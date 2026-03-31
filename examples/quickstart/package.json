@@ -15,6 +15,9 @@
 		"tools": "node --import tsx src/tools.ts",
 		"agent-session": "node --import tsx src/agent-session.ts",
 		"sandbox": "node --import tsx src/sandbox.ts",
+		"nodejs": "node --import tsx src/nodejs.ts",
+		"python": "node --import tsx src/python.ts",
+		"bash": "node --import tsx src/bash.ts",
 		"s3-filesystem": "node --import tsx src/s3-filesystem.ts"
 	},
 	"dependencies": {
@@ -25,6 +28,7 @@
 		"@rivet-dev/agent-os-git": "link:../../registry/software/git",
 		"@rivet-dev/agent-os-pi": "link:../../registry/agent/pi",
 		"@rivet-dev/agent-os-s3": "link:../../registry/file-system/s3",
+		"pyodide": "^0.28.3",
 		"zod": "^3.25.0"
 	},
 	"devDependencies": {
