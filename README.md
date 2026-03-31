@@ -3,11 +3,11 @@
 </p>
 
 <p align="center">
-  A portable open-source operating system for AI agents.<br/>Near-zero cold starts (~6 ms), up to 32x cheaper than sandboxes.<br/>Powered by WebAssembly and V8 isolates.
+  A portable open-source operating system for AI agents.<br/>Near-zero cold starts (~6 ms), up to 32x cheaper than sandboxes.<br/>Powered by WebAssembly and V8 isolates.<br/><br/>Supports Pi, Claude Code*, Codex*, Amp*, and OpenCode*<br/><sub>* coming soon</sub>
 </p>
 
 <p align="center">
-  <a href="https://rivet.dev/docs/agent-os">Documentation</a> | <a href="https://rivet.dev/docs/agent-os/quickstart">Quickstart</a> | <a href="https://rivet.dev/docs/agent-os/versus-sandbox">agentOS vs Sandbox</a>
+  <a href="https://rivet.dev/docs/agent-os">Documentation</a> | <a href="https://rivet.dev/docs/agent-os/quickstart">Quickstart</a>
 </p>
 
 
@@ -19,55 +19,42 @@
 - **Deploy anywhere**: Just an npm package. Works on your laptop, Rivet Cloud, Railway, Vercel, Kubernetes, or any container platform.
 - **Open source**: Apache 2.0 licensed. Self-host or use [Rivet Cloud](https://rivet.dev/docs/agent-os/deployment) for managed infrastructure.
 
+### agentOS vs Sandbox
+
+agentOS is a lightweight VM that runs inside your process. Sandboxes are full Linux environments. agentOS integrates agents into your backend with [host tools](https://rivet.dev/docs/agent-os/tools) and granular permissions. Sandboxes give you a full OS for browsers, native binaries, and dev servers.
+
+You don't have to choose: agentOS works with sandboxes through the [sandbox extension](https://rivet.dev/docs/agent-os/sandbox), spinning up a full sandbox on demand and mounting the sandbox's file system when the workload needs it.
 
 ## Quick start
 
 ```bash
-npm install rivetkit @rivet-dev/agent-os-common @rivet-dev/agent-os-pi
+npm install @rivet-dev/agent-os-core @rivet-dev/agent-os-common @rivet-dev/agent-os-pi
 ```
 
-**server.ts**
-
 ```ts
-import { agentOs } from "rivetkit/agent-os";
-import { setup } from "rivetkit";
+import { AgentOs } from "@rivet-dev/agent-os-core";
 import common from "@rivet-dev/agent-os-common";
 import pi from "@rivet-dev/agent-os-pi";
 
-const vm = agentOs({
-  options: { software: [common, pi] },
-});
-
-export const registry = setup({ use: { vm } });
-registry.start();
-```
-
-**client.ts**
-
-```ts
-import { createClient } from "rivetkit/client";
-import type { registry } from "./server";
-
-const client = createClient<typeof registry>("http://localhost:6420");
-const agent = client.vm.getOrCreate(["my-agent"]);
-
-// Subscribe to streaming events
-agent.on("sessionEvent", (data) => {
-  console.log(data.event);
-});
+const vm = await AgentOs.create({ software: [common, pi] });
 
 // Create a session and send a prompt
-const session = await agent.createSession("pi", {
+const { sessionId } = await vm.createSession("pi", {
   env: { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY! },
 });
-await agent.sendPrompt(
-  session.sessionId,
-  "Write a hello world script to /home/user/hello.js",
-);
+
+vm.onSessionEvent(sessionId, (event) => {
+  console.log(event);
+});
+
+await vm.prompt(sessionId, "Write a hello world script to /home/user/hello.js");
 
 // Read the file the agent created
-const content = await agent.readFile("/home/user/hello.js");
+const content = await vm.readFile("/home/user/hello.js");
 console.log(new TextDecoder().decode(content));
+
+vm.closeSession(sessionId);
+await vm.dispose();
 ```
 
 See the [Quickstart guide](https://rivet.dev/docs/agent-os/quickstart) for the full walkthrough.
