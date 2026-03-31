@@ -19,6 +19,59 @@
 - **Deploy anywhere**: Just an npm package. Works on your laptop, Rivet Cloud, Railway, Vercel, Kubernetes, or any container platform.
 - **Open source**: Apache 2.0 licensed. Self-host or use [Rivet Cloud](https://rivet.dev/docs/agent-os/deployment) for managed infrastructure.
 
+
+## Quick start
+
+```bash
+npm install rivetkit @rivet-dev/agent-os-common @rivet-dev/agent-os-pi
+```
+
+**server.ts**
+
+```ts
+import { agentOs } from "rivetkit/agent-os";
+import { setup } from "rivetkit";
+import common from "@rivet-dev/agent-os-common";
+import pi from "@rivet-dev/agent-os-pi";
+
+const vm = agentOs({
+  options: { software: [common, pi] },
+});
+
+export const registry = setup({ use: { vm } });
+registry.start();
+```
+
+**client.ts**
+
+```ts
+import { createClient } from "rivetkit/client";
+import type { registry } from "./server";
+
+const client = createClient<typeof registry>("http://localhost:6420");
+const agent = client.vm.getOrCreate(["my-agent"]);
+
+// Subscribe to streaming events
+agent.on("sessionEvent", (data) => {
+  console.log(data.event);
+});
+
+// Create a session and send a prompt
+const session = await agent.createSession("pi", {
+  env: { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY! },
+});
+await agent.sendPrompt(
+  session.sessionId,
+  "Write a hello world script to /home/user/hello.js",
+);
+
+// Read the file the agent created
+const content = await agent.readFile("/home/user/hello.js");
+console.log(new TextDecoder().decode(content));
+```
+
+See the [Quickstart guide](https://rivet.dev/docs/agent-os/quickstart) for the full walkthrough.
+
 ## Benchmarks
 
 All benchmarks compare agentOS against the fastest/cheapest mainstream sandbox providers as of March 2026.
@@ -89,58 +142,6 @@ agentOS is built on an in-process operating system kernel written in JavaScript.
 The kernel manages a virtual filesystem, process table, pipes, PTYs, and a virtual network stack. Everything runs inside the kernel -- nothing executes on the host.
 
 See the [Architecture docs](https://rivet.dev/docs/agent-os/architecture) for details.
-
-## Quick start
-
-```bash
-npm install rivetkit @rivet-dev/agent-os-common @rivet-dev/agent-os-pi
-```
-
-**server.ts**
-
-```ts
-import { agentOs } from "rivetkit/agent-os";
-import { setup } from "rivetkit";
-import common from "@rivet-dev/agent-os-common";
-import pi from "@rivet-dev/agent-os-pi";
-
-const vm = agentOs({
-  options: { software: [common, pi] },
-});
-
-export const registry = setup({ use: { vm } });
-registry.start();
-```
-
-**client.ts**
-
-```ts
-import { createClient } from "rivetkit/client";
-import type { registry } from "./server";
-
-const client = createClient<typeof registry>("http://localhost:6420");
-const agent = client.vm.getOrCreate(["my-agent"]);
-
-// Subscribe to streaming events
-agent.on("sessionEvent", (data) => {
-  console.log(data.event);
-});
-
-// Create a session and send a prompt
-const session = await agent.createSession("pi", {
-  env: { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY! },
-});
-await agent.sendPrompt(
-  session.sessionId,
-  "Write a hello world script to /home/user/hello.js",
-);
-
-// Read the file the agent created
-const content = await agent.readFile("/home/user/hello.js");
-console.log(new TextDecoder().decode(content));
-```
-
-See the [Quickstart guide](https://rivet.dev/docs/agent-os/quickstart) for the full walkthrough.
 
 ## Registry
 
