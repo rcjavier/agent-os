@@ -57,6 +57,21 @@ vm.closeSession(sessionId);
 await vm.dispose();
 ```
 
+agentOS runs Node.js, Python, and shell scripts inside the VM:
+
+```ts
+// Node.js
+await vm.writeFile("/hello.mjs", 'import fs from "fs"; fs.writeFileSync("/out.txt", "hi"); console.log(fs.readFileSync("/out.txt", "utf8"));');
+await vm.exec("node /hello.mjs");
+
+// Python
+await vm.writeFile("/hello.py", 'open("/out.txt", "w").write("hi"); print(open("/out.txt").read())');
+await vm.exec("python /hello.py");
+
+// Bash
+await vm.exec("echo 'hi' > /out.txt && cat /out.txt");
+```
+
 See the [Quickstart guide](https://rivet.dev/docs/agent-os/quickstart) for the full walkthrough.
 
 ## Benchmarks
