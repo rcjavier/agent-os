@@ -1,12 +1,15 @@
 <p align="center">
-  <img src=".github/media/banner.png" alt="agentOS" width="600" />
+  <img src=".github/media/banner.png" alt="agentOS" />
 </p>
 
 <p align="center">
-  <b><a href="https://rivet.dev/docs/agent-os">Documentation</a></b> | <b><a href="https://rivet.dev/docs/agent-os/quickstart">Quickstart</a></b> | <b><a href="https://rivet.dev/docs/agent-os/versus-sandbox">agentOS vs Sandbox</a></b>
+  A portable open-source operating system for AI agents.<br/>Near-zero cold starts (~6 ms), up to 32x cheaper than sandboxes.<br/>Powered by WebAssembly and V8 isolates.
 </p>
 
-A portable open-source operating system for AI agents. Near-zero cold starts (~6 ms), up to 32x cheaper than sandboxes. Powered by WebAssembly and V8 isolates.
+<p align="center">
+  <a href="https://rivet.dev/docs/agent-os">Documentation</a> | <a href="https://rivet.dev/docs/agent-os/quickstart">Quickstart</a> | <a href="https://rivet.dev/docs/agent-os/versus-sandbox">agentOS vs Sandbox</a>
+</p>
+
 
 ## Why agentOS
 
@@ -82,7 +85,6 @@ agentOS is built on an in-process operating system kernel written in JavaScript.
 
 - **WebAssembly**: POSIX utilities (coreutils, grep, sed, etc.) compiled to WASM
 - **V8 isolates**: JavaScript/TypeScript agent code runs in sandboxed V8 contexts
-- **Pyodide**: Python workloads via CPython compiled to WASM
 
 The kernel manages a virtual filesystem, process table, pipes, PTYs, and a virtual network stack. Everything runs inside the kernel -- nothing executes on the host.
 
