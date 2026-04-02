@@ -12,6 +12,7 @@ import {
   RIGHTS_STDIO,
   RIGHTS_FILE_ALL,
   RIGHTS_DIR_ALL,
+  FDFLAG_APPEND,
   ERRNO_SUCCESS,
   ERRNO_EBADF,
 } from './wasi-constants.js';
@@ -54,14 +55,14 @@ export class FDTable implements WasiFDTable {
       FILETYPE_CHARACTER_DEVICE,
       RIGHTS_STDIO,
       0n,
-      0
+      FDFLAG_APPEND
     ));
     this._fds.set(2, new FDEntry(
       { type: 'stdio', name: 'stderr' },
       FILETYPE_CHARACTER_DEVICE,
       RIGHTS_STDIO,
       0n,
-      0
+      FDFLAG_APPEND
     ));
   }
 
@@ -108,9 +109,12 @@ export class FDTable implements WasiFDTable {
     }
     entry.fileDescription.refCount--;
     this._fds.delete(fd);
-    // Reclaim FD for reuse (sorted descending so pop gives lowest-available per POSIX)
-    this._freeFds.push(fd);
-    this._freeFds.sort((a, b) => b - a);
+    // Never recycle reserved stdio fd numbers even after they are closed.
+    if (fd >= 3) {
+      // Reclaim FD for reuse (sorted descending so pop gives lowest-available per POSIX)
+      this._freeFds.push(fd);
+      this._freeFds.sort((a, b) => b - a);
+    }
     return ERRNO_SUCCESS;
   }
 

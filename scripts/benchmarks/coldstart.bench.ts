@@ -2,19 +2,23 @@
  * Cold-start latency benchmark.
  *
  * Measures time from AgentOs.create() through workload ready:
- *   --workload=sleep       Minimal VM + first node eval completing
- *   --workload=pi-session  VM + createSession("pi") completing (ACP handshake done)
+ *   --workload=echo             Minimal VM + first exec("echo hello") completing
+ *   --workload=pi-session       VM + createSession("pi") completing (ACP handshake done)
+ *   --workload=claude-session   VM + createSession("claude") completing (ACP handshake done)
+ *   --workload=codex-session    VM + createSession("codex") completing (ACP handshake done)
  *
  * Pass --iterations=N to override default (5).
  *
  * Usage:
- *   npx tsx scripts/benchmarks/coldstart.bench.ts --workload=sleep
+ *   npx tsx scripts/benchmarks/coldstart.bench.ts --workload=echo
  *   npx tsx scripts/benchmarks/coldstart.bench.ts --workload=pi-session --iterations=3
+ *   npx tsx scripts/benchmarks/coldstart.bench.ts --workload=claude-session --iterations=3
  */
 
 import {
 	ITERATIONS,
 	WARMUP_ITERATIONS,
+	WORKLOADS,
 	createBenchVm,
 	ECHO_COMMAND,
 	EXPECTED_OUTPUT,
@@ -25,7 +29,7 @@ import {
 	stopLlmock,
 } from "./bench-utils.js";
 
-type WorkloadName = "echo" | "pi-session";
+const VALID_WORKLOADS = ["echo", ...Object.keys(WORKLOADS).filter((k) => k.endsWith("-session"))];
 
 async function measureEcho(): Promise<number> {
 	const t0 = performance.now();
@@ -39,25 +43,29 @@ async function measureEcho(): Promise<number> {
 	return ms;
 }
 
-async function measurePiSession(): Promise<number> {
-	const { vm, coldStartMs } = await createPiSessionVm();
+async function measureAgentSession(workloadName: string): Promise<number> {
+	const workload = WORKLOADS[workloadName];
+	const t0 = performance.now();
+	const vm = await workload.createVm();
+	await workload.start(vm);
+	const ms = performance.now() - t0;
 	await vm.dispose();
-	return coldStartMs;
+	return ms;
 }
 
-function parseArgs(): { workload: WorkloadName; iterations: number } {
+function parseArgs(): { workload: string; iterations: number } {
 	const wArg = process.argv.find((a) => a.startsWith("--workload="));
 	const iArg = process.argv.find((a) => a.startsWith("--iterations="));
 
 	if (!wArg) {
 		console.error(
-			"Usage: npx tsx coldstart.bench.ts --workload=echo|pi-session [--iterations=N]",
+			`Usage: npx tsx coldstart.bench.ts --workload=${VALID_WORKLOADS.join("|")} [--iterations=N]`,
 		);
 		process.exit(1);
 	}
 	const name = wArg.split("=")[1];
-	if (name !== "echo" && name !== "pi-session") {
-		console.error(`Unknown workload: ${name}. Use echo or pi-session.`);
+	if (!VALID_WORKLOADS.includes(name)) {
+		console.error(`Unknown workload: ${name}. Use: ${VALID_WORKLOADS.join(", ")}`);
 		process.exit(1);
 	}
 
@@ -72,7 +80,9 @@ function parseArgs(): { workload: WorkloadName; iterations: number } {
 
 async function main() {
 	const { workload, iterations } = parseArgs();
-	const measure = workload === "echo" ? measureEcho : measurePiSession;
+	const measure = workload === "echo"
+		? measureEcho
+		: () => measureAgentSession(workload);
 
 	const hardware = getHardware();
 	console.error(`=== Cold-Start Benchmark (${workload}) ===`);

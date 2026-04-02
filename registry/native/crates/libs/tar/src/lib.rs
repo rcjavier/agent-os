@@ -3,10 +3,11 @@
 //! Supports -c create, -x extract, -t list.
 //! Options: -f archive, -z gzip, -v verbose, -C directory, --strip-components=N.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -130,17 +131,21 @@ pub fn main(args: Vec<OsString>) -> i32 {
         }
     }
 
-    // Change directory if -C specified
-    if let Some(ref dir) = directory {
-        if let Err(e) = std::env::set_current_dir(dir) {
-            eprintln!("tar: {}: {}", dir, e);
-            return 1;
-        }
-    }
-
     let result = match mode {
-        Mode::Create => do_create(archive_file.as_deref(), gzip, verbose, &paths),
-        Mode::Extract => do_extract(archive_file.as_deref(), gzip, verbose, strip_components),
+        Mode::Create => do_create(
+            archive_file.as_deref(),
+            gzip,
+            verbose,
+            directory.as_deref(),
+            &paths,
+        ),
+        Mode::Extract => do_extract(
+            archive_file.as_deref(),
+            gzip,
+            verbose,
+            directory.as_deref(),
+            strip_components,
+        ),
         Mode::List => do_list(archive_file.as_deref(), gzip, verbose),
         Mode::None => {
             eprintln!("tar: must specify one of -c, -x, -t");
@@ -161,6 +166,7 @@ fn do_create(
     archive_file: Option<&str>,
     gzip: bool,
     verbose: bool,
+    directory: Option<&str>,
     paths: &[String],
 ) -> io::Result<()> {
     if paths.is_empty() {
@@ -170,61 +176,69 @@ fn do_create(
         ));
     }
 
-    let writer: Box<dyn Write> = match archive_file {
-        Some("-") | None => Box::new(io::stdout()),
-        Some(path) => Box::new(File::create(path)?),
+    let bytes = if gzip {
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        for path in paths {
+            append_path(
+                &mut builder,
+                resolve_disk_path(directory, Path::new(path)),
+                Path::new(path),
+                verbose,
+            )?;
+        }
+        let encoder = builder.into_inner()?;
+        encoder.finish()?
+    } else {
+        let cursor = io::Cursor::new(Vec::new());
+        let mut builder = tar::Builder::new(cursor);
+        for path in paths {
+            append_path(
+                &mut builder,
+                resolve_disk_path(directory, Path::new(path)),
+                Path::new(path),
+                verbose,
+            )?;
+        }
+        let cursor = builder.into_inner()?;
+        cursor.into_inner()
     };
 
-    if gzip {
-        let gz = GzEncoder::new(writer, Compression::default());
-        let mut builder = tar::Builder::new(gz);
-        for path in paths {
-            append_path(&mut builder, Path::new(path), verbose)?;
-        }
-        let gz = builder.into_inner()?;
-        gz.finish()?;
-    } else {
-        let mut builder = tar::Builder::new(writer);
-        for path in paths {
-            append_path(&mut builder, Path::new(path), verbose)?;
-        }
-        builder.into_inner()?;
-    }
-
-    Ok(())
+    write_archive_bytes(archive_file, &bytes)
 }
 
 fn append_path<W: Write>(
     builder: &mut tar::Builder<W>,
-    path: &Path,
+    disk_path: PathBuf,
+    archive_path: &Path,
     verbose: bool,
 ) -> io::Result<()> {
-    let meta = fs::symlink_metadata(path)?;
+    let meta = fs::symlink_metadata(&disk_path)?;
 
     if meta.is_dir() {
-        append_dir(builder, path, verbose)?;
+        append_dir(builder, &disk_path, archive_path, verbose)?;
     } else if meta.is_file() {
         if verbose {
-            eprintln!("{}", path.display());
+            eprintln!("{}", archive_path.display());
         }
         let mut header = tar::Header::new_gnu();
         header.set_entry_type(tar::EntryType::Regular);
         header.set_size(meta.len());
         header.set_mode(0o644);
         header.set_cksum();
-        let mut file = File::open(path)?;
-        builder.append_data(&mut header, path, &mut file)?;
+        let mut file = File::open(&disk_path)?;
+        builder.append_data(&mut header, archive_path, &mut file)?;
     } else if meta.file_type().is_symlink() {
         if verbose {
-            eprintln!("{}", path.display());
+            eprintln!("{}", archive_path.display());
         }
-        let target = fs::read_link(path)?;
+        let target = fs::read_link(&disk_path)?;
         let mut header = tar::Header::new_gnu();
         header.set_entry_type(tar::EntryType::Symlink);
         header.set_size(0);
         header.set_mode(0o777);
         header.set_cksum();
-        builder.append_link(&mut header, path, &target)?;
+        builder.append_link(&mut header, archive_path, &target)?;
     }
 
     Ok(())
@@ -232,11 +246,12 @@ fn append_path<W: Write>(
 
 fn append_dir<W: Write>(
     builder: &mut tar::Builder<W>,
-    dir: &Path,
+    disk_dir: &Path,
+    archive_dir: &Path,
     verbose: bool,
 ) -> io::Result<()> {
     if verbose {
-        eprintln!("{}/", dir.display());
+        eprintln!("{}/", archive_dir.display());
     }
 
     let mut header = tar::Header::new_gnu();
@@ -244,13 +259,14 @@ fn append_dir<W: Write>(
     header.set_size(0);
     header.set_mode(0o755);
     header.set_cksum();
-    builder.append_data(&mut header, dir, io::empty())?;
+    builder.append_data(&mut header, archive_dir, io::empty())?;
 
-    let mut entries: Vec<_> = fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
+    let mut entries: Vec<_> = fs::read_dir(disk_dir)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|e| e.file_name());
 
     for entry in entries {
-        append_path(builder, &entry.path(), verbose)?;
+        let archive_child = archive_dir.join(entry.file_name());
+        append_path(builder, entry.path(), &archive_child, verbose)?;
     }
 
     Ok(())
@@ -260,19 +276,25 @@ fn do_extract(
     archive_file: Option<&str>,
     gzip: bool,
     verbose: bool,
+    directory: Option<&str>,
     strip_components: usize,
 ) -> io::Result<()> {
     let reader = open_read(archive_file, gzip)?;
     let mut archive = tar::Archive::new(reader);
+    let mut known_dirs = HashSet::new();
+    if let Some(base) = directory {
+        known_dirs.insert(PathBuf::from(base));
+    }
 
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
         let orig_path = entry.path()?.into_owned();
 
-        let dest = match strip_path_components(&orig_path, strip_components) {
+        let relative_dest = match strip_path_components(&orig_path, strip_components) {
             Some(p) if !p.as_os_str().is_empty() => p,
             _ => continue,
         };
+        let dest = resolve_output_path(directory, &relative_dest);
 
         if verbose {
             eprintln!("{}", orig_path.display());
@@ -280,22 +302,39 @@ fn do_extract(
 
         match entry.header().entry_type() {
             tar::EntryType::Directory => {
-                fs::create_dir_all(&dest)?;
+                ensure_relative_dir_exists(directory, &relative_dest, &mut known_dirs)?;
             }
             tar::EntryType::Regular | tar::EntryType::GNUSparse => {
                 if let Some(parent) = dest.parent() {
                     if !parent.as_os_str().is_empty() {
-                        fs::create_dir_all(parent)?;
+                        let relative_parent =
+                            relative_dest.parent().unwrap_or_else(|| Path::new(""));
+                        ensure_relative_dir_exists(
+                            directory,
+                            relative_parent,
+                            &mut known_dirs,
+                        )?;
                     }
                 }
-                let mut file = File::create(&dest)?;
-                io::copy(&mut entry, &mut file)?;
+                let mut contents = Vec::new();
+                entry.read_to_end(&mut contents).map_err(|e| {
+                    io::Error::new(e.kind(), format!("read {}: {}", orig_path.display(), e))
+                })?;
+                fs::write(&dest, contents).map_err(|e| {
+                    io::Error::new(e.kind(), format!("write {}: {}", dest.display(), e))
+                })?;
             }
             tar::EntryType::Symlink => {
                 if let Some(target) = entry.link_name()? {
                     if let Some(parent) = dest.parent() {
                         if !parent.as_os_str().is_empty() {
-                            fs::create_dir_all(parent)?;
+                            let relative_parent =
+                                relative_dest.parent().unwrap_or_else(|| Path::new(""));
+                            ensure_relative_dir_exists(
+                                directory,
+                                relative_parent,
+                                &mut known_dirs,
+                            )?;
                         }
                     }
                     #[allow(deprecated)]
@@ -311,11 +350,66 @@ fn do_extract(
     Ok(())
 }
 
-fn do_list(
-    archive_file: Option<&str>,
-    gzip: bool,
-    verbose: bool,
+fn resolve_disk_path(directory: Option<&str>, path: &Path) -> PathBuf {
+    match directory {
+        Some(base) if !path.is_absolute() => Path::new(base).join(path),
+        _ => path.to_path_buf(),
+    }
+}
+
+fn resolve_output_path(directory: Option<&str>, path: &Path) -> PathBuf {
+    match directory {
+        Some(base) if path.is_relative() => Path::new(base).join(path),
+        _ => path.to_path_buf(),
+    }
+}
+
+fn ensure_relative_dir_exists(
+    directory: Option<&str>,
+    relative_path: &Path,
+    known_dirs: &mut HashSet<PathBuf>,
 ) -> io::Result<()> {
+    let mut current = match directory {
+        Some(base) => PathBuf::from(base),
+        None => PathBuf::new(),
+    };
+
+    for component in relative_path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => {
+                current.push(part);
+                if known_dirs.contains(&current) {
+                    continue;
+                }
+                match fs::create_dir(&current) {
+                    Ok(()) => {
+                        known_dirs.insert(current.clone());
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                        known_dirs.insert(current.clone());
+                    }
+                    Err(err) => {
+                        return Err(io::Error::new(
+                            err.kind(),
+                            format!("create_dir {}: {}", current.display(), err),
+                        ));
+                    }
+                }
+            }
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unsupported path component in {}", relative_path.display()),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn do_list(archive_file: Option<&str>, gzip: bool, verbose: bool) -> io::Result<()> {
     let reader = open_read(archive_file, gzip)?;
     let mut archive = tar::Archive::new(reader);
 
@@ -352,6 +446,7 @@ fn open_read(archive_file: Option<&str>, gzip: bool) -> io::Result<Box<dyn Read>
         Some("-") | None => Box::new(io::stdin()),
         Some(path) => Box::new(File::open(path)?),
     };
+
     if gzip {
         Ok(Box::new(GzDecoder::new(reader)))
     } else {
@@ -359,15 +454,44 @@ fn open_read(archive_file: Option<&str>, gzip: bool) -> io::Result<Box<dyn Read>
     }
 }
 
+fn write_archive_bytes(archive_file: Option<&str>, bytes: &[u8]) -> io::Result<()> {
+    match archive_file {
+        Some("-") | None => {
+            let mut stdout = io::stdout();
+            stdout.write_all(bytes)?;
+            stdout.flush()
+        }
+        Some(path) => fs::write(path, bytes),
+    }
+}
+
 fn strip_path_components(path: &Path, n: usize) -> Option<PathBuf> {
-    if n == 0 {
-        return Some(path.to_path_buf());
+    let mut remaining = n;
+    let mut stripped = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                if remaining == 0 {
+                    stripped.push(component.as_os_str());
+                }
+            }
+            Component::Normal(part) => {
+                if remaining > 0 {
+                    remaining -= 1;
+                } else {
+                    stripped.push(part);
+                }
+            }
+        }
     }
-    let components: Vec<_> = path.components().collect();
-    if components.len() <= n {
-        return None;
+
+    if stripped.as_os_str().is_empty() {
+        None
+    } else {
+        Some(stripped)
     }
-    Some(components[n..].iter().collect())
 }
 
 fn format_mode(mode: u32) -> String {

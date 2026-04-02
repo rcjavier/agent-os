@@ -104,6 +104,8 @@ const pkg = {
 		{ name: "pwd", permissionTier: "read-only" as const },
 		{ name: "basename", permissionTier: "read-only" as const },
 		{ name: "dirname", permissionTier: "read-only" as const },
+		{ name: "xu", permissionTier: "read-only" as const },
+		{ name: "which", permissionTier: "read-only" as const },
 		{ name: "sleep", permissionTier: "read-only" as const },
 
 		// Checksums and encoding

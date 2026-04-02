@@ -9,6 +9,7 @@
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import * as posixPath from "node:path/posix";
 import {
 	KernelError,
 	type VirtualDirEntry,
@@ -23,6 +24,26 @@ export interface HostDirBackendOptions {
 	readOnly?: boolean;
 }
 
+export interface HostDirBackendMeta {
+	hostPath: string;
+	readOnly: boolean;
+}
+
+export const HOST_DIR_BACKEND_META = Symbol.for(
+	"@rivet-dev/agent-os/HostDirBackendMeta",
+);
+
+type HostDirVirtualFileSystem = VirtualFileSystem & {
+	[HOST_DIR_BACKEND_META]?: HostDirBackendMeta;
+};
+
+export function getHostDirBackendMeta(
+	driver: VirtualFileSystem,
+): HostDirBackendMeta | null {
+	const meta = (driver as HostDirVirtualFileSystem)[HOST_DIR_BACKEND_META];
+	return meta ?? null;
+}
+
 /**
  * Create a VirtualFileSystem that projects a host directory into the VM.
  * Symlink escape and path traversal attacks are blocked by canonicalizing
@@ -35,27 +56,49 @@ export function createHostDirBackend(
 	// Canonicalize the host root at creation time
 	const canonicalRoot = fsSync.realpathSync(options.hostPath);
 
+	function ensureWithinRoot(hostPath: string, virtualPath: string): void {
+		if (
+			hostPath !== canonicalRoot &&
+			!hostPath.startsWith(`${canonicalRoot}${path.sep}`)
+		) {
+			throw new KernelError(
+				"EACCES",
+				`path escapes host directory: ${virtualPath}`,
+			);
+		}
+	}
+
+	function normalizeVirtualPath(p: string): string {
+		return posixPath.resolve("/", p);
+	}
+
+	function lexicalHostPath(p: string): string {
+		const normalized = normalizeVirtualPath(p).replace(/^\/+/, "");
+		const joined = path.join(canonicalRoot, normalized);
+		ensureWithinRoot(path.resolve(joined), p);
+		return joined;
+	}
+
+	function hostToVirtualPath(hostPath: string, virtualPath: string): string {
+		const resolved = path.resolve(hostPath);
+		ensureWithinRoot(resolved, virtualPath);
+		const relative = path.relative(canonicalRoot, resolved);
+		if (!relative) return "/";
+		return `/${relative.split(path.sep).join("/")}`;
+	}
+
 	/**
 	 * Resolve a virtual path to a host path and validate it stays under root.
 	 * Uses realpath for existing paths (catches symlink escapes) and
 	 * falls back to lexical resolution for non-existent paths.
 	 */
 	function resolve(p: string): string {
-		const normalized = path.posix.normalize(p).replace(/^\/+/, "");
-		const joined = path.join(canonicalRoot, normalized);
+		const joined = lexicalHostPath(p);
 
 		// For existing paths, canonicalize to catch symlink escapes
 		try {
 			const real = fsSync.realpathSync(joined);
-			if (
-				real !== canonicalRoot &&
-				!real.startsWith(`${canonicalRoot}/`)
-			) {
-				throw new KernelError(
-					"EACCES",
-					`path escapes host directory: ${p}`,
-				);
-			}
+			ensureWithinRoot(real, p);
 			return real;
 		} catch (err) {
 			const e = err as NodeJS.ErrnoException;
@@ -64,35 +107,37 @@ export function createHostDirBackend(
 				const parentHost = path.dirname(joined);
 				try {
 					const realParent = fsSync.realpathSync(parentHost);
-					if (
-						realParent !== canonicalRoot &&
-						!realParent.startsWith(`${canonicalRoot}/`)
-					) {
-						throw new KernelError(
-							"EACCES",
-							`path escapes host directory: ${p}`,
-						);
-					}
+					ensureWithinRoot(realParent, p);
 				} catch (parentErr) {
 					const pe = parentErr as NodeJS.ErrnoException;
 					if (pe instanceof KernelError) throw pe;
 					// Parent doesn't exist either — validate lexically
-					const resolvedPath = path.resolve(joined);
-					if (
-						resolvedPath !== canonicalRoot &&
-						!resolvedPath.startsWith(`${canonicalRoot}/`)
-					) {
-						throw new KernelError(
-							"EACCES",
-							`path escapes host directory: ${p}`,
-						);
-					}
+					ensureWithinRoot(path.resolve(joined), p);
 				}
 				return joined;
 			}
 			if (e instanceof KernelError) throw e;
 			throw err;
 		}
+	}
+
+	function resolveNoFollow(p: string): string {
+		const joined = lexicalHostPath(p);
+		const parentHost = path.dirname(joined);
+		try {
+			const realParent = fsSync.realpathSync(parentHost);
+			ensureWithinRoot(realParent, p);
+		} catch (err) {
+			const e = err as NodeJS.ErrnoException;
+			if (e.code === "ENOENT") {
+				ensureWithinRoot(path.resolve(joined), p);
+			} else if (e instanceof KernelError) {
+				throw e;
+			} else {
+				throw err;
+			}
+		}
+		return joined;
 	}
 
 	function throwIfReadOnly(): void {
@@ -118,7 +163,7 @@ export function createHostDirBackend(
 		};
 	}
 
-	const backend: VirtualFileSystem = {
+	const backend: HostDirVirtualFileSystem = {
 		async readFile(p: string): Promise<Uint8Array> {
 			return new Uint8Array(await fs.readFile(resolve(p)));
 		},
@@ -183,7 +228,7 @@ export function createHostDirBackend(
 
 		async removeFile(p: string): Promise<void> {
 			throwIfReadOnly();
-			await fs.unlink(resolve(p));
+			await fs.unlink(resolveNoFollow(p));
 		},
 
 		async removeDir(p: string): Promise<void> {
@@ -193,35 +238,54 @@ export function createHostDirBackend(
 
 		async rename(oldPath: string, newPath: string): Promise<void> {
 			throwIfReadOnly();
-			await fs.rename(resolve(oldPath), resolve(newPath));
+			await fs.mkdir(path.dirname(resolveNoFollow(newPath)), {
+				recursive: true,
+			});
+			await fs.rename(resolveNoFollow(oldPath), resolveNoFollow(newPath));
 		},
 
 		async realpath(p: string): Promise<string> {
-			// Return the virtual path, not the host path
-			return path.posix.normalize(p);
+			return hostToVirtualPath(fsSync.realpathSync(resolveNoFollow(p)), p);
 		},
 
-		async symlink(_target: string, _linkPath: string): Promise<void> {
-			throw new KernelError(
-				"ENOSYS",
-				"symlink not supported by host-dir backend",
+		async symlink(target: string, linkPath: string): Promise<void> {
+			throwIfReadOnly();
+			const hostLinkPath = resolveNoFollow(linkPath);
+			await fs.mkdir(path.dirname(hostLinkPath), { recursive: true });
+			const linkVirtualPath = normalizeVirtualPath(linkPath);
+			const targetVirtualPath = target.startsWith("/")
+				? normalizeVirtualPath(target)
+				: normalizeVirtualPath(
+						posixPath.resolve(posixPath.dirname(linkVirtualPath), target),
+					);
+			const hostTargetPath = lexicalHostPath(targetVirtualPath);
+			const relativeTarget = path.relative(
+				path.dirname(hostLinkPath),
+				hostTargetPath,
 			);
+			await fs.symlink(relativeTarget, hostLinkPath);
 		},
 
 		async readlink(p: string): Promise<string> {
-			return fs.readlink(resolve(p));
+			const hostLinkPath = resolveNoFollow(p);
+			const linkTarget = await fs.readlink(hostLinkPath);
+			return hostToVirtualPath(
+				path.resolve(path.dirname(hostLinkPath), linkTarget),
+				p,
+			);
 		},
 
 		async lstat(p: string): Promise<VirtualStat> {
-			const s = await fs.lstat(resolve(p));
+			const s = await fs.lstat(resolveNoFollow(p));
 			return toVirtualStat(s);
 		},
 
-		async link(_oldPath: string, _newPath: string): Promise<void> {
-			throw new KernelError(
-				"ENOSYS",
-				"link not supported by host-dir backend",
-			);
+		async link(oldPath: string, newPath: string): Promise<void> {
+			throwIfReadOnly();
+			const hostOldPath = resolveNoFollow(oldPath);
+			const hostNewPath = resolveNoFollow(newPath);
+			await fs.mkdir(path.dirname(hostNewPath), { recursive: true });
+			await fs.link(hostOldPath, hostNewPath);
 		},
 
 		async chmod(p: string, mode: number): Promise<void> {
@@ -272,6 +336,11 @@ export function createHostDirBackend(
 				await handle.close();
 			}
 		},
+	};
+
+	backend[HOST_DIR_BACKEND_META] = {
+		hostPath: canonicalRoot,
+		readOnly,
 	};
 
 	return backend;

@@ -1,3 +1,5 @@
+import { readdirSync } from "node:fs";
+import curlPackage from "@rivet-dev/agent-os-curl";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { AgentOs } from "../src/index.js";
 import {
@@ -89,8 +91,7 @@ EOF`);
 			expect(r.stdout.trim()).toBe("data");
 		});
 
-		// WASI libc rename() returns ENOENT for valid paths — kernel-level bug in path_rename
-		test.skip("mv renames file", async () => {
+		test("mv renames file", async () => {
 			await vm.exec("echo moved > /tmp/mv-src.txt");
 			const r = await vm.exec(
 				"mv /tmp/mv-src.txt /tmp/mv-dst.txt && cat /tmp/mv-dst.txt",
@@ -212,6 +213,26 @@ EOF`);
 			const r = await vm.exec("env", { env: { FOO: "bar" } });
 			expect(r.exitCode).toBe(0);
 			expect(r.stdout).toContain("FOO=bar");
+		});
+
+		test("which resolves virtual PATH commands", async () => {
+			const bash = await vm.exec("which bash");
+			expect(bash.exitCode).toBe(0);
+			expect(bash.stdout.trim()).toBe("/bin/bash");
+
+			const rg = await vm.exec("which rg");
+			expect(rg.exitCode).toBe(0);
+			expect(rg.stdout.trim()).toBe("/bin/rg");
+
+			const missing = await vm.exec("which definitely-not-a-command");
+			expect(missing.exitCode).toBe(1);
+			expect(missing.stdout.trim()).toBe("");
+		});
+
+		test("xu executes as a registered PATH command", async () => {
+			const r = await vm.exec("xu hello-agent-os");
+			expect(r.exitCode).toBe(0);
+			expect(r.stdout.trim()).toBe("xu-ok:hello-agent-os");
 		});
 
 		test("test command conditionals", async () => {
@@ -415,8 +436,7 @@ EOF`);
 	// ── tar ───────────────────────────────────────────────────────────
 
 	describe("tar", () => {
-		// tar gets "Bad file descriptor" on WASI — kernel fd handling bug
-		test.skip("create and extract archive", async () => {
+		test("create and extract archive", async () => {
 			await vm.exec("mkdir -p /tmp/tardir && echo file-a > /tmp/tardir/a.txt && echo file-b > /tmp/tardir/b.txt");
 			const create = await vm.exec("tar cf /tmp/test.tar -C /tmp tardir");
 			expect(create.exitCode).toBe(0);
@@ -428,8 +448,7 @@ EOF`);
 			expect(extract.stdout.trim()).toBe("file-a");
 		});
 
-		// tar gets "Bad file descriptor" on WASI — kernel fd handling bug
-		test.skip("list archive contents", async () => {
+		test("list archive contents", async () => {
 			await vm.exec("mkdir -p /tmp/tarlist && echo x > /tmp/tarlist/x.txt");
 			await vm.exec("tar cf /tmp/list.tar -C /tmp tarlist");
 			const r = await vm.exec("tar tf /tmp/list.tar");
@@ -554,19 +573,9 @@ EOF`);
 	});
 
 	// ── curl (requires C build) ───────────────────────────────────────
-	// curl is a C-built WASM binary. Skip all tests if not available.
 
 	describe("curl", () => {
-		const hasCurl = (() => {
-			try {
-				const { readdirSync } = require("node:fs");
-				const curl = require("@rivet-dev/agent-os-curl");
-				const dir = (curl.default || curl).commandDir;
-				return readdirSync(dir).includes("curl");
-			} catch {
-				return false;
-			}
-		})();
+		const hasCurl = readdirSync(curlPackage.commandDir).includes("curl");
 
 		const CURL_SCRIPT = `
 const http = require("http");
@@ -607,7 +616,8 @@ server.listen(0, "0.0.0.0", () => {
 			return { pid, port };
 		}
 
-		test.skipIf(!hasCurl)("curl GET request", async () => {
+		test("curl GET request", async () => {
+			expect(hasCurl).toBe(true);
 
 			const { pid, port } = await startServer(vm);
 			try {
@@ -619,7 +629,8 @@ server.listen(0, "0.0.0.0", () => {
 			}
 		});
 
-		test.skipIf(!hasCurl)("curl POST with data", async () => {
+		test("curl POST with data", async () => {
+			expect(hasCurl).toBe(true);
 
 			const { pid, port } = await startServer(vm);
 			try {
@@ -716,8 +727,7 @@ server.listen(0, "0.0.0.0", () => {
 			expect(r.stdout.trim()).toBe("alice");
 		});
 
-		// tar gets "Bad file descriptor" on WASI — kernel fd handling bug
-		test.skip("tar + gzip round trip", async () => {
+		test("tar + gzip round trip", async () => {
 			await vm.exec("mkdir -p /tmp/tgz && echo round-trip-data > /tmp/tgz/data.txt");
 			const create = await vm.exec(
 				"tar cf - -C /tmp tgz | gzip > /tmp/archive.tar.gz",

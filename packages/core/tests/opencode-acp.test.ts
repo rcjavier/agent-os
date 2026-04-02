@@ -1,175 +1,157 @@
 import { resolve } from "node:path";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { AgentOs } from "../src/index.js";
-
-/**
- * OpenCode ACP Manual Spawn Tests
- *
- * OpenCode speaks ACP natively via `opencode acp` subcommand — no separate
- * adapter like pi-acp is needed. The `opencode acp` command starts a JSON-RPC
- * 2.0 server over stdio that implements the Agent Communication Protocol.
- *
- * BLOCKED: OpenCode is a native ELF binary (compiled Go), not Node.js. The
- * secure-exec VM kernel only supports JS/WASM command execution. The opencode-ai
- * npm package is a thin wrapper that calls child_process.spawnSync on the native
- * binary, which returns ENOENT inside the VM.
- *
- * ACP protocol differences from PI (documented from OpenCode's public docs):
- * - OpenCode speaks ACP directly (`opencode acp`), PI requires pi-acp adapter
- * - OpenCode uses its own agentInfo.name (e.g., "opencode") vs PI's pi-acp info
- * - Both use the same JSON-RPC 2.0 transport over stdio
- * - Both support initialize, session/new, session/prompt, session/cancel
- */
+import type { LLMock } from "@copilotkit/llmock";
+import type { ManagedProcess } from "@secure-exec/core";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "vitest";
+import opencode from "@rivet-dev/agent-os-opencode";
+import { AcpClient } from "../src/acp-client.js";
+import { AgentOs } from "../src/agent-os.js";
+import { createStdoutLineIterable } from "../src/stdout-lines.js";
+import {
+	DEFAULT_TEXT_FIXTURE,
+	startLlmock,
+	stopLlmock,
+} from "./helpers/llmock-helper.js";
+import {
+	createVmOpenCodeHome,
+	createVmWorkspace,
+	resolveOpenCodeAdapterBinPath,
+} from "./helpers/opencode-helper.js";
+import { REGISTRY_SOFTWARE, registrySkipReason } from "./helpers/registry-commands.js";
 
 const MODULE_ACCESS_CWD = resolve(import.meta.dirname, "..");
 
-describe.skip("OpenCode ACP manual spawn", () => {
+describe.skipIf(registrySkipReason)("OpenCode ACP manual spawn inside the VM", () => {
 	let vm: AgentOs;
+	let mock: LLMock;
+	let mockUrl: string;
+	let mockPort: number;
+	let client: AcpClient | undefined;
+
+	beforeAll(async () => {
+		const result = await startLlmock([DEFAULT_TEXT_FIXTURE]);
+		mock = result.mock;
+		mockUrl = result.url;
+		mockPort = Number(new URL(result.url).port);
+	});
+
+	afterAll(async () => {
+		await stopLlmock(mock);
+	});
 
 	beforeEach(async () => {
 		vm = await AgentOs.create({
+			loopbackExemptPorts: [mockPort],
 			moduleAccessCwd: MODULE_ACCESS_CWD,
+			software: [opencode, ...REGISTRY_SOFTWARE],
 		});
 	});
 
 	afterEach(async () => {
+		if (client) {
+			client.close();
+			client = undefined;
+		}
 		await vm.dispose();
 	});
 
-	test("opencode-ai wrapper bin is accessible in VM", async () => {
-		// Verify the opencode-ai wrapper script (Node.js) is available via
-		// the ModuleAccessFileSystem overlay. This is the entry point that
-		// would normally spawn the native binary.
-		const script = `
-const fs = require("fs");
-const pkgPath = "/root/node_modules/opencode-ai/package.json";
-const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
-const binEntry = typeof pkg.bin === "string" ? pkg.bin : (pkg.bin.opencode || Object.values(pkg.bin)[0]);
-const binPath = "/root/node_modules/opencode-ai/" + binEntry;
-const binExists = fs.existsSync(binPath);
-console.log("bin-path:" + binPath);
-console.log("bin-exists:" + binExists);
-if (binExists) {
-  const content = fs.readFileSync(binPath, "utf-8");
-  console.log("is-js-wrapper:" + content.includes("spawnSync"));
-}
-`;
-		await vm.writeFile("/tmp/check-acp-bin.mjs", script);
+	async function spawnOpenCodeAcp(): Promise<{
+		proc: ManagedProcess;
+		client: AcpClient;
+		stderr: () => string;
+		workspaceDir: string;
+	}> {
+		const homeDir = await createVmOpenCodeHome(vm, mockUrl);
+		const workspaceDir = await createVmWorkspace(vm);
+		const binPath = resolveOpenCodeAdapterBinPath(MODULE_ACCESS_CWD);
+		const { iterable, onStdout } = createStdoutLineIterable();
 
-		let stdout = "";
-		let stderr = "";
-
-		const { pid } = vm.spawn("node", ["/tmp/check-acp-bin.mjs"], {
-			onStdout: (data: Uint8Array) => {
-				stdout += new TextDecoder().decode(data);
-			},
+		let stderrOutput = "";
+		const proc = vm.kernel.spawn("node", [binPath], {
+			streamStdin: true,
+			onStdout,
 			onStderr: (data: Uint8Array) => {
-				stderr += new TextDecoder().decode(data);
+				stderrOutput += new TextDecoder().decode(data);
 			},
+			env: {
+				HOME: homeDir,
+				ANTHROPIC_API_KEY: "mock-key",
+			},
+			cwd: workspaceDir,
 		});
 
-		const exitCode = await vm.waitProcess(pid);
+		const acpClient = new AcpClient(proc, iterable);
+		return {
+			proc,
+			client: acpClient,
+			stderr: () => stderrOutput,
+			workspaceDir,
+		};
+	}
 
-		expect(exitCode, `Failed. stderr: ${stderr}`).toBe(0);
-		expect(stdout).toContain("bin-exists:true");
-		// The bin entry is a JS wrapper that shells out to the native binary
-		expect(stdout).toContain("is-js-wrapper:true");
-	}, 30_000);
+	test("real OpenCode ACP initializes and creates a session over stdio inside the VM", async () => {
+		const spawned = await spawnOpenCodeAcp();
+		client = spawned.client;
 
-	test("opencode acp mode cannot start - native binary required", async () => {
-		// Attempt to spawn the opencode wrapper with the `acp` subcommand.
-		// This fails because the wrapper calls spawnSync on the native ELF
-		// binary, which the kernel cannot execute.
-		//
-		// In a non-VM environment, `opencode acp` would start a JSON-RPC 2.0
-		// server on stdio, accepting initialize, session/new, session/prompt, etc.
-		const script = `
-const childProcess = require("child_process");
-const fs = require("fs");
+		let initResponse: Awaited<ReturnType<AcpClient["request"]>>;
+		try {
+			initResponse = await client.request("initialize", {
+				protocolVersion: 1,
+				clientCapabilities: {
+					fs: {
+						readTextFile: true,
+						writeTextFile: true,
+					},
+					terminal: true,
+				},
+			});
+		} catch (error) {
+			throw new Error(`Initialize failed. stderr: ${spawned.stderr()}\n${error}`);
+		}
 
-// Find the native binary (same resolution as the wrapper)
-const candidates = [
-  "/root/node_modules/opencode-linux-x64-baseline/bin/opencode",
-  "/root/node_modules/opencode-linux-x64/bin/opencode",
-];
-let binaryPath = null;
-for (const c of candidates) {
-  if (fs.existsSync(c)) {
-    binaryPath = c;
-    break;
-  }
-}
-
-if (!binaryPath) {
-  console.log("result:no-binary");
-  process.exit(0);
-}
-
-console.log("binary:" + binaryPath);
-
-// Attempt to spawn the native binary with "acp" subcommand
-// This is what would start the ACP JSON-RPC server over stdio
-const result = childProcess.spawnSync(binaryPath, ["acp"], {
-  timeout: 5000,
-  encoding: "utf-8",
-});
-
-console.log("status:" + result.status);
-const stderrStr = result.stderr ? String(result.stderr) : "";
-console.log("stderr:" + stderrStr);
-console.log("failed:" + (result.status !== 0));
-`;
-		await vm.writeFile("/tmp/try-acp.mjs", script);
-
-		let stdout = "";
-		let stderr = "";
-
-		const { pid } = vm.spawn("node", ["/tmp/try-acp.mjs"], {
-			onStdout: (data: Uint8Array) => {
-				stdout += new TextDecoder().decode(data);
-			},
-			onStderr: (data: Uint8Array) => {
-				stderr += new TextDecoder().decode(data);
-			},
+		expect(initResponse.error).toBeUndefined();
+		expect(
+			(initResponse.result as { protocolVersion: number }).protocolVersion,
+		).toBe(1);
+		expect(
+			(
+				initResponse.result as {
+					agentInfo: { name: string; version: string };
+				}
+			).agentInfo,
+		).toMatchObject({
+			name: "OpenCode",
 		});
 
-		const exitCode = await vm.waitProcess(pid);
+		let sessionResponse: Awaited<ReturnType<AcpClient["request"]>>;
+		try {
+			sessionResponse = await client.request("session/new", {
+				cwd: spawned.workspaceDir,
+				mcpServers: [],
+			});
+		} catch (error) {
+			throw new Error(`session/new failed. stderr: ${spawned.stderr()}\n${error}`);
+		}
 
-		expect(exitCode, `Script failed. stderr: ${stderr}`).toBe(0);
-		expect(stdout).toContain("binary:");
-		// Native binary spawn fails — kernel can't execute ELF binaries
-		expect(stdout).toContain("status:1");
-		expect(stdout).toContain("failed:true");
-		// ENOENT from the kernel's command resolver
-		expect(stdout).toMatch(/ENOENT|command not found/);
-	}, 30_000);
-
-	test("ACP JSON-RPC protocol tests skipped - native binary limitation", async () => {
-		// This test documents why the ACP protocol tests (initialize,
-		// session/new) cannot be run for OpenCode inside the secure-exec VM.
-		//
-		// The tests that WOULD be here (matching pi-acp-adapter.test.ts):
-		//
-		// 1. "initialize returns protocolVersion and agentInfo"
-		//    - Send: { method: "initialize", params: { protocolVersion: 1, clientCapabilities: {} } }
-		//    - Expected: { result: { protocolVersion: <number>, agentInfo: { name: "opencode", ... } } }
-		//
-		// 2. "session/new returns sessionId"
-		//    - Send: { method: "session/new", params: { cwd: "/home/user", mcpServers: [] } }
-		//    - Expected: { result: { sessionId: <string> } }
-		//
-		// Unlike PI (which needs pi-acp as a separate adapter), OpenCode's ACP
-		// mode is built-in. The `opencode acp` command starts the JSON-RPC server
-		// directly — no wrapper process indirection.
-		//
-		// To enable these tests, one of:
-		// (a) Add native binary execution to the secure-exec kernel
-		// (b) Run OpenCode outside the VM and proxy ACP over a socket/pipe
-		// (c) Create a mock OpenCode ACP responder in JS for unit testing
-		//
-		// For now, we verify that the binary and wrapper are accessible (above
-		// tests) and document the protocol expectations here.
-
-		expect(true).toBe(true); // Placeholder — tests are structurally skipped
-	});
+		expect(sessionResponse.error).toBeUndefined();
+		expect(
+			(sessionResponse.result as { sessionId: string }).sessionId,
+		).toBeTruthy();
+		expect(
+			(
+				sessionResponse.result as {
+					modes: {
+						currentModeId: string;
+						availableModes: Array<{ id: string }>;
+					};
+				}
+			).modes.currentModeId,
+		).toBe("build");
+		expect(
+			(
+				sessionResponse.result as {
+					modes: { availableModes: Array<{ id: string }> };
+				}
+			).modes.availableModes.map((mode) => mode.id),
+		).toEqual(expect.arrayContaining(["build", "plan"]));
+	}, 120_000);
 });

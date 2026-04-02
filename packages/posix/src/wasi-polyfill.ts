@@ -14,6 +14,7 @@ import {
   FILETYPE_CHARACTER_DEVICE,
   FILETYPE_SYMBOLIC_LINK,
   FDFLAG_APPEND,
+  FDFLAG_NONBLOCK,
   RIGHT_FD_DATASYNC,
   RIGHT_FD_READ,
   RIGHT_FD_SEEK,
@@ -197,6 +198,7 @@ export interface WasiOptions {
   env?: Record<string, string>;
   stdin?: Uint8Array | string | null;
   memory?: { buffer: ArrayBuffer } | null;
+  onFdFlagsChanged?: (fd: number, flags: number, entry: FDEntry) => void;
 }
 
 /** VFS inode as returned by WasiVFS.getInodeByIno(). */
@@ -246,6 +248,7 @@ export class WasiPolyfill {
   private _stdoutChunks: Uint8Array[];
   private _stderrChunks: Uint8Array[];
   private _preopens: Map<number, string>;
+  private _onFdFlagsChanged: ((fd: number, flags: number, entry: FDEntry) => void) | null;
 
   constructor(fdTable: WasiFDTable, vfs: WasiVFS, options: WasiOptions) {
     this.fdTable = fdTable;
@@ -256,6 +259,7 @@ export class WasiPolyfill {
     this._processIO = options.processIO;
     this.memory = options.memory ?? null;
     this.exitCode = null;
+    this._onFdFlagsChanged = options.onFdFlagsChanged ?? null;
 
     // Stdin
     if (typeof options.stdin === 'string') {
@@ -626,6 +630,9 @@ export class WasiPolyfill {
     if (!(entry.rightsBase & RIGHT_FD_FDSTAT_SET_FLAGS)) return ERRNO_EBADF;
 
     entry.fdflags = flags;
+    if (entry.resource.type === 'socket') {
+      this._onFdFlagsChanged?.(fd, flags & FDFLAG_NONBLOCK, entry);
+    }
     return ERRNO_SUCCESS;
   }
 

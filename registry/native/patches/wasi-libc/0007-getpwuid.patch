@@ -10,35 +10,12 @@ struct passwd and getpwuid().
 
 Import signature matches wasmvm/crates/wasi-ext/src/lib.rs exactly.
 
---- a/scripts/install-include-headers.sh
-+++ b/scripts/install-include-headers.sh
-@@ -64,4 +64,4 @@
-     "sys/fanotify.h" "sys/personality.h" "elf.h" "link.h" "bits/link.h" \
--    "scsi/scsi.h" "scsi/scsi_ioctl.h" "scsi/sg.h" "sys/auxv.h" "pwd.h" \
-+    "scsi/scsi.h" "scsi/scsi_ioctl.h" "scsi/sg.h" "sys/auxv.h" \
-     "shadow.h" "grp.h" "mntent.h" "resolv.h" "pty.h" "ulimit.h" "sys/xattr.h" \
-
---- a/libc-top-half/musl/src/passwd/getpwent.c
-+++ b/libc-top-half/musl/src/passwd/getpwent.c
-@@ -22,12 +22,14 @@
- 	return res;
- }
-
-+#ifdef __wasilibc_unmodified_upstream /* getpwuid via /etc/passwd — replaced by host_user import */
- struct passwd *getpwuid(uid_t uid)
- {
- 	struct passwd *res;
- 	__getpw_a(0, uid, &pw, &line, &size, &res);
- 	return res;
- }
-+#endif
-
- struct passwd *getpwnam(const char *name)
- {
-
+diff --git a/libc-bottom-half/sources/host_user_getpwuid.c b/libc-bottom-half/sources/host_user_getpwuid.c
+new file mode 100644
+index 0000000..c80a680
 --- /dev/null
 +++ b/libc-bottom-half/sources/host_user_getpwuid.c
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,56 @@
 +// getpwuid() via wasmVM host_user.getpwuid import.
 +//
 +// Replaces musl's /etc/passwd-based implementation with a call to our
@@ -56,7 +33,6 @@ Import signature matches wasmvm/crates/wasi-ext/src/lib.rs exactly.
 +#define WASM_IMPORT(mod, fn) \
 +    __attribute__((__import_module__(mod), __import_name__(fn)))
 +
-+// host_user.getpwuid(uid: u32, buf_ptr: *mut u8, buf_len: u32, ret_len: *mut u32) -> errno
 +WASM_IMPORT("host_user", "getpwuid")
 +uint32_t __host_getpwuid(uint32_t uid, uint8_t *buf_ptr, uint32_t buf_len, uint32_t *ret_len);
 +
@@ -75,7 +51,6 @@ Import signature matches wasmvm/crates/wasi-ext/src/lib.rs exactly.
 +
 +    pw_buf[ret_len] = '\0';
 +
-+    // Parse "name:passwd:uid:gid:gecos:home:shell"
 +    char *fields[7];
 +    int fi = 0;
 +    fields[0] = pw_buf;
@@ -85,7 +60,7 @@ Import signature matches wasmvm/crates/wasi-ext/src/lib.rs exactly.
 +            fields[++fi] = &pw_buf[i + 1];
 +        }
 +    }
-+    if (fi != 6) return NULL; /* malformed response */
++    if (fi != 6) return NULL;
 +
 +    pw_entry.pw_name   = fields[0];
 +    pw_entry.pw_passwd = fields[1];
@@ -97,3 +72,35 @@ Import signature matches wasmvm/crates/wasi-ext/src/lib.rs exactly.
 +
 +    return &pw_entry;
 +}
+diff --git a/libc-top-half/musl/src/passwd/getpwent.c b/libc-top-half/musl/src/passwd/getpwent.c
+index f2bd516..6ca7e67 100644
+--- a/libc-top-half/musl/src/passwd/getpwent.c
++++ b/libc-top-half/musl/src/passwd/getpwent.c
+@@ -22,12 +22,14 @@ struct passwd *getpwent()
+ 	return res;
+ }
+ 
++#ifdef __wasilibc_unmodified_upstream /* getpwuid via /etc/passwd - replaced by host_user import */
+ struct passwd *getpwuid(uid_t uid)
+ {
+ 	struct passwd *res;
+ 	__getpw_a(0, uid, &pw, &line, &size, &res);
+ 	return res;
+ }
++#endif
+ 
+ struct passwd *getpwnam(const char *name)
+ {
+diff --git a/scripts/install-include-headers.sh b/scripts/install-include-headers.sh
+index efa48aa..30b2da5 100755
+--- a/scripts/install-include-headers.sh
++++ b/scripts/install-include-headers.sh
+@@ -62,7 +62,7 @@ MUSL_OMIT_HEADERS+=("sys/procfs.h" "sys/user.h" "sys/kd.h" "sys/vt.h" \
+     "sys/swap.h" "sys/sendfile.h" "sys/inotify.h" "sys/quota.h" "sys/klog.h" \
+     "sys/fsuid.h" "sys/io.h" "sys/prctl.h" "sys/mtio.h" "sys/mount.h" \
+     "sys/fanotify.h" "sys/personality.h" "elf.h" "link.h" "bits/link.h" \
+-    "scsi/scsi.h" "scsi/scsi_ioctl.h" "scsi/sg.h" "sys/auxv.h" "pwd.h" \
++    "scsi/scsi.h" "scsi/scsi_ioctl.h" "scsi/sg.h" "sys/auxv.h" \
+     "shadow.h" "grp.h" "mntent.h" "resolv.h" "pty.h" "ulimit.h" "sys/xattr.h" \
+     "wordexp.h" "spawn.h" "sys/membarrier.h" "sys/signalfd.h" "termios.h" \
+     "sys/termios.h" "bits/termios.h" "net/if.h" "net/if_arp.h" \

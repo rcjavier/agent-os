@@ -18,7 +18,7 @@ defineFsDriverTests({
 		symlinks: true,
 		hardLinks: true,
 		permissions: true,
-		utimes: false,
+		utimes: true,
 		truncate: true,
 		pread: true,
 		mkdir: true,

@@ -108,7 +108,10 @@ function createTestHostAdapter(): HostNetworkAdapter {
 /** Create a mock kernel with a real SocketTable + HostNetworkAdapter for tests. */
 function createMockKernel() {
   const hostAdapter = createTestHostAdapter();
-  const socketTable = new SocketTable({ hostAdapter });
+  const socketTable = new SocketTable({
+    hostAdapter,
+    networkCheck: () => ({ allow: true }),
+  });
   const pipeManager = new PipeManager();
   const pipeDescriptions = new Map<number, number>();
   let nextPipeFd = 10_000;

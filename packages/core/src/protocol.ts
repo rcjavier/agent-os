@@ -2,14 +2,14 @@
 
 export interface JsonRpcRequest {
 	jsonrpc: "2.0";
-	id: number;
+	id: number | string | null;
 	method: string;
 	params?: unknown;
 }
 
 export interface JsonRpcResponse {
 	jsonrpc: "2.0";
-	id: number;
+	id: number | string | null;
 	result?: unknown;
 	error?: JsonRpcError;
 }
@@ -27,14 +27,14 @@ export interface JsonRpcNotification {
 }
 
 export function serializeMessage(
-	msg: JsonRpcRequest | JsonRpcNotification,
+	msg: JsonRpcRequest | JsonRpcResponse | JsonRpcNotification,
 ): string {
 	return `${JSON.stringify(msg)}\n`;
 }
 
 export function deserializeMessage(
 	line: string,
-): JsonRpcResponse | JsonRpcNotification | null {
+): JsonRpcRequest | JsonRpcResponse | JsonRpcNotification | null {
 	try {
 		const parsed = JSON.parse(line);
 		if (parsed?.jsonrpc !== "2.0") return null;
@@ -45,7 +45,13 @@ export function deserializeMessage(
 }
 
 export function isResponse(
-	msg: JsonRpcResponse | JsonRpcNotification,
+	msg: JsonRpcRequest | JsonRpcResponse | JsonRpcNotification,
 ): msg is JsonRpcResponse {
-	return "id" in msg;
+	return "id" in msg && !("method" in msg);
+}
+
+export function isRequest(
+	msg: JsonRpcRequest | JsonRpcResponse | JsonRpcNotification,
+): msg is JsonRpcRequest {
+	return "id" in msg && "method" in msg;
 }

@@ -171,6 +171,11 @@ function rpcCall(call: string, args: Record<string, unknown>): {
   return { errno, intResult, data };
 }
 
+const FD_POLL_READABLE = 0x1;
+const FD_POLL_WRITABLE = 0x2;
+const FD_POLL_HANGUP = 0x4;
+const FD_POLL_INVALID = 0x8;
+
 // -------------------------------------------------------------------------
 // Local FD table — mirrors kernel state for rights checking / routing
 // -------------------------------------------------------------------------
@@ -1276,16 +1281,34 @@ async function main(): Promise<void> {
     processIO,
     args: [init.command, ...init.args],
     env: init.env,
+    onFdFlagsChanged(fd, flags, entry) {
+      if (entry.resource.type !== 'socket') return;
+      rpcCall('netSetNonBlocking', {
+        fd: getKernelFd(fd),
+        nonBlocking: flags !== 0,
+      });
+    },
   });
 
   // Route stdin through kernel pipe when piped
   if (init.stdinFd !== undefined) {
     polyfill.setStdinReader((buf, offset, length) => {
-      const res = rpcCall('fdRead', { fd: 0, length });
-      if (res.errno !== 0 || res.data.length === 0) return 0; // EOF or error
-      const n = Math.min(res.data.length, length);
-      buf.set(res.data.subarray(0, n), offset);
-      return n;
+      while (true) {
+        const res = rpcCall('fdRead', { fd: 0, length });
+        if (res.errno !== 0) return 0;
+        if (res.data.length > 0) {
+          const n = Math.min(res.data.length, length);
+          buf.set(res.data.subarray(0, n), offset);
+          return n;
+        }
+
+        const poll = rpcCall('fdPoll', { fd: 0 });
+        if (poll.errno !== 0 || (poll.intResult & (FD_POLL_HANGUP | FD_POLL_INVALID)) !== 0) {
+          return 0;
+        }
+
+        rpcCall('fdPollWait', { fd: 0, timeout: -1 });
+      }
     });
   }
 

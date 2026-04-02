@@ -20,6 +20,11 @@ import { createStdoutLineIterable } from "../src/stdout-lines.js";
 const COMPREHENSIVE_MOCK = `
 let buffer = '';
 let sessionCounter = 0;
+let currentModeId = 'normal';
+let configOptions = [
+  { id: 'model-opt', category: 'model', label: 'Model', currentValue: 'default', allowedValues: [{ id: 'default' }, { id: 'opus' }] },
+  { id: 'thought-opt', category: 'thought_level', label: 'Thought Level', currentValue: 'medium' },
+];
 
 process.stdin.resume();
 process.stdin.on('data', (chunk) => {
@@ -59,16 +64,13 @@ process.stdin.on('data', (chunk) => {
               mcp_tools: true,
             },
             modes: {
-              currentModeId: 'normal',
+              currentModeId,
               availableModes: [
                 { id: 'normal', label: 'Normal' },
                 { id: 'plan', label: 'Plan' },
               ],
             },
-            configOptions: [
-              { id: 'model-opt', category: 'model', label: 'Model', currentValue: 'default', allowedValues: [{ id: 'default' }, { id: 'opus' }] },
-              { id: 'thought-opt', category: 'thought_level', label: 'Thought Level', currentValue: 'medium' },
-            ],
+            configOptions,
           };
           break;
 
@@ -111,10 +113,38 @@ process.stdin.on('data', (chunk) => {
           break;
 
         case 'session/set_mode':
+          currentModeId = msg.params.modeId;
+          process.stdout.write(JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: msg.params.sessionId,
+              update: {
+                sessionUpdate: 'current_mode_update',
+                currentModeId,
+              },
+            },
+          }) + '\\n');
           result = { modeId: msg.params.modeId, applied: true };
           break;
 
         case 'session/set_config_option':
+          configOptions = configOptions.map((option) =>
+            option.id === msg.params.configId
+              ? { ...option, currentValue: msg.params.value }
+              : option,
+          );
+          process.stdout.write(JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: msg.params.sessionId,
+              update: {
+                sessionUpdate: 'config_option_update',
+                configOptions,
+              },
+            },
+          }) + '\\n');
           result = { configId: msg.params.configId, value: msg.params.value, applied: true };
           break;
 
@@ -279,6 +309,7 @@ describe("comprehensive session API tests", () => {
 		const result = response.result as { modeId: string; applied: boolean };
 		expect(result.modeId).toBe("plan");
 		expect(result.applied).toBe(true);
+		expect(vm.getSessionModes(sessionId)?.currentModeId).toBe("plan");
 
 		vm.closeSession(sessionId);
 	}, 30_000);
@@ -299,6 +330,11 @@ describe("comprehensive session API tests", () => {
 		expect(result.configId).toBe("model-opt");
 		expect(result.value).toBe("opus");
 		expect(result.applied).toBe(true);
+		expect(
+			vm
+				.getSessionConfigOptions(sessionId)
+				.find((option) => option.id === "model-opt")?.currentValue,
+		).toBe("opus");
 
 		vm.closeSession(sessionId);
 	}, 30_000);
@@ -643,10 +679,15 @@ describe("comprehensive session API tests", () => {
 			value: string;
 			applied: boolean;
 		};
-		// Falls back to using 'thought_level' (the category name) as configId
-		expect(result.configId).toBe("thought_level");
+		// With a matching config option present, the category resolves to the option id.
+		expect(result.configId).toBe("thought-opt");
 		expect(result.value).toBe("high");
 		expect(result.applied).toBe(true);
+		expect(
+			vm
+				.getSessionConfigOptions(sessionId)
+				.find((option) => option.id === "thought-opt")?.currentValue,
+		).toBe("high");
 
 		vm.closeSession(sessionId);
 	}, 30_000);
@@ -690,7 +731,7 @@ describe("comprehensive session API tests", () => {
 		);
 	}, 30_000);
 
-	test("getModes() returns modes from initialize, null without modes, unchanged after setMode()", async () => {
+	test("getModes() returns modes from initialize, null without modes, and updates after setMode()", async () => {
 		const { sessionId } = await createTrackedSession(
 			vm,
 			"/tmp/getmodes-mock.mjs",
@@ -762,14 +803,13 @@ describe("comprehensive session API tests", () => {
 		expect(vm.getSessionModes(sessionId2)).toBeNull();
 		vm.closeSession(sessionId2);
 
-		// 3. After setMode(), getSessionModes() still returns the original modes
-		// (modes are agent-reported, not client-tracked)
+		// 3. After setMode(), getSessionModes() reflects the agent-reported update.
 		const resp = await vm.setSessionMode(sessionId, "plan");
 		expect(resp.error).toBeUndefined();
 
 		const modesAfter = vm.getSessionModes(sessionId);
 		expect(modesAfter).not.toBeNull();
-		expect(modesAfter?.currentModeId).toBe("normal");
+		expect(modesAfter?.currentModeId).toBe("plan");
 		expect(modesAfter?.availableModes).toHaveLength(2);
 
 		vm.closeSession(sessionId);

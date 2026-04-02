@@ -2,28 +2,25 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	allowAllEnv,
 	allowAllNetwork,
-	PythonRuntime,
 	createInMemoryFileSystem,
-	createNodeDriver,
-} from "../../../src/index.js";
-import { createPyodideRuntimeDriverFactory } from "@secure-exec/python";
-import type { PythonRuntimeOptions } from "../../../src/index.js";
+	type RuntimeDriverOptions,
+} from "@secure-exec/core";
+import { createNodeDriver } from "@secure-exec/nodejs";
+import { PyodideRuntimeDriver } from "../../src/driver.ts";
 
-type RuntimeOptions = Omit<
-	PythonRuntimeOptions,
-	"systemDriver" | "runtimeDriverFactory"
->;
+type RuntimeOptions = Pick<RuntimeDriverOptions, "cpuTimeLimitMs" | "onStdio">;
 
 describe("runtime driver specific: python", () => {
-	const runtimes = new Set<PythonRuntime>();
+	const runtimes = new Set<PyodideRuntimeDriver>();
 
-	const createRuntime = (options: RuntimeOptions = {}): PythonRuntime => {
-		const runtime = new PythonRuntime({
+	const createRuntime = (options: RuntimeOptions = {}): PyodideRuntimeDriver => {
+		const systemDriver = createNodeDriver({
+			filesystem: createInMemoryFileSystem(),
+		});
+		const runtime = new PyodideRuntimeDriver({
 			...options,
-			systemDriver: createNodeDriver({
-				filesystem: createInMemoryFileSystem(),
-			}),
-			runtimeDriverFactory: createPyodideRuntimeDriverFactory(),
+			system: systemDriver,
+			runtime: systemDriver.runtime,
 		});
 		runtimes.add(runtime);
 		return runtime;
@@ -70,12 +67,13 @@ describe("runtime driver specific: python", () => {
 	});
 
 	it("streams stdio and applies run overrides without leaking them", async () => {
-		const runtime = new PythonRuntime({
-			systemDriver: createNodeDriver({
+		const systemDriver = createNodeDriver({
 				filesystem: createInMemoryFileSystem(),
 				permissions: allowAllEnv,
-			}),
-			runtimeDriverFactory: createPyodideRuntimeDriverFactory(),
+		});
+		const runtime = new PyodideRuntimeDriver({
+			system: systemDriver,
+			runtime: systemDriver.runtime,
 		});
 		runtimes.add(runtime);
 
@@ -125,14 +123,17 @@ describe("runtime driver specific: python", () => {
 	});
 
 	it("reports ENOSYS for python-accessible fs hooks when no filesystem adapter exists", async () => {
-		const runtime = new PythonRuntime({
-			systemDriver: {
+		const runtime = new PyodideRuntimeDriver({
+			system: {
 				runtime: {
 					process: {},
 					os: {},
 				},
 			},
-			runtimeDriverFactory: createPyodideRuntimeDriverFactory(),
+			runtime: {
+				process: {},
+				os: {},
+			},
 		});
 		runtimes.add(runtime);
 
@@ -144,12 +145,13 @@ describe("runtime driver specific: python", () => {
 	});
 
 	it("reuses system-driver permission gates for python-accessible network hooks", async () => {
-		const runtime = new PythonRuntime({
-			systemDriver: createNodeDriver({
+		const systemDriver = createNodeDriver({
 				filesystem: createInMemoryFileSystem(),
 				useDefaultNetwork: true,
-			}),
-			runtimeDriverFactory: createPyodideRuntimeDriverFactory(),
+		});
+		const runtime = new PyodideRuntimeDriver({
+			system: systemDriver,
+			runtime: systemDriver.runtime,
 		});
 		runtimes.add(runtime);
 
@@ -161,14 +163,17 @@ describe("runtime driver specific: python", () => {
 	});
 
 	it("reports ENOSYS for python-accessible network hooks when no adapter exists", async () => {
-		const runtime = new PythonRuntime({
-			systemDriver: {
+		const runtime = new PyodideRuntimeDriver({
+			system: {
 				runtime: {
 					process: {},
 					os: {},
 				},
 			},
-			runtimeDriverFactory: createPyodideRuntimeDriverFactory(),
+			runtime: {
+				process: {},
+				os: {},
+			},
 		});
 		runtimes.add(runtime);
 
@@ -180,13 +185,14 @@ describe("runtime driver specific: python", () => {
 	});
 
 	it("allows python-accessible network hooks when permissions permit them", async () => {
-		const runtime = new PythonRuntime({
-			systemDriver: createNodeDriver({
+		const systemDriver = createNodeDriver({
 				filesystem: createInMemoryFileSystem(),
 				useDefaultNetwork: true,
 				permissions: allowAllNetwork,
-			}),
-			runtimeDriverFactory: createPyodideRuntimeDriverFactory(),
+		});
+		const runtime = new PyodideRuntimeDriver({
+			system: systemDriver,
+			runtime: systemDriver.runtime,
 		});
 		runtimes.add(runtime);
 
@@ -223,12 +229,13 @@ describe("runtime driver specific: python", () => {
 	});
 
 	it("allows exec env overrides when env permissions permit them", async () => {
-		const runtime = new PythonRuntime({
-			systemDriver: createNodeDriver({
+		const systemDriver = createNodeDriver({
 				filesystem: createInMemoryFileSystem(),
 				permissions: allowAllEnv,
-			}),
-			runtimeDriverFactory: createPyodideRuntimeDriverFactory(),
+		});
+		const runtime = new PyodideRuntimeDriver({
+			system: systemDriver,
+			runtime: systemDriver.runtime,
 		});
 		runtimes.add(runtime);
 

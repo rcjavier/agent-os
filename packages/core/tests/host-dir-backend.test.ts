@@ -28,8 +28,8 @@ defineFsDriverTests({
 			fs.rmSync(conformanceTmpDir, { recursive: true, force: true });
 	},
 	capabilities: {
-		symlinks: false,
-		hardLinks: false,
+		symlinks: true,
+		hardLinks: true,
 		permissions: true,
 		utimes: true,
 		truncate: true,

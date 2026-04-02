@@ -101,8 +101,8 @@ The registry software packages depend on `@rivet-dev/agent-os-registry-types` (i
 - Reference `~/sandbox-agent` for ACP integration patterns (how pi-acp is spawned, JSON-RPC protocol, session lifecycle). Do not copy code from it.
 - ACP docs: https://agentclientprotocol.com/get-started/introduction
 - Session design is **agent-agnostic**: each agent type has a config specifying its ACP adapter package and main agent package name
-- Currently configured agents: PI (`@rivet-dev/agent-os-pi`), PI CLI (`@rivet-dev/agent-os-pi-cli`), OpenCode (`opencode-ai`). Only PI is tested.
-- **OpenCode limitation**: OpenCode is a native ELF binary (compiled Go), not Node.js. The `opencode-ai` npm package is a wrapper that spawns the native binary. It cannot run inside the VM because the kernel only supports JS/WASM command execution.
+- Currently configured agents: PI (`@rivet-dev/agent-os-pi`), PI CLI (`@rivet-dev/agent-os-pi-cli`), OpenCode (`@rivet-dev/agent-os-opencode`), Claude (`@rivet-dev/agent-os-claude`).
+- **No host agent exceptions.** Host-native wrappers and host binary launch paths are not allowed. OpenCode support must use the real upstream OpenCode implementation rebuilt into the VM adapter package and executed inside the VM.
 - `createSession("pi")` spawns the ACP adapter inside the VM, which calls the Pi SDK directly
 
 ### Agent Adapter Approaches

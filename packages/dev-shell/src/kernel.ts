@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import * as fsPromises from "node:fs/promises";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import {
@@ -33,6 +34,7 @@ import type { WorkspacePaths } from "./shared.js";
 import { collectShellEnv, resolveWorkspacePaths } from "./shared.js";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+const moduleRequire = createRequire(import.meta.url);
 
 export interface DevShellOptions {
 	workDir?: string;
@@ -538,15 +540,33 @@ class SandboxNodeScriptDriver implements RuntimeDriver {
 }
 
 function resolvePiCliPath(paths: WorkspacePaths): string | undefined {
-	const piCliPath = path.join(
-		paths.secureExecRoot,
-		"node_modules",
-		"@mariozechner",
-		"pi-coding-agent",
-		"dist",
-		"cli.js",
-	);
-	return existsSync(piCliPath) ? piCliPath : undefined;
+	try {
+		return moduleRequire.resolve("@mariozechner/pi-coding-agent/dist/cli.js");
+	} catch {
+		const candidates = [
+			path.join(
+				paths.secureExecRoot,
+				"node_modules",
+				"@mariozechner",
+				"pi-coding-agent",
+				"dist",
+				"cli.js",
+			),
+			path.join(
+				paths.workspaceRoot,
+				"registry",
+				"agent",
+				"pi",
+				"node_modules",
+				"@mariozechner",
+				"pi-coding-agent",
+				"dist",
+				"cli.js",
+			),
+		];
+
+		return candidates.find((candidate) => existsSync(candidate));
+	}
 }
 
 export async function createDevShellKernel(

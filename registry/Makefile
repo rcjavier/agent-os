@@ -68,6 +68,8 @@ $(COPY_MARKER): $(RUST_MARKER) $(C_MARKER)
 		realpath rev rm rmdir seq sha1sum sha224sum sha256sum sha384sum sha512sum \
 		shred shuf sleep sort split stat stdbuf strings _stubs sum tac tail tee \
 		test timeout touch tr true truncate tsort uname unexpand uniq unlink wc \
+		xu \
+		which \
 		whoami yes; do \
 		if [ -f "$(COMMANDS_DIR)/$$cmd" ]; then \
 			cp "$(COMMANDS_DIR)/$$cmd" software/coreutils/wasm/; \

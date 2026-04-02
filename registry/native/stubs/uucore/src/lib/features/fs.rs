@@ -355,12 +355,36 @@ pub fn normalize_path(path: &Path) -> PathBuf {
 }
 
 fn resolve_symlink<P: AsRef<Path>>(path: P) -> IOResult<Option<PathBuf>> {
-    let result = if fs::symlink_metadata(&path)?.file_type().is_symlink() {
-        Some(fs::read_link(&path)?)
-    } else {
-        None
-    };
-    Ok(result)
+    #[cfg(target_os = "wasi")]
+    {
+        let path = path.as_ref();
+        match fs::read_link(path) {
+            Ok(target) => Ok(Some(target)),
+            Err(err)
+                if err.kind() == ErrorKind::InvalidInput
+                    || (err.raw_os_error() == Some(2) && fs::metadata(path).is_ok()) =>
+            {
+                Ok(None)
+            }
+            Err(err) => {
+                let meta = fs::symlink_metadata(path)?;
+                if meta.file_type().is_symlink() {
+                    Err(err)
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        let result = if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+            Some(fs::read_link(&path)?)
+        } else {
+            None
+        };
+        Ok(result)
+    }
 }
 
 enum OwningComponent {

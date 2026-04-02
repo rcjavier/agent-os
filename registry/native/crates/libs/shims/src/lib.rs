@@ -9,4 +9,5 @@ pub mod nice;
 pub mod nohup;
 pub mod stdbuf;
 pub mod timeout;
+pub mod which;
 pub mod xargs;

@@ -9,14 +9,17 @@ const opencode = defineSoftware({
 	name: "opencode",
 	type: "agent" as const,
 	packageDir,
-	requires: ["opencode-ai"],
+	requires: ["@rivet-dev/agent-os-opencode"],
 	agent: {
 		id: "opencode",
-		// OpenCode speaks ACP natively. No separate adapter wrapper needed.
-		// NOTE: OpenCode is a native binary, not Node.js. It cannot currently
-		// run inside the secure-exec VM (kernel only supports JS/WASM commands).
-		acpAdapter: "opencode-ai",
-		agentPackage: "opencode-ai",
+		// OpenCode still speaks ACP natively, but Agent OS runs a source-built
+		// Node ACP bundle entirely inside the VM rather than a host binary wrapper.
+		acpAdapter: "@rivet-dev/agent-os-opencode",
+		agentPackage: "@rivet-dev/agent-os-opencode",
+		staticEnv: {
+			OPENCODE_DISABLE_CONFIG_DEP_INSTALL: "1",
+			OPENCODE_DISABLE_EMBEDDED_WEB_UI: "1",
+		},
 		prepareInstructions: async (kernel, _cwd, additionalInstructions, opts) => {
 			const contextPaths = opts?.skipBase
 				? []

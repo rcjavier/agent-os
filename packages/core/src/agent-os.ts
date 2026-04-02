@@ -1,5 +1,20 @@
-import { readFileSync, realpathSync } from "node:fs";
-import { join } from "node:path";
+import { spawn as spawnChildProcess } from "node:child_process";
+import {
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import {
+	basename,
+	dirname,
+	join,
+	posix as posixPath,
+	relative as relativeHostPath,
+	resolve as resolveHostPath,
+	sep as hostPathSeparator,
+} from "node:path";
 import {
 	allowAll,
 	createInMemoryFileSystem,
@@ -86,6 +101,7 @@ import { createPythonRuntime } from "@rivet-dev/agent-os-python";
 import { createWasmVmRuntime } from "@rivet-dev/agent-os-posix";
 import { AcpClient } from "./acp-client.js";
 import { AGENT_CONFIGS, type AgentConfig, type AgentType } from "./agents.js";
+import { getHostDirBackendMeta } from "./backends/host-dir-backend.js";
 import {
 	type SoftwareInput,
 	type SoftwareRoot,
@@ -115,8 +131,23 @@ import {
 	type SessionModeState,
 	type PermissionRequestHandler,
 } from "./session.js";
-import type { JsonRpcResponse } from "./protocol.js";
+import type { JsonRpcRequest, JsonRpcResponse } from "./protocol.js";
 import { createStdoutLineIterable } from "./stdout-lines.js";
+import { createSqliteBindings } from "./sqlite-bindings.js";
+
+interface HostMountInfo {
+	vmPath: string;
+	hostPath: string;
+	readOnly: boolean;
+}
+
+interface AcpTerminalState {
+	sessionId: string;
+	pid: number;
+	output: string;
+	truncated: boolean;
+	outputByteLimit: number;
+}
 
 /** Configuration for mounting a filesystem driver at a path. */
 export interface MountConfig {
@@ -238,6 +269,9 @@ export class AgentOs {
 	private _toolsServer: HostToolsServer | null = null;
 	private _toolKits: ToolKit[] = [];
 	private _shimFs: ReturnType<typeof createInMemoryFileSystem> | null = null;
+	private _hostMounts: HostMountInfo[];
+	private _acpTerminals = new Map<string, AcpTerminalState>();
+	private _acpTerminalCounter = 0;
 	private _env: Record<string, string>;
 
 	private constructor(
@@ -245,12 +279,14 @@ export class AgentOs {
 		moduleAccessCwd: string,
 		softwareRoots: SoftwareRoot[],
 		softwareAgentConfigs: Map<string, AgentConfig>,
+		hostMounts: HostMountInfo[],
 		env: Record<string, string>,
 	) {
 		this.kernel = kernel;
 		this._moduleAccessCwd = moduleAccessCwd;
 		this._softwareRoots = softwareRoots;
 		this._softwareAgentConfigs = softwareAgentConfigs;
+		this._hostMounts = hostMounts;
 		this._env = env;
 	}
 
@@ -267,6 +303,21 @@ export class AgentOs {
 			fs: m.driver,
 			readOnly: m.readOnly,
 		}));
+		const hostMounts = (options?.mounts ?? [])
+			.flatMap((mount) => {
+				const meta = getHostDirBackendMeta(mount.driver);
+				if (!meta) {
+					return [];
+				}
+				return [
+					{
+						vmPath: posixPath.normalize(mount.path),
+						hostPath: meta.hostPath,
+						readOnly: mount.readOnly ?? meta.readOnly,
+					},
+				];
+			})
+			.sort((a, b) => b.vmPath.length - a.vmPath.length);
 
 		// Start host tools RPC server before kernel creation so the port
 		// can be included in the kernel env and loopback exemptions.
@@ -324,6 +375,7 @@ export class AgentOs {
 		);
 		await kernel.mount(
 			createNodeRuntime({
+				bindings: createSqliteBindings(kernel),
 				loopbackExemptPorts,
 				moduleAccessCwd,
 				packageRoots: processed.softwareRoots.length > 0
@@ -338,6 +390,7 @@ export class AgentOs {
 			moduleAccessCwd,
 			processed.softwareRoots,
 			processed.agentConfigs,
+			hostMounts,
 			env,
 		);
 		vm._toolsServer = toolsServer;
@@ -356,6 +409,31 @@ export class AgentOs {
 		options?: KernelExecOptions,
 	): Promise<KernelExecResult> {
 		return this.kernel.exec(command, options);
+	}
+
+	private _trackProcess(
+		proc: ManagedProcess,
+		command: string,
+		args: string[],
+		stdoutHandlers: Set<(data: Uint8Array) => void>,
+		stderrHandlers: Set<(data: Uint8Array) => void>,
+		exitHandlers: Set<(exitCode: number) => void>,
+	): { pid: number } {
+		const entry = {
+			proc,
+			command,
+			args,
+			stdoutHandlers,
+			stderrHandlers,
+			exitHandlers,
+		};
+		this._processes.set(proc.pid, entry);
+
+		proc.wait().then((code) => {
+			for (const h of exitHandlers) h(code);
+		});
+
+		return { pid: proc.pid };
 	}
 
 	spawn(
@@ -381,22 +459,14 @@ export class AgentOs {
 			},
 		});
 
-		const entry = {
+		return this._trackProcess(
 			proc,
 			command,
 			args,
 			stdoutHandlers,
 			stderrHandlers,
 			exitHandlers,
-		};
-		this._processes.set(proc.pid, entry);
-
-		// Monitor exit and notify handlers.
-		proc.wait().then((code) => {
-			for (const h of exitHandlers) h(code);
-		});
-
-		return { pid: proc.pid };
+		);
 	}
 
 	/** Write data to a process's stdin. */
@@ -690,6 +760,251 @@ export class AgentOs {
 		this._shells.delete(shellId);
 	}
 
+	private _resolveVmPathToHostPath(vmPath: string): string | null {
+		const normalizedVmPath = posixPath.normalize(vmPath);
+		for (const mount of this._hostMounts) {
+			if (
+				normalizedVmPath === mount.vmPath ||
+				normalizedVmPath.startsWith(`${mount.vmPath}/`)
+			) {
+				const relativePath = posixPath.relative(mount.vmPath, normalizedVmPath);
+				if (!relativePath) {
+					return mount.hostPath;
+				}
+				return join(
+					mount.hostPath,
+					...relativePath.split("/").filter(Boolean),
+				);
+			}
+		}
+		return null;
+	}
+
+	private _resolveHostPathToVmPath(hostPath: string): string | null {
+		const normalizedHostPath = resolveHostPath(hostPath);
+		for (const mount of this._hostMounts) {
+			if (
+				normalizedHostPath === mount.hostPath ||
+				normalizedHostPath.startsWith(
+					`${mount.hostPath}${hostPathSeparator}`,
+				)
+			) {
+				const relativePath = relativeHostPath(
+					mount.hostPath,
+					normalizedHostPath,
+				);
+				if (!relativePath) {
+					return mount.vmPath;
+				}
+				return posixPath.join(
+					mount.vmPath,
+					...relativePath.split(hostPathSeparator).filter(Boolean),
+				);
+			}
+		}
+		return null;
+	}
+
+	private _normalizeClientPathToVmPath(clientPath: string): string {
+		if (!clientPath.startsWith("/")) {
+			throw new Error(`ACP path must be absolute: ${clientPath}`);
+		}
+		return (
+			this._resolveHostPathToVmPath(clientPath) ??
+			posixPath.normalize(clientPath)
+		);
+	}
+
+	private _appendTerminalOutput(
+		terminal: AcpTerminalState,
+		data: Uint8Array,
+	): void {
+		terminal.output += new TextDecoder().decode(data);
+		if (terminal.outputByteLimit <= 0) {
+			terminal.output = "";
+			terminal.truncated = true;
+			return;
+		}
+
+		while (Buffer.byteLength(terminal.output, "utf8") > terminal.outputByteLimit) {
+			terminal.output = terminal.output.slice(1);
+			terminal.truncated = true;
+		}
+	}
+
+	private async _handleInboundAcpRequest(
+		request: JsonRpcRequest,
+	): Promise<{ result?: unknown } | null> {
+		const params = (
+			request.params && typeof request.params === "object"
+				? (request.params as Record<string, unknown>)
+				: {}
+		);
+
+		switch (request.method) {
+			case "fs/read_text_file": {
+				const path = params.path;
+				if (typeof path !== "string") {
+					throw new Error("fs/read_text_file requires a string path");
+				}
+				const vmPath = this._normalizeClientPathToVmPath(path);
+				const content = new TextDecoder().decode(await this.readFile(vmPath));
+				const startLine = Math.max(
+					1,
+					typeof params.line === "number" ? params.line : 1,
+				);
+				const limit =
+					typeof params.limit === "number" ? params.limit : undefined;
+				const lines = content.split("\n");
+				const sliced = lines.slice(
+					startLine - 1,
+					limit === undefined ? undefined : startLine - 1 + limit,
+				);
+				return { result: { content: sliced.join("\n") } };
+			}
+			case "fs/write_text_file": {
+				const path = params.path;
+				const content = params.content;
+				if (typeof path !== "string" || typeof content !== "string") {
+					throw new Error(
+						"fs/write_text_file requires string path and content",
+					);
+				}
+				await this.writeFile(this._normalizeClientPathToVmPath(path), content);
+				return { result: null };
+			}
+			case "terminal/create": {
+				const command = params.command;
+				if (typeof command !== "string") {
+					throw new Error("terminal/create requires a command");
+				}
+				const args = Array.isArray(params.args)
+					? params.args.filter((arg): arg is string => typeof arg === "string")
+					: [];
+				const env = Array.isArray(params.env)
+					? Object.fromEntries(
+							params.env
+								.map((entry) => {
+									if (
+										!entry ||
+										typeof entry !== "object" ||
+										typeof (entry as { name?: unknown }).name !== "string" ||
+										typeof (entry as { value?: unknown }).value !== "string"
+									) {
+										return null;
+									}
+									return [
+										(entry as { name: string }).name,
+										(entry as { value: string }).value,
+									];
+								})
+								.filter(
+									(
+										entry,
+									): entry is [string, string] => Array.isArray(entry),
+								),
+						)
+					: undefined;
+				const cwd =
+					typeof params.cwd === "string"
+						? this._normalizeClientPathToVmPath(params.cwd)
+						: undefined;
+				const outputByteLimit =
+					typeof params.outputByteLimit === "number"
+						? params.outputByteLimit
+						: 1_048_576;
+				const terminalId = `acp-term-${++this._acpTerminalCounter}`;
+				const { pid } = this.spawn(command, args, {
+					cwd,
+					env,
+					onStdout: (data) => {
+						const terminal = this._acpTerminals.get(terminalId);
+						if (terminal) {
+							this._appendTerminalOutput(terminal, data);
+						}
+					},
+					onStderr: (data) => {
+						const terminal = this._acpTerminals.get(terminalId);
+						if (terminal) {
+							this._appendTerminalOutput(terminal, data);
+						}
+					},
+				});
+				this._acpTerminals.set(terminalId, {
+					sessionId:
+						typeof params.sessionId === "string" ? params.sessionId : "",
+					pid,
+					output: "",
+					truncated: false,
+					outputByteLimit,
+				});
+				return { result: { terminalId } };
+			}
+			case "terminal/output": {
+				const terminalId = params.terminalId;
+				if (typeof terminalId !== "string") {
+					throw new Error("terminal/output requires a terminalId");
+				}
+				const terminal = this._acpTerminals.get(terminalId);
+				if (!terminal) {
+					throw new Error(`ACP terminal not found: ${terminalId}`);
+				}
+				const proc = this.getProcess(terminal.pid);
+				return {
+					result: {
+						output: terminal.output,
+						truncated: terminal.truncated,
+						exitStatus:
+							proc.exitCode === null
+								? undefined
+								: { exitCode: proc.exitCode, signal: null },
+					},
+				};
+			}
+			case "terminal/wait_for_exit": {
+				const terminalId = params.terminalId;
+				if (typeof terminalId !== "string") {
+					throw new Error("terminal/wait_for_exit requires a terminalId");
+				}
+				const terminal = this._acpTerminals.get(terminalId);
+				if (!terminal) {
+					throw new Error(`ACP terminal not found: ${terminalId}`);
+				}
+				const exitCode = await this.waitProcess(terminal.pid);
+				return { result: { exitCode, signal: null } };
+			}
+			case "terminal/kill": {
+				const terminalId = params.terminalId;
+				if (typeof terminalId !== "string") {
+					throw new Error("terminal/kill requires a terminalId");
+				}
+				const terminal = this._acpTerminals.get(terminalId);
+				if (!terminal) {
+					throw new Error(`ACP terminal not found: ${terminalId}`);
+				}
+				this.killProcess(terminal.pid);
+				return { result: null };
+			}
+			case "terminal/release": {
+				const terminalId = params.terminalId;
+				if (typeof terminalId !== "string") {
+					throw new Error("terminal/release requires a terminalId");
+				}
+				const terminal = this._acpTerminals.get(terminalId);
+				if (!terminal) {
+					throw new Error(`ACP terminal not found: ${terminalId}`);
+				}
+				if (this.getProcess(terminal.pid).exitCode === null) {
+					this.killProcess(terminal.pid);
+				}
+				this._acpTerminals.delete(terminalId);
+				return { result: null };
+			}
+			default:
+				return null;
+		}
+	}
+
 	/** Returns info about all processes spawned via spawn(). */
 	listProcesses(): SpawnedProcessInfo[] {
 		return [...this._processes.values()].map(({ proc, command, args }) => ({
@@ -827,6 +1142,63 @@ export class AgentOs {
 		}).filter((entry): entry is AgentRegistryEntry => entry !== null);
 	}
 
+	private _deriveSessionConfigOptions(
+		agentType: string,
+		sessionResult: Record<string, unknown> | undefined,
+	): SessionConfigOption[] {
+		const models =
+			sessionResult?.models && typeof sessionResult.models === "object"
+				? (sessionResult.models as Record<string, unknown>)
+				: null;
+		if (!models) {
+			return [];
+		}
+
+		const currentModelId =
+			typeof models.currentModelId === "string"
+				? models.currentModelId
+				: undefined;
+		const allowedValues = Array.isArray(models.availableModels)
+			? models.availableModels.reduce<Array<{ id: string; label?: string }>>(
+					(acc, model) => {
+						if (!model || typeof model !== "object") {
+							return acc;
+						}
+						const modelId = (model as { modelId?: unknown }).modelId;
+						const name = (model as { name?: unknown }).name;
+						if (typeof modelId !== "string") {
+							return acc;
+						}
+						acc.push({
+							id: modelId,
+							label: typeof name === "string" ? name : undefined,
+						});
+						return acc;
+					},
+					[],
+				)
+			: [];
+
+		if (!currentModelId && allowedValues.length === 0) {
+			return [];
+		}
+
+		return [
+			{
+				id: "model",
+				category: "model",
+				label: "Model",
+				description:
+					agentType === "opencode"
+						? "Available models reported by OpenCode. Model switching must be configured before createSession() because ACP session/set_config_option is not implemented."
+						: undefined,
+				currentValue: currentModelId,
+				allowedValues,
+				readOnly: agentType === "opencode",
+			},
+		];
+	}
+
 	/**
 	 * Spawn an ACP-compatible coding agent inside the VM and return a Session.
 	 *
@@ -843,9 +1215,6 @@ export class AgentOs {
 		if (!config) {
 			throw new Error(`Unknown agent type: ${agentType}`);
 		}
-
-		// Resolve the adapter's CLI entry point from mounted node_modules
-		const binPath = this._resolveAdapterBin(config.acpAdapter);
 
 		// Generate tool reference from VM-level toolkits. This is always
 		// injected into the agent prompt, even when skipOsInstructions is true.
@@ -877,51 +1246,62 @@ export class AgentOs {
 
 		// Create stdout line iterable wired via onStdout callback
 		const { iterable, onStdout } = createStdoutLineIterable();
-
-		// Spawn the adapter inside the VM with streaming stdin.
-		// Use the public spawn() so the onStdout callback is properly wired
-		// through the process handler multiplexer.
-		// Env priority (lowest to highest): defaultEnv, prepareInstructions env, user env
-		const { pid } = this.spawn("node", [binPath, ...extraArgs], {
+		const launchArgs = [...(config.launchArgs ?? []), ...extraArgs];
+		let launchEnv = { ...config.defaultEnv, ...extraEnv, ...options?.env };
+		let sessionCwd = options?.cwd ?? "/home/user";
+		const binPath = this._resolveAdapterBin(config.acpAdapter);
+		const pid = this.spawn("node", [binPath, ...launchArgs], {
 			streamStdin: true,
 			onStdout,
-			env: { ...config.defaultEnv, ...extraEnv, ...options?.env },
+			env: launchEnv,
 			cwd: options?.cwd,
-		});
+		}).pid;
+
 		const proc = this._processes.get(pid)!.proc;
-
-		// Wire up ACP client
-		const client = new AcpClient(proc, iterable);
-
-		// Initialize the ACP protocol
-		const initResponse = await client.request("initialize", {
-			protocolVersion: 1,
-			clientCapabilities: {},
+		const client = new AcpClient(proc, iterable, {
+			requestHandler: (request) => this._handleInboundAcpRequest(request),
 		});
-		if (initResponse.error) {
-			client.close();
-			throw new Error(
-				`ACP initialize failed: ${initResponse.error.message}`,
-			);
-		}
 
-		// Create a new session
-		const sessionResponse = await client.request("session/new", {
-			cwd: options?.cwd ?? "/home/user",
-			mcpServers: options?.mcpServers ?? [],
-		});
-		if (sessionResponse.error) {
+		let initResponse: JsonRpcResponse;
+		let sessionResponse: JsonRpcResponse;
+		try {
+			initResponse = await client.request("initialize", {
+				protocolVersion: 1,
+				clientCapabilities: {
+					fs: {
+						readTextFile: true,
+						writeTextFile: true,
+					},
+					terminal: true,
+				},
+			});
+			if (initResponse.error) {
+				throw new Error(`ACP initialize failed: ${initResponse.error.message}`);
+			}
+
+			sessionResponse = await client.request("session/new", {
+				cwd: sessionCwd,
+				mcpServers: options?.mcpServers ?? [],
+			});
+			if (sessionResponse.error) {
+				throw new Error(
+					`ACP session/new failed: ${sessionResponse.error.message}`,
+				);
+			}
+		} catch (error) {
 			client.close();
-			throw new Error(
-				`ACP session/new failed: ${sessionResponse.error.message}`,
-			);
+			throw error;
 		}
 
 		const sessionId = (sessionResponse.result as { sessionId: string })
 			.sessionId;
 
-		// Extract capabilities, agentInfo, modes, and config options from initialize response
+		// Extract initialize-scoped metadata, then allow session/new to
+		// override with session-scoped modes/config options when present.
 		const initResult = initResponse.result as
+			| Record<string, unknown>
+			| undefined;
+		const sessionResult = sessionResponse.result as
 			| Record<string, unknown>
 			| undefined;
 		const initData: SessionInitData = {};
@@ -942,6 +1322,25 @@ export class AgentOs {
 					initResult.agentInfo as SessionInitData["agentInfo"];
 			}
 		}
+		if (sessionResult) {
+			if (sessionResult.modes) {
+				initData.modes = sessionResult.modes as SessionInitData["modes"];
+			}
+			if (sessionResult.configOptions) {
+				initData.configOptions =
+					sessionResult.configOptions as SessionInitData["configOptions"];
+			}
+		}
+		const derivedConfigOptions = this._deriveSessionConfigOptions(
+			agentType,
+			sessionResult,
+		);
+		if (derivedConfigOptions.length > 0) {
+			initData.configOptions = [
+				...(initData.configOptions ?? []),
+				...derivedConfigOptions,
+			];
+		}
 
 		const session = new Session(
 			client,
@@ -949,6 +1348,15 @@ export class AgentOs {
 			agentType,
 			initData,
 			() => {
+				for (const [terminalId, terminal] of this._acpTerminals) {
+					if (terminal.sessionId !== sessionId) {
+						continue;
+					}
+					if (this.getProcess(terminal.pid).exitCode === null) {
+						this.killProcess(terminal.pid);
+					}
+					this._acpTerminals.delete(terminalId);
+				}
 				this._sessions.delete(sessionId);
 			},
 		);
@@ -958,13 +1366,11 @@ export class AgentOs {
 	}
 
 	/**
-	 * Resolve the bin entry point of an ACP adapter package.
+	 * Resolve the VM bin entry point of an ACP adapter package.
 	 * Reads from the host filesystem since kernel.readFile() does NOT see
-	 * the ModuleAccessFileSystem overlay. Returns the VFS path for spawning.
+	 * the ModuleAccessFileSystem overlay.
 	 */
 	private _resolveAdapterBin(adapterPackage: string): string {
-		// Check package roots first for the adapter's package.json.
-		// Roots are already realpath-resolved by processSoftware.
 		const vmPrefix = `/root/node_modules/${adapterPackage}`;
 		let hostPkgJsonPath: string | null = null;
 		for (const root of this._softwareRoots) {
@@ -1198,6 +1604,13 @@ export class AgentOs {
 			entry.handle.kill();
 		}
 		this._shells.clear();
+
+		for (const terminal of this._acpTerminals.values()) {
+			if (this.getProcess(terminal.pid).exitCode === null) {
+				this.killProcess(terminal.pid);
+			}
+		}
+		this._acpTerminals.clear();
 
 		// Shut down the host tools RPC server
 		if (this._toolsServer) {

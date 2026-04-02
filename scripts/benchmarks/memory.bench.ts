@@ -6,14 +6,17 @@
  * The per-VM cost is the average step delta — free of one-time setup noise.
  *
  * Workloads:
- *   --workload=sleep  (default) Minimal VM with coreutils, running `sleep 99999`
- *   --workload=pi     VM with PI agent session via createSession
+ *   --workload=sleep             (default) Minimal VM with idle Node.js process
+ *   --workload=pi-session        VM with PI agent session via createSession
+ *   --workload=claude-session    VM with Claude agent session via createSession
+ *   --workload=codex-session     VM with Codex agent session via createSession
  *
  * Pass --count=N to control how many VMs to add (default 5).
  *
  * Usage:
  *   npx tsx --expose-gc benchmarks/memory.bench.ts
- *   npx tsx --expose-gc benchmarks/memory.bench.ts --workload=pi --count=1
+ *   npx tsx --expose-gc benchmarks/memory.bench.ts --workload=pi-session --count=1
+ *   npx tsx --expose-gc benchmarks/memory.bench.ts --workload=claude-session --count=1
  */
 
 import type { AgentOs } from "@rivet-dev/agent-os-core";

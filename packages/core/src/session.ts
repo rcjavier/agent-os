@@ -23,8 +23,10 @@ export type PermissionRequestHandler = (request: PermissionRequest) => void;
 /** A mode the agent supports (e.g., "plan", "normal", "full-access"). */
 export interface SessionMode {
 	id: string;
+	name?: string;
 	label?: string;
 	description?: string;
+	[key: string]: unknown;
 }
 
 /** Current mode state reported by the agent. */
@@ -41,9 +43,18 @@ export interface SessionConfigOption {
 	description?: string;
 	currentValue?: string;
 	allowedValues?: Array<{ id: string; label?: string }>;
+	readOnly?: boolean;
 }
 
-/** Boolean capability flags reported by the agent during initialize. */
+/** Prompt media capabilities reported by ACP-style adapters. */
+export interface PromptCapabilities {
+	audio?: boolean;
+	embeddedContext?: boolean;
+	image?: boolean;
+	[key: string]: unknown;
+}
+
+/** Agent capabilities reported by the agent during initialize. */
 export interface AgentCapabilities {
 	permissions?: boolean;
 	plan_mode?: boolean;
@@ -58,12 +69,16 @@ export interface AgentCapabilities {
 	status?: boolean;
 	streaming_deltas?: boolean;
 	mcp_tools?: boolean;
+	promptCapabilities?: PromptCapabilities;
+	[key: string]: unknown;
 }
 
 /** Agent identity information from the initialize response. */
 export interface AgentInfo {
 	name: string;
+	title?: string;
 	version?: string;
+	[key: string]: unknown;
 }
 
 /** Options for constructing a Session, including capabilities from initialize/session-new. */
@@ -121,32 +136,60 @@ export class Session {
 
 		// Forward notifications to appropriate handlers and store in event history
 		const handler: NotificationHandler = (notification) => {
-			// Store all notifications in event history
-			this._events.push({
-				sequenceNumber: this._nextSequence++,
-				notification,
-			});
-
-			if (notification.method === "session/update") {
-				for (const h of this._eventHandlers) {
-					h(notification);
-				}
-			} else if (notification.method === "request/permission") {
-				const params = (notification.params ?? {}) as Record<
-					string,
-					unknown
-				>;
-				const request: PermissionRequest = {
-					permissionId: params.permissionId as string,
-					description: params.description as string | undefined,
-					params,
-				};
-				for (const h of this._permissionHandlers) {
-					h(request);
-				}
-			}
+			this._recordNotification(notification);
 		};
 		this._client.onNotification(handler);
+	}
+
+	private _recordNotification(notification: JsonRpcNotification): void {
+		this._events.push({
+			sequenceNumber: this._nextSequence++,
+			notification,
+		});
+
+		if (notification.method === "session/update") {
+			this._applySessionUpdate(notification);
+			for (const h of this._eventHandlers) {
+				h(notification);
+			}
+			return;
+		}
+
+		if (notification.method === "request/permission") {
+			const params = (notification.params ?? {}) as Record<string, unknown>;
+			const request: PermissionRequest = {
+				permissionId: params.permissionId as string,
+				description: params.description as string | undefined,
+				params,
+			};
+			for (const h of this._permissionHandlers) {
+				h(request);
+			}
+		}
+	}
+
+	private _applySessionUpdate(notification: JsonRpcNotification): void {
+		const params = (notification.params ?? {}) as Record<string, unknown>;
+		const update = (params.update ?? params) as Record<string, unknown>;
+
+		if (
+			update.sessionUpdate === "current_mode_update" &&
+			typeof update.currentModeId === "string" &&
+			this._modes
+		) {
+			this._modes = {
+				...this._modes,
+				currentModeId: update.currentModeId,
+			};
+		}
+
+		if (
+			(update.sessionUpdate === "config_option_update" ||
+				update.sessionUpdate === "config_options_update") &&
+			Array.isArray(update.configOptions)
+		) {
+			this._configOptions = update.configOptions as SessionConfigOption[];
+		}
 	}
 
 	get sessionId(): string {
@@ -238,9 +281,7 @@ export class Session {
 	 * Sends session/set_mode via ACP.
 	 */
 	async setMode(modeId: string): Promise<JsonRpcResponse> {
-		this._throwIfClosed();
-		return this._client.request("session/set_mode", {
-			sessionId: this._sessionId,
+		return this.rawSend("session/set_mode", {
 			modeId,
 		});
 	}
@@ -281,11 +322,66 @@ export class Session {
 	): Promise<JsonRpcResponse> {
 		this._throwIfClosed();
 		const option = this._configOptions.find((o) => o.category === category);
+		if (option?.readOnly) {
+			return this._unsupportedConfigResponse(category);
+		}
 		const configId = option?.id ?? category;
-		return this._client.request("session/set_config_option", {
-			sessionId: this._sessionId,
+		return this.rawSend("session/set_config_option", {
 			configId,
 			value,
+		});
+	}
+
+	private _unsupportedConfigResponse(category: string): JsonRpcResponse {
+		const message =
+			this._agentType === "opencode" && category === "model"
+				? "OpenCode reports available models, but model switching must be configured before createSession() because ACP session/set_config_option is not implemented."
+				: `The ${category} config option is read-only for ${this._agentType} sessions.`;
+		return {
+			jsonrpc: "2.0",
+			id: null,
+			error: {
+				code: -32601,
+				message,
+			},
+		};
+	}
+
+	private _applyLocalModeUpdate(modeId: string): void {
+		if (!this._modes) {
+			return;
+		}
+		this._modes = {
+			...this._modes,
+			currentModeId: modeId,
+		};
+	}
+
+	private _applyLocalConfigUpdate(configId: string, value: string): void {
+		this._configOptions = this._configOptions.map((option) =>
+			option.id === configId ? { ...option, currentValue: value } : option,
+		);
+	}
+
+	private _hasSessionUpdateSince(
+		startIndex: number,
+		predicate: (update: Record<string, unknown>) => boolean,
+	): boolean {
+		return this._events.slice(startIndex).some((event) => {
+			if (event.notification.method !== "session/update") {
+				return false;
+			}
+			const params = (event.notification.params ?? {}) as Record<string, unknown>;
+			const update = (params.update ?? params) as Record<string, unknown>;
+			return predicate(update);
+		});
+	}
+
+	private _emitSyntheticSessionUpdate(update: Record<string, unknown>): void {
+		this._recordNotification({
+			jsonrpc: "2.0",
+			method: "session/update",
+			params: update,
 		});
 	}
 
@@ -345,8 +441,45 @@ export class Session {
 		params?: Record<string, unknown>,
 	): Promise<JsonRpcResponse> {
 		this._throwIfClosed();
-		const mergedParams = { sessionId: this._sessionId, ...params };
-		return this._client.request(method, mergedParams);
+		const eventCountBefore = this._events.length;
+		const mergedParams: Record<string, unknown> = {
+			sessionId: this._sessionId,
+			...(params ?? {}),
+		};
+		const response = await this._client.request(method, mergedParams);
+		if (!response.error) {
+			if (
+				method === "session/set_mode" &&
+				typeof mergedParams.modeId === "string"
+			) {
+				this._applyLocalModeUpdate(mergedParams.modeId);
+				if (
+					this._agentType === "opencode" &&
+					!this._hasSessionUpdateSince(
+						eventCountBefore,
+						(update) =>
+							update.sessionUpdate === "current_mode_update" &&
+							update.currentModeId === mergedParams.modeId,
+					)
+				) {
+					this._emitSyntheticSessionUpdate({
+						sessionUpdate: "current_mode_update",
+						currentModeId: mergedParams.modeId,
+					});
+				}
+			}
+			if (
+				method === "session/set_config_option" &&
+				typeof mergedParams.configId === "string" &&
+				typeof mergedParams.value === "string"
+			) {
+				this._applyLocalConfigUpdate(
+					mergedParams.configId,
+					mergedParams.value,
+				);
+			}
+		}
+		return response;
 	}
 
 	/** Kill the agent process and clear event history. */

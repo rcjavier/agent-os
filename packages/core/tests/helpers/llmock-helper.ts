@@ -37,6 +37,16 @@ export async function startLlmock(
 		mock.addFixtures(fixtures);
 	}
 	const url = await mock.start();
+	const server = (
+		mock as unknown as {
+			serverInstance?: {
+				server?: {
+					unref?: () => void;
+				};
+			};
+		}
+	).serverInstance?.server;
+	server?.unref?.();
 	return { url, mock };
 }
 
@@ -44,5 +54,17 @@ export async function startLlmock(
  * Stop a running LLMock server.
  */
 export async function stopLlmock(mock: LLMock): Promise<void> {
+	const server = (
+		mock as unknown as {
+			serverInstance?: {
+				server?: {
+					closeAllConnections?: () => void;
+					closeIdleConnections?: () => void;
+				};
+			};
+		}
+	).serverInstance?.server;
+	server?.closeIdleConnections?.();
+	server?.closeAllConnections?.();
 	await mock.stop();
 }

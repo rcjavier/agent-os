@@ -10,6 +10,7 @@ import {
 	getFieldInfos,
 	getZodDescription,
 	getZodEnumValues,
+	getZodObjectShape,
 	parseArgv,
 } from "./host-tools-argv.js";
 
@@ -108,7 +109,7 @@ async function handleCall(
 	// Validate input against zod schema
 	const parseResult = tool.inputSchema.safeParse(resolvedInput);
 	if (!parseResult.success) {
-		const message = parseResult.error.errors
+		const message = parseResult.error.issues
 			.map((e) => {
 				const path =
 					e.path.length > 0 ? `at "${e.path.join(".")}"` : "";
@@ -159,10 +160,7 @@ interface ToolDescriptor {
 function describeFlags(tool: HostTool): FlagDescriptor[] {
 	const fields = getFieldInfos(tool.inputSchema);
 	const flags: FlagDescriptor[] = [];
-	const shape: Record<string, unknown> =
-		(tool.inputSchema as any)._def.typeName === "ZodObject"
-			? (tool.inputSchema as any)._def.shape()
-			: {};
+	const shape = getZodObjectShape(tool.inputSchema);
 
 	for (const field of fields.values()) {
 		let type: string;

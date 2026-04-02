@@ -328,7 +328,14 @@ export function createOverlayBackend(
 				const data = await lower.readFile(p);
 				await upper.writeFile(p, data);
 			}
-			return upper.utimes(p, atime, mtime);
+			await upper.utimes(p, atime, mtime);
+			const updated = await upper.stat(p);
+			// Some backends (notably the in-memory core VFS) interpret utimes
+			// inputs as seconds rather than milliseconds. Normalize them here so
+			// the overlay presents a consistent millisecond-based contract.
+			if (updated.atimeMs === atime * 1000 && updated.mtimeMs === mtime * 1000) {
+				await upper.utimes(p, atime / 1000, mtime / 1000);
+			}
 		},
 
 		async truncate(p: string, length: number): Promise<void> {

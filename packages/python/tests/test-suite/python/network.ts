@@ -1,8 +1,6 @@
 import { afterEach, expect, it } from "vitest";
-import {
-	allowAllNetwork,
-	createNodeDriver,
-} from "../../../src/index.js";
+import { allowAllNetwork } from "@secure-exec/core";
+import { createNodeDriver } from "@secure-exec/nodejs";
 import type { PythonSuiteContext } from "./runtime.js";
 
 export function runPythonNetworkSuite(context: PythonSuiteContext): void {

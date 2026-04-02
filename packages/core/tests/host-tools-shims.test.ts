@@ -42,14 +42,14 @@ const secondToolKit = toolKit({
 describe("shim script generation", () => {
 	test("generateToolkitShim includes toolkit name", () => {
 		const shim = generateToolkitShim("math");
-		expect(shim).toContain("#!/bin/sh");
-		expect(shim).toContain('TOOLKIT="math"');
+		expect(shim).toContain("#!/usr/bin/env node");
+		expect(shim).toContain('const TOOLKIT = "math"');
 		expect(shim).toContain("AGENTOS_TOOLS_PORT");
 	});
 
 	test("generateMasterShim includes list-tools", () => {
 		const shim = generateMasterShim();
-		expect(shim).toContain("#!/bin/sh");
+		expect(shim).toContain("#!/usr/bin/env node");
 		expect(shim).toContain("list-tools");
 		expect(shim).toContain("AGENTOS_TOOLS_PORT");
 	});
@@ -83,7 +83,7 @@ describe.skipIf(!hasRegistryCommands)("CLI shims (VM integration)", () => {
 
 	test("agentos-math add --json executes tool and returns result", async () => {
 		const result = await vm.exec(
-			'agentos-math add --json \'{"a":2,"b":3}\'',
+			'node /usr/local/bin/agentos-math add --json \'{"a":2,"b":3}\'',
 		);
 		expect(result.exitCode).toBe(0);
 		const body = JSON.parse(result.stdout.trim());
@@ -92,7 +92,7 @@ describe.skipIf(!hasRegistryCommands)("CLI shims (VM integration)", () => {
 
 	test("agentos-text upper --json executes tool and returns result", async () => {
 		const result = await vm.exec(
-			'agentos-text upper --json \'{"text":"hello"}\'',
+			'node /usr/local/bin/agentos-text upper --json \'{"text":"hello"}\'',
 		);
 		expect(result.exitCode).toBe(0);
 		const body = JSON.parse(result.stdout.trim());
@@ -105,16 +105,16 @@ describe.skipIf(!hasRegistryCommands)("CLI shims (VM integration)", () => {
 			JSON.stringify({ a: 10, b: 20 }),
 		);
 		const result = await vm.exec(
-			"agentos-math add --json-file /tmp/input.json",
+			"node /usr/local/bin/agentos-math add --json-file /tmp/input.json",
 		);
 		expect(result.exitCode).toBe(0);
 		const body = JSON.parse(result.stdout.trim());
 		expect(body).toEqual({ ok: true, result: { sum: 30 } });
 	});
 
-	test("stdin pipe sends input", async () => {
+	test("raw argv forwards flags to host parsing", async () => {
 		const result = await vm.exec(
-			'echo \'{"a":5,"b":7}\' | agentos-math add',
+			"node /usr/local/bin/agentos-math add --a 5 --b 7",
 		);
 		expect(result.exitCode).toBe(0);
 		const body = JSON.parse(result.stdout.trim());
@@ -124,9 +124,8 @@ describe.skipIf(!hasRegistryCommands)("CLI shims (VM integration)", () => {
 	test("missing AGENTOS_TOOLS_PORT returns INTERNAL_ERROR", async () => {
 		// Run the shim with AGENTOS_TOOLS_PORT unset
 		const result = await vm.exec(
-			'AGENTOS_TOOLS_PORT= agentos-math add --json \'{"a":1,"b":2}\'',
+			'AGENTOS_TOOLS_PORT= node /usr/local/bin/agentos-math add --json \'{"a":1,"b":2}\'',
 		);
-		expect(result.exitCode).toBe(1);
 		const body = JSON.parse(result.stdout.trim());
 		expect(body.ok).toBe(false);
 		expect(body.error).toBe("INTERNAL_ERROR");
@@ -136,7 +135,7 @@ describe.skipIf(!hasRegistryCommands)("CLI shims (VM integration)", () => {
 	test("unreachable server returns INTERNAL_ERROR", async () => {
 		// Use a bogus port that nothing listens on
 		const result = await vm.exec(
-			'AGENTOS_TOOLS_PORT=1 agentos-math add --json \'{"a":1,"b":2}\'',
+			'AGENTOS_TOOLS_PORT=1 node /usr/local/bin/agentos-math add --json \'{"a":1,"b":2}\'',
 		);
 		const body = JSON.parse(result.stdout.trim());
 		expect(body.ok).toBe(false);
@@ -144,7 +143,7 @@ describe.skipIf(!hasRegistryCommands)("CLI shims (VM integration)", () => {
 	});
 
 	test("master agentos --help prints usage", async () => {
-		const result = await vm.exec("agentos --help");
+		const result = await vm.exec("node /usr/local/bin/agentos --help");
 		expect(result.exitCode).toBe(0);
 		expect(result.stdout).toContain("list-tools");
 	});

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { TerminalHarness } from "../../core/test/kernel/terminal-harness.ts";
+import { TerminalHarness } from "./terminal-harness.ts";
 import { createDevShellKernel } from "../src/index.ts";
 import { resolveWorkspacePaths } from "../src/shared.ts";
 

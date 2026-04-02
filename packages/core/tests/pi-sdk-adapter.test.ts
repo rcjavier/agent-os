@@ -11,6 +11,7 @@ import {
 	expect,
 	test,
 } from "vitest";
+import pi from "@rivet-dev/agent-os-pi";
 import { AcpClient } from "../src/acp-client.js";
 import { AgentOs } from "../src/agent-os.js";
 import { createStdoutLineIterable } from "../src/stdout-lines.js";
@@ -73,6 +74,7 @@ describe("pi-sdk-acp adapter manual spawn", () => {
 		vm = await AgentOs.create({
 			loopbackExemptPorts: [mockPort],
 			moduleAccessCwd: MODULE_ACCESS_CWD,
+			software: [pi],
 		});
 	});
 

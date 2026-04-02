@@ -43,7 +43,7 @@ export function createSandboxToolkit(options: SandboxToolkitOptions): ToolKit {
 						.optional()
 						.describe("Working directory for the command."),
 					env: z
-						.record(z.string())
+						.record(z.string(), z.string())
 						.optional()
 						.describe("Additional environment variables."),
 					timeoutMs: z
@@ -84,7 +84,7 @@ export function createSandboxToolkit(options: SandboxToolkitOptions): ToolKit {
 						.optional()
 						.describe("Working directory for the process."),
 					env: z
-						.record(z.string())
+						.record(z.string(), z.string())
 						.optional()
 						.describe("Additional environment variables."),
 				}),

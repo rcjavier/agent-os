@@ -42,6 +42,8 @@ export interface AgentConfig {
 	acpAdapter: string;
 	/** npm package name for the underlying agent */
 	agentPackage: string;
+	/** Additional CLI args prepended when launching the ACP adapter. */
+	launchArgs?: string[];
 	/**
 	 * Default env vars to pass when spawning the adapter. These are merged
 	 * UNDER prepareInstructions env and user env (lowest priority).
@@ -65,7 +67,7 @@ export interface AgentConfig {
 	): Promise<{ args?: string[]; env?: Record<string, string> }>;
 }
 
-export type AgentType = "pi" | "pi-cli" | "opencode";
+export type AgentType = "pi" | "pi-cli" | "opencode" | "claude";
 
 export const AGENT_CONFIGS: Record<AgentType, AgentConfig> = {
 	pi: {
@@ -112,16 +114,18 @@ export const AGENT_CONFIGS: Record<AgentType, AgentConfig> = {
 		},
 	},
 	opencode: {
-		// OpenCode speaks ACP natively — no separate adapter wrapper needed.
-		// NOTE: OpenCode is a native binary, not Node.js. It cannot currently
-		// run inside the secure-exec VM (kernel only supports JS/WASM commands).
-		acpAdapter: "opencode-ai",
-		agentPackage: "opencode-ai",
+		// OpenCode speaks ACP natively. Agent OS runs a source-built ACP bundle
+		// from @rivet-dev/agent-os-opencode entirely inside the VM.
+		acpAdapter: "@rivet-dev/agent-os-opencode",
+		agentPackage: "@rivet-dev/agent-os-opencode",
+		defaultEnv: {
+			OPENCODE_DISABLE_CONFIG_DEP_INSTALL: "1",
+			OPENCODE_DISABLE_EMBEDDED_WEB_UI: "1",
+		},
 		// OS instructions injection: OPENCODE_CONTEXTPATHS env var with absolute
-		// path to /etc/agentos/instructions.md. No cwd file writes needed — the
-		// file is already on disk from VM boot. /etc/agentos/ is read-only so we
-		// never write there. If session-level additional instructions are provided,
-		// they are written to /tmp/ and the path is added to OPENCODE_CONTEXTPATHS.
+		// path to /etc/agentos/instructions.md. No cwd file writes needed; the
+		// file is already on disk from VM boot. /etc/agentos/ is read-only, so we
+		// only write additional session-level prompt fragments into /tmp/.
 		prepareInstructions: async (
 			kernel,
 			_cwd,
@@ -159,6 +163,39 @@ export const AGENT_CONFIGS: Record<AgentType, AgentConfig> = {
 			return {
 				env: { OPENCODE_CONTEXTPATHS: JSON.stringify(contextPaths) },
 			};
+		},
+	},
+	claude: {
+		acpAdapter: "@rivet-dev/agent-os-claude",
+		agentPackage: "@anthropic-ai/claude-agent-sdk",
+		defaultEnv: {
+			CLAUDE_AGENT_SDK_CLIENT_APP: "@rivet-dev/agent-os",
+			CLAUDE_CODE_SIMPLE: "1",
+			CLAUDE_CODE_FORCE_AGENT_OS_RIPGREP: "1",
+			CLAUDE_CODE_DEFER_GROWTHBOOK_INIT: "1",
+			CLAUDE_CODE_DISABLE_STREAM_JSON_HOOK_EVENTS: "1",
+			CLAUDE_CODE_SHELL: "/bin/bash",
+			CLAUDE_CODE_SKIP_INITIAL_MESSAGES: "1",
+			CLAUDE_CODE_SKIP_SANDBOX_INIT: "1",
+			CLAUDE_CODE_USE_PIPE_OUTPUT: "1",
+			DISABLE_TELEMETRY: "1",
+			SHELL: "/bin/bash",
+			USE_BUILTIN_RIPGREP: "0",
+		},
+		prepareInstructions: async (
+			kernel,
+			_cwd,
+			additionalInstructions,
+			opts,
+		) => {
+			const instructions = await readVmInstructions(
+				kernel,
+				additionalInstructions,
+				opts?.toolReference,
+				opts?.skipBase,
+			);
+			if (!instructions) return {};
+			return { args: ["--append-system-prompt", instructions] };
 		},
 	},
 };

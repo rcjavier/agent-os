@@ -449,7 +449,7 @@ describe.skipIf(!hasRegistryCommands)("host tools CLI commands (VM integration)"
 	});
 
 	test("agentos list-tools shows both toolkits", async () => {
-		const result = await vm.exec("agentos list-tools");
+		const result = await vm.exec("node /usr/local/bin/agentos list-tools");
 		expect(result.exitCode).toBe(0);
 		const body = JSON.parse(result.stdout);
 		expect(body.ok).toBe(true);
@@ -459,7 +459,9 @@ describe.skipIf(!hasRegistryCommands)("host tools CLI commands (VM integration)"
 	});
 
 	test("agentos list-tools <name> shows tools with flag details", async () => {
-		const result = await vm.exec("agentos list-tools text");
+		const result = await vm.exec(
+			"node /usr/local/bin/agentos list-tools text",
+		);
 		expect(result.exitCode).toBe(0);
 		const body = JSON.parse(result.stdout);
 		expect(body.ok).toBe(true);
@@ -469,7 +471,7 @@ describe.skipIf(!hasRegistryCommands)("host tools CLI commands (VM integration)"
 	});
 
 	test("agentos-{name} --help shows toolkit description", async () => {
-		const result = await vm.exec("agentos-math --help");
+		const result = await vm.exec("node /usr/local/bin/agentos-math --help");
 		expect(result.exitCode).toBe(0);
 		const body = JSON.parse(result.stdout);
 		expect(body.ok).toBe(true);
@@ -478,7 +480,9 @@ describe.skipIf(!hasRegistryCommands)("host tools CLI commands (VM integration)"
 	});
 
 	test("agentos-{name} <tool> --help shows tool flags", async () => {
-		const result = await vm.exec("agentos-text upper --help");
+		const result = await vm.exec(
+			"node /usr/local/bin/agentos-text upper --help",
+		);
 		expect(result.exitCode).toBe(0);
 		const body = JSON.parse(result.stdout);
 		expect(body.ok).toBe(true);

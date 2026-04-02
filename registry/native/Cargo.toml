@@ -117,6 +117,8 @@ members = [
     "crates/commands/whoami",
     "crates/commands/env",
     "crates/commands/timeout",
+    "crates/commands/which",
+    "crates/commands/xu",
     "crates/commands/xargs",
     "crates/commands/nice",
     "crates/commands/nohup",

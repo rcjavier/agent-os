@@ -49,7 +49,7 @@ import { resolvePermissionTier } from './permission-check.js';
 import { ModuleCache } from './module-cache.js';
 import { readdir, stat } from 'node:fs/promises';
 import { existsSync, statSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { basename, isAbsolute, join } from 'node:path';
 import { type Socket } from 'node:net';
 import { connect as tlsConnect, type TLSSocket } from 'node:tls';
 import { lookup } from 'node:dns/promises';
@@ -62,6 +62,13 @@ const WASI_AF_UNIX = 3;
 const WASI_SOCK_DGRAM = 5;
 const WASI_SOCK_STREAM = 6;
 const WASI_SOCK_TYPE_FLAGS = 0x6000;
+const WASI_SOL_SOCKET = 0x7fffffff;
+const POSIX_SOL_SOCKET = 1;
+const POSIX_SO_TYPE = 3;
+const POSIX_SO_ERROR = 4;
+const POSIX_SO_ACCEPTCONN = 30;
+const POSIX_SO_PROTOCOL = 38;
+const POSIX_SO_DOMAIN = 39;
 
 function normalizeSocketDomain(domain: number): number {
   switch (domain) {
@@ -85,6 +92,13 @@ function normalizeSocketType(type: number): number {
     default:
       return type & ~WASI_SOCK_TYPE_FLAGS;
   }
+}
+
+function normalizeSocketLevel(level: number): number {
+  if (level === WASI_SOL_SOCKET) {
+    return POSIX_SOL_SOCKET;
+  }
+  return level;
 }
 
 function scopedProcPath(pid: number, path: string): string {
@@ -553,8 +567,16 @@ class WasmVmRuntimeDriver implements RuntimeDriver {
   _resolvePermissionTier(command: string): PermissionTier {
     // No permissions config → fully unrestricted (backward compatible)
     if (Object.keys(this._permissions).length === 0) return 'full';
-    // Normalize path-based commands (/bin/ls → ls) so tier lookup matches basename keys
-    const commandName = command.includes('/') ? basename(command) : command;
+    // Normalize actual filesystem paths (/bin/ls, ./tool, ../tool) so tier
+    // lookup matches basename keys, but preserve slash-delimited command IDs
+    // like _untrusted/cmd for exact/glob permission rules.
+    const commandName = (
+      isAbsolute(command) ||
+      command.startsWith('./') ||
+      command.startsWith('../')
+    )
+      ? basename(command)
+      : command;
     // User config checked first (exact, glob, *), defaults as fallback layer
     return resolvePermissionTier(commandName, this._permissions, DEFAULT_FIRST_PARTY_TIERS);
   }
@@ -807,6 +829,26 @@ class WasmVmRuntimeDriver implements RuntimeDriver {
           view.setFloat64(8, Number(stat.rights), true);
           responseData = new Uint8Array(0); // signal data-in-buffer
           Atomics.store(signal, SIG_IDX_DATA_LEN, 16);
+          break;
+        }
+        case 'fdPoll': {
+          const polled = kernel.fdPoll(pid, msg.args.fd as number);
+          intResult =
+            (polled.readable ? 0x1 : 0) |
+            (polled.writable ? 0x2 : 0) |
+            (polled.hangup ? 0x4 : 0) |
+            (polled.invalid ? 0x8 : 0);
+          break;
+        }
+        case 'fdPollWait': {
+          const pollKernel = kernel as PollWaitKernel;
+          if (pollKernel.fdPollWait) {
+            await pollKernel.fdPollWait(
+              pid,
+              msg.args.fd as number,
+              msg.args.timeout as number | undefined,
+            );
+          }
           break;
         }
         case 'spawn': {
@@ -1221,22 +1263,59 @@ class WasmVmRuntimeDriver implements RuntimeDriver {
           const socketId = msg.args.fd as number;
           const optvalBytes = new Uint8Array(msg.args.optval as number[]);
           const optval = decodeSocketOptionValue(optvalBytes);
+          const level = normalizeSocketLevel(msg.args.level as number);
           kernel.socketTable.setsockopt(
             socketId,
-            msg.args.level as number,
+            level,
             msg.args.optname as number,
             optval,
           );
           break;
         }
+        case 'netSetNonBlocking': {
+          kernel.socketTable.setNonBlocking(
+            msg.args.fd as number,
+            !!msg.args.nonBlocking,
+          );
+          break;
+        }
         case 'netGetsockopt': {
           const socketId = msg.args.fd as number;
+          const level = normalizeSocketLevel(msg.args.level as number);
+          const optname = msg.args.optname as number;
           const optlen = msg.args.optvalLen as number;
-          const optval = kernel.socketTable.getsockopt(
+          const socket = kernel.socketTable.get(socketId);
+          if (!socket) {
+            errno = ERRNO_MAP.EBADF;
+            break;
+          }
+
+          let optval = kernel.socketTable.getsockopt(
             socketId,
-            msg.args.level as number,
-            msg.args.optname as number,
+            level,
+            optname,
           );
+
+          if (optval === undefined && level === POSIX_SOL_SOCKET) {
+            switch (optname) {
+              case POSIX_SO_TYPE:
+                optval = socket.type;
+                break;
+              case POSIX_SO_ERROR:
+                optval = 0;
+                break;
+              case POSIX_SO_ACCEPTCONN:
+                optval = socket.state === 'listening' ? 1 : 0;
+                break;
+              case POSIX_SO_PROTOCOL:
+                optval = socket.protocol;
+                break;
+              case POSIX_SO_DOMAIN:
+                optval = socket.domain;
+                break;
+            }
+          }
+
           if (optval === undefined) {
             errno = ERRNO_MAP.EINVAL;
             break;
@@ -1376,7 +1455,7 @@ class WasmVmRuntimeDriver implements RuntimeDriver {
 
                 const ksock = kernel.socketTable.get(entry.fd);
                 if (ksock) {
-                  if (entry.events & POLLIN) {
+                  if (entry.events & (POLLIN | POLLOUT)) {
                     const waitQueue = ksock.state === 'listening'
                       ? ksock.acceptWaiters
                       : ksock.readWaiters;

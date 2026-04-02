@@ -4,6 +4,7 @@ import {
 	getFieldInfos,
 	getZodDescription,
 	getZodEnumValues,
+	getZodObjectShape,
 } from "./host-tools-argv.js";
 
 /**
@@ -18,7 +19,7 @@ export function generateToolReference(toolKits: ToolKit[]): string {
 	lines.push("## Available Host Tools");
 	lines.push("");
 	lines.push(
-		"Run `agentos list-tools` to see all available tools.",
+		"Run `node /usr/local/bin/agentos list-tools` to see all available tools.",
 	);
 	lines.push("");
 
@@ -33,7 +34,7 @@ export function generateToolReference(toolKits: ToolKit[]): string {
 			const flagSig = buildFlagSignature(tool.inputSchema);
 			const flagStr = flagSig ? ` ${flagSig}` : "";
 			lines.push(
-				`- \`agentos-${tk.name} ${toolName}${flagStr}\` — ${tool.description}`,
+				`- \`node /usr/local/bin/agentos-${tk.name} ${toolName}${flagStr}\` — ${tool.description}`,
 			);
 		}
 		lines.push("");
@@ -49,7 +50,7 @@ export function generateToolReference(toolKits: ToolKit[]): string {
 				for (const ex of tool.examples ?? []) {
 					const flagArgs = inputToFlags(ex.input);
 					lines.push(
-						`- ${ex.description}: \`agentos-${tk.name} ${toolName}${flagArgs ? ` ${flagArgs}` : ""}\``,
+						`- ${ex.description}: \`node /usr/local/bin/agentos-${tk.name} ${toolName}${flagArgs ? ` ${flagArgs}` : ""}\``,
 					);
 				}
 			}
@@ -57,7 +58,7 @@ export function generateToolReference(toolKits: ToolKit[]): string {
 		}
 
 		lines.push(
-			`Run \`agentos-${tk.name} <tool> --help\` for details.`,
+			`Run \`node /usr/local/bin/agentos-${tk.name} <tool> --help\` for details.`,
 		);
 		lines.push("");
 	}
@@ -71,8 +72,7 @@ export function generateToolReference(toolKits: ToolKit[]): string {
  */
 function buildFlagSignature(schema: any): string {
 	const fields = getFieldInfos(schema);
-	const shape: Record<string, unknown> =
-		schema._def?.typeName === "ZodObject" ? schema._def.shape() : {};
+	const shape = getZodObjectShape(schema);
 
 	const parts: string[] = [];
 	for (const field of fields.values()) {

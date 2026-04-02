@@ -77,7 +77,7 @@ describe("generateToolReference", () => {
 		const result = generateToolReference([mathToolKit]);
 		expect(result).toContain("## Available Host Tools");
 		expect(result).toContain(
-			"Run `agentos list-tools` to see all available tools.",
+			"Run `node /usr/local/bin/agentos list-tools` to see all available tools.",
 		);
 	});
 
@@ -89,8 +89,8 @@ describe("generateToolReference", () => {
 
 	test("includes tool names with CLI signatures", () => {
 		const result = generateToolReference([mathToolKit]);
-		expect(result).toContain("agentos-math add");
-		expect(result).toContain("agentos-math multiply");
+		expect(result).toContain("node /usr/local/bin/agentos-math add");
+		expect(result).toContain("node /usr/local/bin/agentos-math multiply");
 		expect(result).toContain("Add two numbers");
 		expect(result).toContain("Multiply two numbers");
 	});
@@ -109,7 +109,7 @@ describe("generateToolReference", () => {
 	test("includes help instruction per toolkit", () => {
 		const result = generateToolReference([mathToolKit]);
 		expect(result).toContain(
-			"Run `agentos-math <tool> --help` for details.",
+			"Run `node /usr/local/bin/agentos-math <tool> --help` for details.",
 		);
 	});
 
@@ -117,7 +117,9 @@ describe("generateToolReference", () => {
 		const result = generateToolReference([mathToolKit]);
 		expect(result).toContain("**Examples:**");
 		expect(result).toContain("Add 1 and 2");
-		expect(result).toContain("agentos-math add --a 1 --b 2");
+		expect(result).toContain(
+			"node /usr/local/bin/agentos-math add --a 1 --b 2",
+		);
 	});
 
 	test("does not include examples section when no tools have examples", () => {
@@ -140,8 +142,8 @@ describe("generateToolReference", () => {
 		const result = generateToolReference([mathToolKit, textToolKit]);
 		expect(result).toContain("### math");
 		expect(result).toContain("### text");
-		expect(result).toContain("agentos-math add");
-		expect(result).toContain("agentos-text upper");
+		expect(result).toContain("node /usr/local/bin/agentos-math add");
+		expect(result).toContain("node /usr/local/bin/agentos-text upper");
 	});
 
 	test("includes multiple examples from the same toolkit", () => {
@@ -179,7 +181,9 @@ describe("PI prepareInstructions with toolReference", () => {
 		);
 		const instructionsArg = (result.args as string[])[argIdx + 1];
 		expect(instructionsArg).toContain("## Available Host Tools");
-		expect(instructionsArg).toContain("agentos-math add");
+		expect(instructionsArg).toContain(
+			"node /usr/local/bin/agentos-math add",
+		);
 	});
 
 	test("appends tool reference after additionalInstructions", async () => {
@@ -415,11 +419,15 @@ describe("createSession with toolkits injects tool reference", () => {
 				const instructionsArg = spawnCall.args[argIdx + 1];
 				// Tool reference section is present
 				expect(instructionsArg).toContain("## Available Host Tools");
-				expect(instructionsArg).toContain("agentos-math add");
+				expect(instructionsArg).toContain(
+					"node /usr/local/bin/agentos-math add",
+				);
 				expect(instructionsArg).toContain("Add two numbers");
 				// Examples are present
 				expect(instructionsArg).toContain("Add 1 and 2");
-				expect(instructionsArg).toContain("agentos-math add --a 1 --b 2");
+				expect(instructionsArg).toContain(
+					"node /usr/local/bin/agentos-math add --a 1 --b 2",
+				);
 
 				vm.closeSession(sessionId);
 			} finally {

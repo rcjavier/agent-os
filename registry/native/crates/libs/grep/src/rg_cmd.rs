@@ -30,6 +30,7 @@ pub fn rg(args: Vec<OsString>) -> i32 {
 struct Options {
     patterns: Vec<String>,
     paths: Vec<String>,
+    files_mode: bool,
     ignore_case: bool,
     smart_case: bool,
     invert_match: bool,
@@ -47,6 +48,8 @@ struct Options {
     before_context: usize,
     show_filename: Option<bool>,
     hidden: bool,
+    max_depth: Option<usize>,
+    sort_modified: bool,
     glob_patterns: Vec<String>,
     type_include: Vec<String>,
     type_exclude: Vec<String>,
@@ -57,6 +60,7 @@ impl Options {
         Self {
             patterns: Vec::new(),
             paths: Vec::new(),
+            files_mode: false,
             ignore_case: false,
             smart_case: true,
             invert_match: false,
@@ -74,6 +78,8 @@ impl Options {
             before_context: 0,
             show_filename: None,
             hidden: false,
+            max_depth: None,
+            sort_modified: false,
             glob_patterns: Vec::new(),
             type_include: Vec::new(),
             type_exclude: Vec::new(),
@@ -94,7 +100,28 @@ impl Options {
 }
 
 fn run(args: &[String]) -> Result<i32, String> {
+    if args.len() == 1 && (args[0] == "--version" || args[0] == "-V") {
+        println!("ripgrep 14.1.0 (Agent OS)");
+        return Ok(0);
+    }
+
     let opts = parse_args(args)?;
+
+    if opts.files_mode {
+        let paths = if opts.paths.is_empty() {
+            vec![".".to_string()]
+        } else {
+            opts.paths.clone()
+        };
+
+        let files = collect_files_from_paths(&paths, &opts);
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        for path in files {
+            let _ = writeln!(out, "{}", path.to_string_lossy());
+        }
+        return Ok(0);
+    }
 
     if opts.patterns.is_empty() {
         return Err("no pattern provided".to_string());
@@ -113,7 +140,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         return Ok(if result.matches > 0 { 0 } else { 1 });
     }
 
-    let files = collect_files(&opts);
+    let files = collect_files_from_paths(&opts.paths, &opts);
     let multi = files.len() > 1;
     let show_fn = opts.resolve_show_filename(multi);
     let mut any_match = false;
@@ -173,6 +200,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 "--smart-case" => opts.smart_case = true,
                 "--invert-match" => opts.invert_match = true,
                 "--count" => opts.count_only = true,
+                "--files" => opts.files_mode = true,
                 "--files-with-matches" => opts.files_with_matches = true,
                 "--files-without-match" => opts.files_without_matches = true,
                 "--line-number" => opts.line_numbers = Some(true),
@@ -183,12 +211,27 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 "--quiet" | "--silent" => opts.quiet = true,
                 "--only-matching" => opts.only_matching = true,
                 "--hidden" | "--no-ignore" => opts.hidden = true,
+                "--follow" | "--no-ignore-vcs" | "--no-ignore-parent" => {}
                 "--with-filename" => opts.show_filename = Some(true),
                 "--no-filename" => opts.show_filename = Some(false),
                 "--no-heading" | "--heading" => {} // no-op (we always use inline format)
                 "--color=auto" | "--color=always" | "--color=never" => {} // no-op in WASI
                 "--no-color" => {}
                 _ if arg.starts_with("--color=") => {}
+                _ if arg.starts_with("--max-depth=") => {
+                    opts.max_depth = Some(
+                        arg[12..]
+                            .parse()
+                            .map_err(|_| format!("invalid number: '{}'", &arg[12..]))?,
+                    );
+                }
+                _ if arg.starts_with("--sort=") => {
+                    match &arg[7..] {
+                        "modified" => opts.sort_modified = true,
+                        value => return Err(format!("unsupported sort: '{}'", value)),
+                    }
+                }
+                _ if arg.starts_with("--threads=") => {}
                 _ if arg.starts_with("--regexp=") => {
                     opts.patterns.push(arg[9..].to_string());
                     explicit_pattern = true;
@@ -227,7 +270,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                     opts.type_exclude.push(arg[11..].to_string());
                 }
                 "--regexp" | "--max-count" | "--after-context" | "--before-context"
-                | "--context" | "--glob" | "--type" | "--type-not" | "--file" | "--color" => {
+                | "--context" | "--glob" | "--type" | "--type-not" | "--file"
+                | "--color" | "--max-depth" | "--threads" => {
                     i += 1;
                     if i >= args.len() {
                         return Err(format!("{} requires an argument", arg));
@@ -275,6 +319,14 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                             explicit_pattern = true;
                         }
                         "--color" => {} // no-op
+                        "--max-depth" => {
+                            opts.max_depth = Some(
+                                args[i]
+                                    .parse()
+                                    .map_err(|_| format!("invalid number: '{}'", args[i]))?,
+                            );
+                        }
+                        "--threads" => {} // no-op
                         _ => unreachable!(),
                     }
                 }
@@ -352,6 +404,14 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                         j = chars.len();
                         continue;
                     }
+                    'j' => {
+                        i += 1;
+                        if i >= args.len() {
+                            return Err("option requires an argument -- 'j'".to_string());
+                        }
+                        j = chars.len();
+                        continue;
+                    }
                     'A' => {
                         i += 1;
                         if i >= args.len() {
@@ -423,7 +483,9 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         }
 
         // Positional argument
-        if !explicit_pattern && opts.patterns.is_empty() {
+        if opts.files_mode {
+            opts.paths.push(arg.clone());
+        } else if !explicit_pattern && opts.patterns.is_empty() {
             opts.patterns.push(arg.clone());
             explicit_pattern = true;
         } else {
@@ -434,7 +496,9 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
 
     // Remaining args after --
     while i < args.len() {
-        if !explicit_pattern && opts.patterns.is_empty() {
+        if opts.files_mode {
+            opts.paths.push(args[i].clone());
+        } else if !explicit_pattern && opts.patterns.is_empty() {
             opts.patterns.push(args[i].clone());
             explicit_pattern = true;
         } else {
@@ -493,21 +557,29 @@ fn prepare_pattern(pattern: &str, opts: &Options) -> String {
 
 // --- File collection ---
 
-fn collect_files(opts: &Options) -> Vec<PathBuf> {
+fn collect_files_from_paths(paths: &[String], opts: &Options) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    for path_str in &opts.paths {
+    for path_str in paths {
         let path = Path::new(path_str);
         if path.is_dir() {
-            walk_dir(path, opts, &mut files);
-        } else {
+            walk_dir(path, path, opts, &mut files, 0);
+        } else if path.is_file() && should_include(path, path, false, opts) {
             files.push(path.to_path_buf());
         }
     }
-    files.sort();
+    if opts.sort_modified {
+        files.sort_by_key(|path| {
+            std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .ok()
+        });
+    } else {
+        files.sort();
+    }
     files
 }
 
-fn walk_dir(dir: &Path, opts: &Options, out: &mut Vec<PathBuf>) {
+fn walk_dir(root: &Path, dir: &Path, opts: &Options, out: &mut Vec<PathBuf>, depth: usize) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
@@ -523,24 +595,40 @@ fn walk_dir(dir: &Path, opts: &Options, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
+        let is_dir = path.is_dir();
 
         // Skip hidden files/dirs unless --hidden
         if !opts.hidden && name_str.starts_with('.') {
             continue;
         }
 
-        if path.is_dir() {
-            walk_dir(&path, opts, out);
-        } else if path.is_file() && should_include(&path, opts) {
+        if !should_include(root, &path, is_dir, opts) {
+            continue;
+        }
+
+        if is_dir {
+            if opts.max_depth.map(|max| depth < max).unwrap_or(true) {
+                walk_dir(root, &path, opts, out, depth + 1);
+            }
+        } else if path.is_file() {
             out.push(path);
         }
     }
 }
 
-fn should_include(path: &Path, opts: &Options) -> bool {
+fn should_include(root: &Path, path: &Path, is_dir: bool, opts: &Options) -> bool {
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let relative_path = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
 
     // Type include filters
@@ -569,17 +657,13 @@ fn should_include(path: &Path, opts: &Options) -> bool {
 
     // Glob filters
     if !opts.glob_patterns.is_empty() {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
         for pattern in &opts.glob_patterns {
             let (negated, pat) = if let Some(rest) = pattern.strip_prefix('!') {
                 (true, rest)
             } else {
                 (false, pattern.as_str())
             };
-            let matches = glob_matches(pat, &name);
+            let matches = glob_matches(pat, &relative_path, &file_name, is_dir);
             if negated && matches {
                 return false;
             }
@@ -621,43 +705,73 @@ fn type_extensions(type_name: &str) -> Option<&'static [&'static str]> {
     }
 }
 
-fn glob_matches(pattern: &str, filename: &str) -> bool {
-    if let Some(ext) = pattern.strip_prefix("*.") {
-        filename.ends_with(&format!(".{}", ext))
-    } else {
-        glob_match_chars(
-            &pattern.chars().collect::<Vec<_>>(),
-            &filename.chars().collect::<Vec<_>>(),
-        )
+fn glob_matches(pattern: &str, relative_path: &str, file_name: &str, is_dir: bool) -> bool {
+    let normalized = pattern.trim_end_matches('/');
+    if pattern.ends_with('/') {
+        return is_dir
+            && relative_path
+                .split('/')
+                .any(|segment| segment == normalized || segment == file_name);
     }
-}
 
-fn glob_match_chars(pattern: &[char], text: &[char]) -> bool {
-    let (mut pi, mut ti) = (0, 0);
-    let (mut star_pi, mut star_ti) = (usize::MAX, 0);
+    let target = if pattern.contains('/') {
+        relative_path
+    } else {
+        file_name
+    };
 
-    while ti < text.len() {
-        if pi < pattern.len() && (pattern[pi] == '?' || pattern[pi] == text[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < pattern.len() && pattern[pi] == '*' {
-            star_pi = pi;
-            star_ti = ti;
-            pi += 1;
-        } else if star_pi != usize::MAX {
-            pi = star_pi + 1;
-            star_ti += 1;
-            ti = star_ti;
-        } else {
-            return false;
+    let mut regex_pattern = String::from("^");
+    let chars: Vec<char> = normalized.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '*' => {
+                if i + 1 < chars.len() && chars[i + 1] == '*' {
+                    regex_pattern.push_str(".*");
+                    i += 2;
+                } else {
+                    regex_pattern.push_str("[^/]*");
+                    i += 1;
+                }
+            }
+            '?' => {
+                regex_pattern.push_str("[^/]");
+                i += 1;
+            }
+            '{' => {
+                if let Some(end) = chars[i + 1..].iter().position(|c| *c == '}') {
+                    let group: String = chars[i + 1..i + 1 + end].iter().collect();
+                    regex_pattern.push('(');
+                    regex_pattern.push_str(
+                        &group
+                            .split(',')
+                            .map(regex::escape)
+                            .collect::<Vec<_>>()
+                            .join("|"),
+                    );
+                    regex_pattern.push(')');
+                    i += end + 2;
+                } else {
+                    regex_pattern.push_str("\\{");
+                    i += 1;
+                }
+            }
+            '.' | '+' | '(' | ')' | '|' | '^' | '$' | '[' | ']' | '\\' => {
+                regex_pattern.push('\\');
+                regex_pattern.push(chars[i]);
+                i += 1;
+            }
+            other => {
+                regex_pattern.push(other);
+                i += 1;
+            }
         }
     }
+    regex_pattern.push('$');
 
-    while pi < pattern.len() && pattern[pi] == '*' {
-        pi += 1;
-    }
-
-    pi == pattern.len()
+    Regex::new(&regex_pattern)
+        .map(|regex| regex.is_match(target))
+        .unwrap_or(false)
 }
 
 // --- Search ---

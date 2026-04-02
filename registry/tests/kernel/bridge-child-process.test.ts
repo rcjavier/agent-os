@@ -92,6 +92,28 @@ describe.skipIf(skipReason)('bridge child_process → kernel routing', () => {
     expect(output).toContain('received: piped-output');
   });
 
+  it('async child_process.spawn("sh") can stream output and exit cleanly', async () => {
+    ctx = await createIntegrationKernel({ runtimes: ['wasmvm', 'node'] });
+
+    const chunks: Uint8Array[] = [];
+    const proc = ctx.kernel.spawn('node', ['-e', `
+      const { spawn } = require('child_process');
+      const child = spawn('sh', ['-lc', 'echo async-ok'], {
+        stdio: ['ignore', 'pipe', 'inherit'],
+      });
+      child.stdout.on('data', (chunk) => process.stdout.write(chunk));
+      child.on('close', (code) => process.exit(code ?? 0));
+    `], {
+      onStdout: (data) => chunks.push(data),
+    });
+
+    const code = await proc.wait();
+    expect(code).toBe(0);
+
+    const output = chunks.map(c => new TextDecoder().decode(c)).join('');
+    expect(output).toContain('async-ok');
+  });
+
   it('stderr from spawned child processes pipes back to Node caller', async () => {
     ctx = await createIntegrationKernel({ runtimes: ['wasmvm', 'node'] });
 

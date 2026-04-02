@@ -1,5 +1,7 @@
-import { AgentOs } from "@rivet-dev/agent-os-core";
+import { AgentOs, type SoftwareInput } from "@rivet-dev/agent-os-core";
 import { coreutils } from "@rivet-dev/agent-os-common";
+import claude from "@rivet-dev/agent-os-claude";
+import codex from "@rivet-dev/agent-os-codex-agent";
 import pi from "@rivet-dev/agent-os-pi";
 import { LLMock } from "@copilotkit/llmock";
 import os from "node:os";
@@ -59,6 +61,49 @@ export interface Workload {
 	settleMs: number;
 }
 
+function makeAgentSessionWorkload(opts: {
+	agentId: string;
+	description: string;
+	software: SoftwareInput[];
+	processMarker: string;
+}): Workload {
+	return {
+		name: `${opts.agentId}-session`,
+		description: opts.description,
+		createVm: async () => {
+			const { port } = await ensureLlmock();
+			return AgentOs.create({
+				software: opts.software,
+				loopbackExemptPorts: [port],
+			});
+		},
+		start: async (vm) => {
+			const { url } = await ensureLlmock();
+			await vm.createSession(opts.agentId, {
+				env: {
+					ANTHROPIC_API_KEY: "bench-key",
+					ANTHROPIC_BASE_URL: url,
+				},
+			});
+		},
+		verify: (vm) => {
+			const procs = vm.listProcesses();
+			const running = procs.filter((p) => p.running);
+			const hasAgent = running.some(
+				(p) =>
+					p.command === "node" &&
+					p.args.some((a) => a.includes(opts.processMarker)),
+			);
+			if (!hasAgent) {
+				throw new Error(
+					`Expected running ${opts.processMarker} process, got: ${JSON.stringify(running.map((p) => ({ cmd: p.command, args: p.args })))}`,
+				);
+			}
+		},
+		settleMs: 2000,
+	};
+}
+
 export const WORKLOADS: Record<string, Workload> = {
 	sleep: {
 		name: "sleep",
@@ -81,53 +126,24 @@ export const WORKLOADS: Record<string, Workload> = {
 		},
 		settleMs: 2000,
 	},
-	"pi-session": {
-		name: "pi-session",
+	"pi-session": makeAgentSessionWorkload({
+		agentId: "pi",
 		description: "VM with PI agent session via createSession",
-		createVm: async () => {
-			const { port } = await ensureLlmock();
-			return AgentOs.create({
-				software: [pi],
-				loopbackExemptPorts: [port],
-			});
-		},
-		start: async (vm) => {
-			const { url } = await ensureLlmock();
-			await vm.createSession("pi", {
-				env: {
-					ANTHROPIC_API_KEY: "bench-key",
-					ANTHROPIC_BASE_URL: url,
-				},
-			});
-		},
-		verify: (vm) => {
-			const procs = vm.listProcesses();
-			const running = procs.filter((p) => p.running);
-			const hasPi = running.some(
-				(p) =>
-					p.command === "node" &&
-					p.args.some((a) => a.includes("agent-os-pi")),
-			);
-			if (!hasPi) {
-				throw new Error(
-					`Expected running agent-os-pi process, got: ${JSON.stringify(running.map((p) => ({ cmd: p.command, args: p.args })))}`,
-				);
-			}
-			const kernelProcs = vm.allProcesses();
-			const v8Proc = kernelProcs.find(
-				(p) =>
-					p.driver === "node" &&
-					p.status === "running" &&
-					p.args.some((a) => a.includes("agent-os-pi")),
-			);
-			if (!v8Proc) {
-				throw new Error(
-					`Expected V8 isolate running agent-os-pi, got: ${JSON.stringify(kernelProcs.map((p) => ({ driver: p.driver, cmd: p.command, status: p.status })))}`,
-				);
-			}
-		},
-		settleMs: 2000,
-	},
+		software: [pi],
+		processMarker: "agent-os-pi",
+	}),
+	"claude-session": makeAgentSessionWorkload({
+		agentId: "claude",
+		description: "VM with Claude agent session via createSession",
+		software: [claude],
+		processMarker: "agent-os-claude",
+	}),
+	"codex-session": makeAgentSessionWorkload({
+		agentId: "codex",
+		description: "VM with Codex agent session via createSession",
+		software: [...codex],
+		processMarker: "agent-os-codex-agent",
+	}),
 };
 
 // ── VM creation helpers ─────────────────────────────────────────────
@@ -143,21 +159,24 @@ export async function createBenchVm(): Promise<AgentOs> {
 }
 
 /**
- * Create a fresh AgentOS VM with PI software and a ready session.
+ * Create a fresh AgentOS VM with agent software and a ready session.
  * Measures cold start from AgentOs.create() through createSession() completing
  * (ACP handshake done, agent ready to accept prompts).
  */
-export async function createPiSessionVm(): Promise<{
+export async function createAgentSessionVm(
+	agentId: string,
+	software: SoftwareInput[],
+): Promise<{
 	vm: AgentOs;
 	coldStartMs: number;
 }> {
 	const { url, port } = await ensureLlmock();
 	const t0 = performance.now();
 	const vm = await AgentOs.create({
-		software: [pi],
+		software,
 		loopbackExemptPorts: [port],
 	});
-	await vm.createSession("pi", {
+	await vm.createSession(agentId, {
 		env: {
 			ANTHROPIC_API_KEY: "bench-key",
 			ANTHROPIC_BASE_URL: url,
@@ -165,6 +184,11 @@ export async function createPiSessionVm(): Promise<{
 	});
 	const coldStartMs = performance.now() - t0;
 	return { vm, coldStartMs };
+}
+
+/** Convenience alias for PI agent session. */
+export function createPiSessionVm() {
+	return createAgentSessionVm("pi", [pi]);
 }
 
 // ── Stats and formatting ────────────────────────────────────────────

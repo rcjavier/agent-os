@@ -9,7 +9,7 @@ const pkg = {
 	aptName: "tar",
 	description: "GNU tar archiver",
 	source: "rust" as const,
-	commands: [{ name: "tar", permissionTier: "read-only" as const }],
+	commands: [{ name: "tar", permissionTier: "read-write" as const }],
 	get commandDir() {
 		return resolve(__dirname, "..", "wasm");
 	},

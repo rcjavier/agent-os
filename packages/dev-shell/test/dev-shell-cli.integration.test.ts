@@ -19,8 +19,8 @@ function stripJustPreamble(output: string): string {
 		.split("\n")
 		.filter((line) =>
 			line.length > 0 &&
-			!line.startsWith("pnpm --filter @secure-exec/dev-shell dev-shell --") &&
-			!line.startsWith("> @secure-exec/dev-shell@ dev-shell ") &&
+			!line.startsWith("pnpm --filter @rivet-dev/agent-os-dev-shell dev-shell --") &&
+			!line.startsWith("> @rivet-dev/agent-os-dev-shell@ dev-shell ") &&
 			!line.startsWith("> tsx src/shell.ts ")
 		)
 		.join("\n")

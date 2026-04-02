@@ -6,6 +6,20 @@ import { join, dirname } from "node:path";
  * Supports both nested (pnpm) and flat (npm) node_modules layouts.
  */
 function resolvePackageDir(startDir: string, packageName: string): string {
+	const localPkgJson = join(startDir, "package.json");
+	if (existsSync(localPkgJson)) {
+		try {
+			const localPkg = JSON.parse(readFileSync(localPkgJson, "utf-8")) as {
+				name?: string;
+			};
+			if (localPkg.name === packageName) {
+				return realpathSync(startDir);
+			}
+		} catch {
+			// Ignore malformed local package metadata and continue walking.
+		}
+	}
+
 	let searchDir = startDir;
 	while (true) {
 		const candidate = join(searchDir, "node_modules", packageName);
@@ -22,7 +36,7 @@ function resolvePackageDir(startDir: string, packageName: string): string {
 	);
 }
 import type { Kernel } from "@secure-exec/core";
-import type { AgentConfig, PrepareInstructionsOptions } from "./agents.js";
+import type { AgentConfig } from "./agents.js";
 
 // ── Software Descriptor Types ────────────────────────────────────────
 
@@ -51,6 +65,8 @@ export interface AgentSoftwareDescriptor extends SoftwareDescriptor {
 		staticEnv?: Record<string, string>;
 		/** Dynamic env vars computed at boot time. */
 		env?: (ctx: SoftwareContext) => Record<string, string>;
+		/** Additional CLI args prepended when launching the ACP adapter. */
+		launchArgs?: string[];
 		/**
 		 * Prepare agent-specific spawn overrides for OS instruction injection.
 		 * When provided, replaces the default instruction injection behavior.
@@ -273,6 +289,7 @@ export function processSoftware(
 				const agentConfig: AgentConfig = {
 					acpAdapter: pkg.agent.acpAdapter,
 					agentPackage: pkg.agent.agentPackage,
+					launchArgs: pkg.agent.launchArgs,
 					defaultEnv: Object.keys(combinedEnv).length > 0 ? combinedEnv : undefined,
 					prepareInstructions: pkg.agent.prepareInstructions,
 				};

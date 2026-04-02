@@ -12,11 +12,12 @@ describe("listAgents()", () => {
 		await vm.dispose();
 	});
 
-	test("returns pi and opencode agents", () => {
+	test("returns pi, opencode, and claude agents", () => {
 		const agents = vm.listAgents();
 		const ids = agents.map((a) => a.id);
 		expect(ids).toContain("pi");
 		expect(ids).toContain("opencode");
+		expect(ids).toContain("claude");
 	});
 
 	test("each entry has correct fields from AGENT_CONFIGS", () => {
@@ -29,10 +30,14 @@ describe("listAgents()", () => {
 	});
 
 	test("installed is true when adapter package exists", () => {
-		// pi-acp should be installed in node_modules (used by the project)
+		// Built-in adapters installed for the workspace should resolve from node_modules.
 		const agents = vm.listAgents();
 		const pi = agents.find((a) => a.id === "pi");
+		const opencode = agents.find((a) => a.id === "opencode");
+		const claude = agents.find((a) => a.id === "claude");
 		expect(pi?.installed).toBe(true);
+		expect(opencode?.installed).toBe(true);
+		expect(claude?.installed).toBe(true);
 	});
 
 	test("installed is false when adapter package is missing", async () => {

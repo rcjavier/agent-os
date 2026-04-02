@@ -28,19 +28,18 @@ import { AgentOs } from "../src/index.js";
  * 3. import.meta.url callback in V8 runtime — was not implemented, returned undefined
  * 4. General fallback for node:-prefixed builtins in loadFile handler
  *
- * Why Claude Code CLI cannot run inside the VM:
- * - Depends on native ripgrep binary for Grep tool (ENOENT in VM)
- * - Complex async startup sequence (config, auth, terminal) that hangs
- * - No TTY support (process.stdout.isTTY is false)
- * - 13MB bundle takes significant time to parse/evaluate
+ * Current status in the VM:
+ * - The ESM bundle loads successfully.
+ * - `claude --version` completes successfully.
+ * - Long-running CLI startup still requires a forced kill in the import probe.
+ * - Native vendor binaries remain present and are not directly runnable in-VM.
  *
- * CONCLUSION: The ESM bundle LOADS successfully but the CLI CANNOT complete startup.
- * US-016 through US-018 should be SKIPPED.
+ * CONCLUSION: Keep these as real regression tests instead of skipping them.
  */
 
 const MODULE_ACCESS_CWD = resolve(import.meta.dirname, "..");
 
-describe.skip("Claude Code SDK investigation", () => {
+describe("Claude Code SDK investigation", () => {
 	let vm: AgentOs;
 
 	beforeEach(async () => {
@@ -262,15 +261,12 @@ main();
 		expect(stdout).toContain("attempting-import");
 		// The ESM bundle loads successfully after secure-exec fixes
 		expect(stdout).toContain("import-success");
-		// Exit code 143 = killed by timeout (SIGTERM) because startup hangs
-		expect(exitCode).toBe(143);
+		// The forced kill currently propagates as 137 inside the VM.
+		expect(exitCode).toBe(137);
 	}, 30_000);
 
-	test("cli.js --version hangs during startup", async () => {
-		// Even with all secure-exec fixes, the CLI cannot complete startup.
-		// It no longer crashes (used to fail with "filename must be a string or URL"
-		// before the import.meta.url fix), but it hangs during the complex
-		// initialization sequence that requires terminal, network, and config access.
+	test("cli.js --version completes inside the VM", async () => {
+		// The lightweight version path now completes successfully in the VM.
 		let stdout = "";
 
 		const cliPath = "/root/node_modules/@anthropic-ai/claude-code/cli.js";
@@ -291,9 +287,7 @@ main();
 		const exitCode = await vm.waitProcess(pid);
 		clearTimeout(timeout);
 
-		// CLI hangs — killed by timeout. No stdout output.
-		expect(exitCode).toBe(143);
-		// No version output produced before hang
-		expect(stdout).toBe("");
+		expect(exitCode).toBe(0);
+		expect(stdout.trim()).toMatch(/\d+\.\d+\.\d+ \(Claude Code\)/);
 	}, 30_000);
 });

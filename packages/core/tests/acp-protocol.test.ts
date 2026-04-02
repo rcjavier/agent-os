@@ -167,6 +167,396 @@ process.stdin.on('data', (chunk) => {
 `;
 
 /**
+ * Mock adapter that sends a modern ACP session/request_permission request during session/prompt.
+ */
+const MODERN_PERMISSION_MOCK_ADAPTER = `
+let buffer = '';
+let pendingPromptId = null;
+const permissionRequestId = 'perm-modern-001';
+
+process.stdin.resume();
+process.stdin.on('data', (chunk) => {
+  const str = chunk instanceof Uint8Array ? new TextDecoder().decode(chunk) : String(chunk);
+  buffer += str;
+
+  while (true) {
+    const idx = buffer.indexOf('\\n');
+    if (idx === -1) break;
+    const line = buffer.substring(0, idx);
+    buffer = buffer.substring(idx + 1);
+    if (!line.trim()) continue;
+
+    try {
+      const msg = JSON.parse(line);
+
+      if (msg.id === permissionRequestId && msg.method === undefined) {
+        process.stdout.write(JSON.stringify({
+          jsonrpc: '2.0',
+          id: pendingPromptId,
+          result: {
+            sessionId: 'perm-session-2',
+            status: 'permission_granted',
+            permission: msg.result,
+          },
+        }) + '\\n');
+        pendingPromptId = null;
+        continue;
+      }
+
+      if (msg.id === undefined) continue;
+
+      let result;
+      switch (msg.method) {
+        case 'initialize':
+          result = { protocolVersion: 1, agentInfo: { name: 'perm-agent-modern', version: '1.0' } };
+          break;
+        case 'session/new':
+          result = { sessionId: 'perm-session-2' };
+          break;
+        case 'session/prompt':
+          pendingPromptId = msg.id;
+          process.stdout.write(JSON.stringify({
+            jsonrpc: '2.0',
+            id: permissionRequestId,
+            method: 'session/request_permission',
+            params: {
+              sessionId: 'perm-session-2',
+              options: [
+                { optionId: 'allow_once', kind: 'allow_once', name: 'Allow once' },
+                { optionId: 'allow_always', kind: 'allow_always', name: 'Always allow' },
+                { optionId: 'reject_once', kind: 'reject_once', name: 'Reject' },
+              ],
+              toolCall: {
+                kind: 'execute',
+                toolCallId: 'tool-001',
+                title: 'Bash',
+                status: 'pending',
+                rawInput: { command: 'xu hello-agent-os' },
+              },
+            },
+          }) + '\\n');
+          continue;
+        default:
+          process.stdout.write(JSON.stringify({
+            jsonrpc: '2.0', id: msg.id,
+            error: { code: -32601, message: 'Method not found' },
+          }) + '\\n');
+          continue;
+      }
+
+      process.stdout.write(JSON.stringify({
+        jsonrpc: '2.0', id: msg.id, result,
+      }) + '\\n');
+    } catch (e) {}
+  }
+});
+`;
+
+/**
+ * Mock adapter that uses OpenCode-style option IDs (once/always/reject)
+ * instead of the allow_once/allow_always/reject_once aliases.
+ */
+const OPENCODE_STYLE_PERMISSION_MOCK_ADAPTER = `
+let buffer = '';
+let pendingPromptId = null;
+const permissionRequestId = 'perm-opencode-001';
+
+process.stdin.resume();
+process.stdin.on('data', (chunk) => {
+  const str = chunk instanceof Uint8Array ? new TextDecoder().decode(chunk) : String(chunk);
+  buffer += str;
+
+  while (true) {
+    const idx = buffer.indexOf('\\n');
+    if (idx === -1) break;
+    const line = buffer.substring(0, idx);
+    buffer = buffer.substring(idx + 1);
+    if (!line.trim()) continue;
+
+    try {
+      const msg = JSON.parse(line);
+
+      if (msg.id === permissionRequestId && msg.method === undefined) {
+        process.stdout.write(JSON.stringify({
+          jsonrpc: '2.0',
+          id: pendingPromptId,
+          result: {
+            sessionId: 'perm-session-opencode',
+            status: 'permission_granted',
+            permission: msg.result,
+          },
+        }) + '\\n');
+        pendingPromptId = null;
+        continue;
+      }
+
+      if (msg.id === undefined) continue;
+
+      switch (msg.method) {
+        case 'initialize':
+          process.stdout.write(JSON.stringify({
+            jsonrpc: '2.0', id: msg.id,
+            result: { protocolVersion: 1, agentInfo: { name: 'perm-agent-opencode', version: '1.0' } },
+          }) + '\\n');
+          continue;
+        case 'session/new':
+          process.stdout.write(JSON.stringify({
+            jsonrpc: '2.0', id: msg.id,
+            result: { sessionId: 'perm-session-opencode' },
+          }) + '\\n');
+          continue;
+        case 'session/prompt':
+          pendingPromptId = msg.id;
+          process.stdout.write(JSON.stringify({
+            jsonrpc: '2.0',
+            id: permissionRequestId,
+            method: 'session/request_permission',
+            params: {
+              sessionId: 'perm-session-opencode',
+              options: [
+                { optionId: 'once', kind: 'allow_once', name: 'Allow once' },
+                { optionId: 'always', kind: 'allow_always', name: 'Always allow' },
+                { optionId: 'reject', kind: 'reject_once', name: 'Reject' },
+              ],
+              toolCall: {
+                kind: 'execute',
+                toolCallId: 'tool-oc-001',
+                title: 'Bash',
+                status: 'pending',
+                rawInput: { command: 'echo hello' },
+              },
+            },
+          }) + '\\n');
+          continue;
+        default:
+          process.stdout.write(JSON.stringify({
+            jsonrpc: '2.0', id: msg.id,
+            error: { code: -32601, message: 'Method not found' },
+          }) + '\\n');
+          continue;
+      }
+    } catch (e) {}
+  }
+});
+`;
+
+/**
+ * Mock adapter that emits non-JSON output and a notification, then hangs.
+ * Used to verify timeout diagnostics include recent ACP activity.
+ */
+const HANGING_ACTIVITY_MOCK_ADAPTER = `
+let buffer = '';
+process.stdin.resume();
+process.stdin.on('data', (chunk) => {
+  const str = chunk instanceof Uint8Array ? new TextDecoder().decode(chunk) : String(chunk);
+  buffer += str;
+
+  while (true) {
+    const idx = buffer.indexOf('\\n');
+    if (idx === -1) break;
+    const line = buffer.substring(0, idx);
+    buffer = buffer.substring(idx + 1);
+    if (!line.trim()) continue;
+
+    try {
+      const msg = JSON.parse(line);
+      if (msg.id === undefined) continue;
+
+      switch (msg.method) {
+        case 'initialize':
+          process.stdout.write(JSON.stringify({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { protocolVersion: 1, agentInfo: { name: 'hanging-activity-agent', version: '1.0' } },
+          }) + '\\n');
+          break;
+        case 'session/prompt':
+          process.stdout.write('[sandbox.require] start node:url /\\n');
+          process.stdout.write(JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'hanging-session',
+              type: 'status',
+              status: 'thinking',
+            },
+          }) + '\\n');
+          break;
+        default:
+          process.stdout.write(JSON.stringify({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { ok: true },
+          }) + '\\n');
+          break;
+      }
+    } catch (e) {}
+  }
+});
+`;
+
+/**
+ * Mock adapter that emits the same ACP permission request twice.
+ * AcpClient should dedupe the repeated inbound request ID.
+ */
+const DUPLICATE_MODERN_PERMISSION_MOCK_ADAPTER = `
+let buffer = '';
+let pendingPromptId = null;
+const permissionRequestId = 'perm-dup-001';
+
+process.stdin.resume();
+process.stdin.on('data', (chunk) => {
+  const str = chunk instanceof Uint8Array ? new TextDecoder().decode(chunk) : String(chunk);
+  buffer += str;
+
+  while (true) {
+    const idx = buffer.indexOf('\\n');
+    if (idx === -1) break;
+    const line = buffer.substring(0, idx);
+    buffer = buffer.substring(idx + 1);
+    if (!line.trim()) continue;
+
+    try {
+      const msg = JSON.parse(line);
+
+      if (msg.id === permissionRequestId && msg.method === undefined) {
+        process.stdout.write(JSON.stringify({
+          jsonrpc: '2.0',
+          id: pendingPromptId,
+          result: {
+            sessionId: 'perm-session-dup',
+            status: 'permission_granted',
+            permission: msg.result,
+          },
+        }) + '\\n');
+        pendingPromptId = null;
+        continue;
+      }
+
+      if (msg.id === undefined) continue;
+
+      let result;
+      switch (msg.method) {
+        case 'initialize':
+          result = { protocolVersion: 1, agentInfo: { name: 'perm-agent-dup', version: '1.0' } };
+          break;
+        case 'session/new':
+          result = { sessionId: 'perm-session-dup' };
+          break;
+        case 'session/prompt': {
+          pendingPromptId = msg.id;
+          const permissionRequest = JSON.stringify({
+            jsonrpc: '2.0',
+            id: permissionRequestId,
+            method: 'session/request_permission',
+            params: {
+              sessionId: 'perm-session-dup',
+              options: [
+                { optionId: 'allow_once', kind: 'allow_once', name: 'Allow once' },
+                { optionId: 'reject_once', kind: 'reject_once', name: 'Reject' },
+              ],
+              toolCall: {
+                kind: 'execute',
+                toolCallId: 'tool-dup-001',
+                title: 'Bash',
+                status: 'pending',
+                rawInput: { command: 'xu hello-agent-os' },
+              },
+            },
+          });
+          process.stdout.write(permissionRequest + '\\n');
+          process.stdout.write(permissionRequest + '\\n');
+          continue;
+        }
+        default:
+          process.stdout.write(JSON.stringify({
+            jsonrpc: '2.0', id: msg.id,
+            error: { code: -32601, message: 'Method not found' },
+          }) + '\\n');
+          continue;
+      }
+
+      process.stdout.write(JSON.stringify({
+        jsonrpc: '2.0', id: msg.id, result,
+      }) + '\\n');
+    } catch (e) {}
+  }
+});
+`;
+
+/**
+ * Mock adapter that only supports session/cancel as an ACP notification.
+ * Request-form session/cancel returns -32601, while the notification increments
+ * a counter that can be queried via custom/cancel-count.
+ */
+const NOTIFICATION_CANCEL_MOCK_ADAPTER = `
+let buffer = '';
+let cancelCount = 0;
+
+process.stdin.resume();
+process.stdin.on('data', (chunk) => {
+  const str = chunk instanceof Uint8Array ? new TextDecoder().decode(chunk) : String(chunk);
+  buffer += str;
+
+  while (true) {
+    const idx = buffer.indexOf('\\n');
+    if (idx === -1) break;
+    const line = buffer.substring(0, idx);
+    buffer = buffer.substring(idx + 1);
+    if (!line.trim()) continue;
+
+    try {
+      const msg = JSON.parse(line);
+
+      if (msg.id === undefined) {
+        if (msg.method === 'session/cancel') {
+          cancelCount++;
+        }
+        continue;
+      }
+
+      let result;
+      switch (msg.method) {
+        case 'initialize':
+          result = {
+            protocolVersion: 1,
+            agentInfo: { name: 'notification-cancel-agent', version: '1.0.0' },
+          };
+          break;
+        case 'session/new':
+          result = { sessionId: 'notification-cancel-session-1' };
+          break;
+        case 'custom/cancel-count':
+          result = { cancelCount };
+          break;
+        case 'session/cancel':
+          process.stdout.write(JSON.stringify({
+            jsonrpc: '2.0',
+            id: msg.id,
+            error: {
+              code: -32601,
+              message: 'Method not found: session/cancel',
+              data: { method: 'session/cancel' },
+            },
+          }) + '\\n');
+          continue;
+        default:
+          process.stdout.write(JSON.stringify({
+            jsonrpc: '2.0', id: msg.id,
+            error: { code: -32601, message: 'Method not found: ' + msg.method },
+          }) + '\\n');
+          continue;
+      }
+
+      process.stdout.write(JSON.stringify({
+        jsonrpc: '2.0', id: msg.id, result,
+      }) + '\\n');
+    } catch (e) {}
+  }
+});
+`;
+
+/**
  * Mock adapter that prints non-JSON banners before becoming ready.
  */
 const BANNER_MOCK_ADAPTER = `
@@ -482,6 +872,38 @@ describe("ACP protocol comprehensive tests", () => {
 		client.close();
 	}, 30_000);
 
+	test("session/cancel falls back to ACP notification when request form is unsupported", async () => {
+		const { client } = await spawnAdapter(vm, NOTIFICATION_CANCEL_MOCK_ADAPTER);
+
+		await client.request("initialize", {
+			protocolVersion: 1,
+			clientCapabilities: {},
+		});
+		await client.request("session/new", {
+			cwd: "/home/user",
+			mcpServers: [],
+		});
+
+		const response = await client.request("session/cancel", {
+			sessionId: "notification-cancel-session-1",
+		});
+
+		expect(response.error).toBeUndefined();
+		expect(
+			response.result as { cancelled: boolean; requested: boolean; via: string },
+		).toMatchObject({
+			cancelled: false,
+			requested: true,
+			via: "notification-fallback",
+		});
+
+		const countResponse = await client.request("custom/cancel-count");
+		expect(countResponse.error).toBeUndefined();
+		expect((countResponse.result as { cancelCount: number }).cancelCount).toBe(1);
+
+		client.close();
+	}, 30_000);
+
 	test("session/set_mode sends mode change", async () => {
 		const { client } = await spawnAdapter(vm, FULL_MOCK_ACP_ADAPTER);
 
@@ -577,6 +999,186 @@ describe("ACP protocol comprehensive tests", () => {
 		expect(
 			(permResponse.result as { acknowledged: boolean }).acknowledged,
 		).toBe(true);
+
+		client.close();
+	}, 30_000);
+
+	test("session/request_permission flow -- agent sends ACP request, client responds", async () => {
+		const { client } = await spawnAdapter(vm, MODERN_PERMISSION_MOCK_ADAPTER);
+
+		await client.request("initialize", {
+			protocolVersion: 1,
+			clientCapabilities: {},
+		});
+		await client.request("session/new", {
+			cwd: "/home/user",
+			mcpServers: [],
+		});
+
+		const permissionRequests: JsonRpcNotification[] = [];
+		client.onNotification((notification) => {
+			if (notification.method === "request/permission") {
+				permissionRequests.push(notification);
+			}
+		});
+
+		const promptPromise = client.request("session/prompt", {
+			sessionId: "perm-session-2",
+			prompt: [{ type: "text", text: "run xu hello-agent-os" }],
+		});
+
+		for (let i = 0; i < 20 && permissionRequests.length === 0; i++) {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+
+		expect(permissionRequests.length).toBeGreaterThanOrEqual(1);
+		const permParams = permissionRequests[0].params as {
+			permissionId: string;
+			sessionId: string;
+			toolCall: {
+				rawInput?: { command?: string };
+			};
+		};
+		expect(permParams.permissionId).toBe("perm-modern-001");
+		expect(permParams.sessionId).toBe("perm-session-2");
+		expect(permParams.toolCall.rawInput?.command).toBe("xu hello-agent-os");
+
+		const permResponse = await client.request("request/permission", {
+			sessionId: "perm-session-2",
+			permissionId: "perm-modern-001",
+			reply: "always",
+		});
+
+		expect(permResponse.error).toBeUndefined();
+		expect(
+			(permResponse.result as { outcome: { optionId: string } }).outcome.optionId,
+		).toBe("allow_always");
+
+		const promptResponse = await promptPromise;
+		expect(promptResponse.error).toBeUndefined();
+		expect(
+			(
+				promptResponse.result as {
+					permission: { outcome: { optionId: string } };
+				}
+			).permission.outcome.optionId,
+		).toBe("allow_always");
+
+		client.close();
+	}, 30_000);
+
+	test("duplicate session/request_permission requests are deduped by request ID", async () => {
+		const { client } = await spawnAdapter(vm, DUPLICATE_MODERN_PERMISSION_MOCK_ADAPTER);
+
+		await client.request("initialize", {
+			protocolVersion: 1,
+			clientCapabilities: {},
+		});
+		await client.request("session/new", {
+			cwd: "/home/user",
+			mcpServers: [],
+		});
+
+		const permissionRequests: JsonRpcNotification[] = [];
+		client.onNotification((notification) => {
+			if (notification.method === "request/permission") {
+				permissionRequests.push(notification);
+			}
+		});
+
+		const promptPromise = client.request("session/prompt", {
+			sessionId: "perm-session-dup",
+			prompt: [{ type: "text", text: "run xu hello-agent-os" }],
+		});
+
+		for (let i = 0; i < 20 && permissionRequests.length === 0; i++) {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+
+		expect(permissionRequests.length).toBe(1);
+		const permParams = permissionRequests[0].params as {
+			permissionId: string;
+			sessionId: string;
+		};
+		expect(permParams.permissionId).toBe("perm-dup-001");
+		expect(permParams.sessionId).toBe("perm-session-dup");
+
+		const permResponse = await client.request("request/permission", {
+			sessionId: "perm-session-dup",
+			permissionId: "perm-dup-001",
+			reply: "once",
+		});
+
+		expect(permResponse.error).toBeUndefined();
+		expect(
+			(permResponse.result as { outcome: { optionId: string } }).outcome.optionId,
+		).toBe("allow_once");
+
+		const promptResponse = await promptPromise;
+		expect(promptResponse.error).toBeUndefined();
+		expect(
+			(
+				promptResponse.result as {
+					permission: { outcome: { optionId: string } };
+				}
+			).permission.outcome.optionId,
+		).toBe("allow_once");
+
+		client.close();
+	}, 30_000);
+
+	test("session/request_permission maps replies onto OpenCode-style option IDs", async () => {
+		const { client } = await spawnAdapter(
+			vm,
+			OPENCODE_STYLE_PERMISSION_MOCK_ADAPTER,
+		);
+
+		await client.request("initialize", {
+			protocolVersion: 1,
+			clientCapabilities: {},
+		});
+		await client.request("session/new", {
+			cwd: "/home/user",
+			mcpServers: [],
+		});
+
+		const permissionRequests: JsonRpcNotification[] = [];
+		client.onNotification((notification) => {
+			if (notification.method === "request/permission") {
+				permissionRequests.push(notification);
+			}
+		});
+
+		const promptPromise = client.request("session/prompt", {
+			sessionId: "perm-session-opencode",
+			prompt: [{ type: "text", text: "run echo hello" }],
+		});
+
+		for (let i = 0; i < 20 && permissionRequests.length === 0; i++) {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+
+		expect(permissionRequests.length).toBe(1);
+		const permResponse = await client.request("request/permission", {
+			sessionId: "perm-session-opencode",
+			permissionId: "perm-opencode-001",
+			reply: "once",
+		});
+
+		expect(permResponse.error).toBeUndefined();
+		expect(
+			(permResponse.result as { outcome: { optionId: string } }).outcome.optionId,
+		).toBe("once");
+
+		const promptResponse = await promptPromise;
+		expect(promptResponse.error).toBeUndefined();
+		expect(
+			(
+				promptResponse.result as {
+					permission: { outcome: { optionId: string } };
+				}
+			).permission.outcome.optionId,
+		).toBe("once");
 
 		client.close();
 	}, 30_000);
@@ -690,6 +1292,31 @@ process.stdin.on('data', () => {
 		await expect(
 			client.request("initialize", { protocolVersion: 1 }),
 		).rejects.toThrow(/timed out after 500ms/);
+
+		client.close();
+	}, 30_000);
+
+	test("request timeout error includes recent ACP activity diagnostics", async () => {
+		const { client } = await spawnAdapterWithTimeout(
+			vm,
+			HANGING_ACTIVITY_MOCK_ADAPTER,
+			500,
+			"/tmp/hanging-activity-adapter.mjs",
+		);
+
+		await client.request("initialize", {
+			protocolVersion: 1,
+			clientCapabilities: {},
+		});
+
+		await expect(
+			client.request("session/prompt", {
+				sessionId: "hanging-session",
+				prompt: [{ type: "text", text: "hang please" }],
+			}),
+		).rejects.toThrow(
+			/recent ACP activity: .*received response id=.*non_json \[sandbox\.require\] start node:url \/.*received notification session\/update/i,
+		);
 
 		client.close();
 	}, 30_000);

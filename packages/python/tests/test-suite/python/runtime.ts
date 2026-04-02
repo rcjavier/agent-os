@@ -3,30 +3,20 @@ import {
 	allowAllEnv,
 	allowAllFs,
 	createInMemoryFileSystem,
-	createNodeDriver,
-} from "../../../src/index.js";
-import type {
-	ExecOptions,
-	ExecResult,
-	PythonRunOptions,
-	PythonRunResult,
-	StdioEvent,
-	StdioHook,
-	SystemDriver,
-} from "../../../src/index.js";
+	type ExecOptions,
+	type ExecResult,
+	type NodeRuntimeDriver,
+	type PythonRunOptions,
+	type PythonRunResult,
+	type PythonRuntimeDriver,
+	type StdioEvent,
+	type StdioHook,
+	type SystemDriver,
+} from "@secure-exec/core";
+import { createNodeDriver } from "@secure-exec/nodejs";
 
-type NodeRuntimeLike = {
-	exec(code: string, options?: ExecOptions): Promise<ExecResult>;
-	dispose(): void;
-	terminate(): Promise<void>;
-};
-
-type PythonRuntimeLike = NodeRuntimeLike & {
-	run<T = unknown>(
-		code: string,
-		options?: PythonRunOptions,
-	): Promise<PythonRunResult<T>>;
-};
+type NodeRuntimeLike = NodeRuntimeDriver;
+type PythonRuntimeLike = PythonRuntimeDriver;
 
 export type PythonCreateRuntimeOptions = {
 	cpuTimeLimitMs?: number;

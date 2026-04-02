@@ -29,11 +29,13 @@ export function resolveWorkspacePaths(startDir: string): WorkspacePaths {
 	const workspaceRoot = findWorkspaceRoot(startDir);
 	return {
 		workspaceRoot,
-		secureExecRoot: path.join(workspaceRoot, "packages", "secure-exec"),
+		// Dev-shell used to live in a nested secure-exec repo. In this monorepo,
+		// the workspace root itself is the host-visible project root.
+		secureExecRoot: workspaceRoot,
 		wasmCommandsDir: path.join(
 			workspaceRoot,
+			"registry",
 			"native",
-			"wasmvm",
 			"target",
 			"wasm32-wasip1",
 			"release",

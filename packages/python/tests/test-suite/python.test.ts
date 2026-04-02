@@ -1,5 +1,10 @@
 import { describe } from "vitest";
-import { allowAll } from "../../src/shared/permissions.js";
+import { allowAll } from "@secure-exec/core";
+import {
+	createNodeDriver,
+	createNodeRuntimeDriverFactory,
+} from "@secure-exec/nodejs";
+import { createPyodideRuntimeDriverFactory } from "../../src/driver.ts";
 import {
 	runPythonNetworkSuite,
 } from "./python/network.js";
@@ -37,42 +42,32 @@ function createPythonSuiteContext(): PythonSuiteContext {
 		},
 		async createNodeRuntime(options: PythonCreateRuntimeOptions = {}) {
 			const { systemDriver, ...runtimeOptions } = options;
-			const {
-				NodeRuntime: NodeRuntimeClass,
-				createNodeDriver,
-				createNodeRuntimeDriverFactory,
-			} = await import("../../src/index.js");
-			const runtime = new NodeRuntimeClass({
+			const effectiveSystemDriver =
+				systemDriver ??
+				createNodeDriver({
+					useDefaultNetwork: true,
+					permissions: allowAll,
+				});
+			const runtime = createNodeRuntimeDriverFactory().createRuntimeDriver({
 				...runtimeOptions,
-				systemDriver:
-					systemDriver ??
-					createNodeDriver({
-						useDefaultNetwork: true,
-						permissions: allowAll,
-					}),
-				runtimeDriverFactory: createNodeRuntimeDriverFactory(),
+				system: effectiveSystemDriver,
+				runtime: effectiveSystemDriver.runtime,
 			});
 			runtimes.add(runtime);
 			return runtime;
 		},
 		async createPythonRuntime(options: PythonCreateRuntimeOptions = {}) {
 			const { systemDriver, ...runtimeOptions } = options;
-			const {
-				PythonRuntime: PythonRuntimeClass,
-				createNodeDriver,
-			} = await import("../../src/index.js");
-			const { createPyodideRuntimeDriverFactory } = await import(
-				"@secure-exec/python"
-			);
-			const runtime = new PythonRuntimeClass({
+			const effectiveSystemDriver =
+				systemDriver ??
+				createNodeDriver({
+					useDefaultNetwork: true,
+					permissions: allowAll,
+				});
+			const runtime = createPyodideRuntimeDriverFactory().createRuntimeDriver({
 				...runtimeOptions,
-				systemDriver:
-					systemDriver ??
-					createNodeDriver({
-						useDefaultNetwork: true,
-						permissions: allowAll,
-					}),
-				runtimeDriverFactory: createPyodideRuntimeDriverFactory(),
+				system: effectiveSystemDriver,
+				runtime: effectiveSystemDriver.runtime,
 			});
 			runtimes.add(runtime);
 			return runtime;

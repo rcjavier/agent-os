@@ -48,18 +48,28 @@ describe("flat spawn API", () => {
 		});
 
 		const chunks: string[] = [];
-		vm.onProcessStdout(pid, (data) => {
-			chunks.push(new TextDecoder().decode(data));
+		const expectedOutput = "hello from flat api";
+		const stdoutReceived = new Promise<void>((resolve, reject) => {
+			const timeout = setTimeout(() => {
+				reject(new Error("Timed out waiting for spawned stdout"));
+			}, 5_000);
+
+			vm.onProcessStdout(pid, (data) => {
+				chunks.push(new TextDecoder().decode(data));
+				if (chunks.join("").includes(expectedOutput)) {
+					clearTimeout(timeout);
+					resolve();
+				}
+			});
 		});
 
 		vm.writeProcessStdin(pid, "hello from flat api\n");
 
-		// Give time for output to arrive
-		await new Promise((r) => setTimeout(r, 500));
+		await stdoutReceived;
 
 		vm.killProcess(pid);
 		await vm.waitProcess(pid);
 
-		expect(chunks.join("")).toContain("hello from flat api");
+		expect(chunks.join("")).toContain(expectedOutput);
 	}, 30_000);
 });

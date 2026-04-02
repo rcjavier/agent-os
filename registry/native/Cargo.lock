@@ -743,6 +743,8 @@ dependencies = [
  "codex-otel",
  "secureexec-wasi-http",
  "secureexec-wasi-spawn",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1369,6 +1371,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cmd-which"
+version = "0.1.0"
+dependencies = [
+ "secureexec-shims",
+]
+
+[[package]]
 name = "cmd-whoami"
 version = "0.1.0"
 dependencies = [
@@ -1381,6 +1390,10 @@ version = "0.1.0"
 dependencies = [
  "secureexec-shims",
 ]
+
+[[package]]
+name = "cmd-xu"
+version = "0.1.0"
 
 [[package]]
 name = "cmd-yes"

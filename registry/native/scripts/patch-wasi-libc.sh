@@ -27,6 +27,8 @@ VENDOR_DIR="$WASMCORE_DIR/c/vendor"
 WASI_LIBC_DIR="$VENDOR_DIR/wasi-libc"
 WASI_SDK_DIR="$VENDOR_DIR/wasi-sdk"
 SYSROOT_DIR="$WASMCORE_DIR/c/sysroot"
+WASI_LIBC_SRC_DIR="$WASI_LIBC_DIR"
+WORKTREE_DIR=""
 
 # Parse arguments
 MODE="apply"
@@ -78,6 +80,21 @@ else
     fi
 fi
 
+cleanup() {
+    if [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ]; then
+        git -C "$WASI_LIBC_DIR" worktree remove --force "$WORKTREE_DIR" >/dev/null 2>&1 || true
+    fi
+}
+
+trap cleanup EXIT
+
+if [ "$MODE" = "apply" ] || [ "$MODE" = "check" ]; then
+    WORKTREE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/wasi-libc-worktree.XXXXXX")"
+    rm -rf "$WORKTREE_DIR"
+    git -C "$WASI_LIBC_DIR" worktree add --detach "$WORKTREE_DIR" "$WASI_LIBC_COMMIT" >/dev/null 2>&1
+    WASI_LIBC_SRC_DIR="$WORKTREE_DIR"
+fi
+
 # Find patch files
 if [ "$MODE" = "reverse" ]; then
     PATCH_FILES=$(find "$PATCHES_DIR" -name '*.patch' -type f 2>/dev/null | sort -r)
@@ -95,7 +112,7 @@ if [ -z "$PATCH_FILES" ]; then
 else
     PATCH_COUNT=$(echo "$PATCH_FILES" | wc -l)
     echo "Found $PATCH_COUNT patch(es) in $PATCHES_DIR"
-    echo "wasi-libc source: $WASI_LIBC_DIR"
+    echo "wasi-libc source: $WASI_LIBC_SRC_DIR"
     echo ""
 
     FAILED=0
@@ -106,36 +123,32 @@ else
         case "$MODE" in
             check)
                 echo -n "Checking $PATCH_NAME ... "
-                if patch --dry-run -p1 -d "$WASI_LIBC_DIR" < "$PATCH" > /dev/null 2>&1; then
+                if git -C "$WASI_LIBC_SRC_DIR" apply --check --recount "$PATCH" > /dev/null 2>&1; then
+                    git -C "$WASI_LIBC_SRC_DIR" apply --recount "$PATCH" > /dev/null 2>&1
                     echo "OK (applies cleanly)"
-                elif patch --dry-run -R -p1 -d "$WASI_LIBC_DIR" < "$PATCH" > /dev/null 2>&1; then
+                elif git -C "$WASI_LIBC_SRC_DIR" apply -R --check --recount "$PATCH" > /dev/null 2>&1; then
                     echo "OK (already applied)"
                 else
-                    # Check if new files from this patch exist (layered patch scenario)
-                    NEW_FILES=$(grep '^+++ b/' "$PATCH" | sed 's|^+++ b/||' | while read -r f; do
-                        [ -f "$WASI_LIBC_DIR/$f" ] && echo "$f"
-                    done)
-                    if [ -n "$NEW_FILES" ]; then
-                        echo "OK (applied, modified by later patch)"
-                    else
-                        echo "FAIL (does not apply)"
-                        FAILED=1
-                    fi
+                    echo "FAIL (does not apply)"
+                    FAILED=1
                 fi
                 ;;
             apply)
                 echo -n "Applying $PATCH_NAME ... "
-                if patch --dry-run -p1 -d "$WASI_LIBC_DIR" < "$PATCH" > /dev/null 2>&1; then
-                    patch --no-backup-if-mismatch -p1 -d "$WASI_LIBC_DIR" < "$PATCH" > /dev/null 2>&1
+                if git -C "$WASI_LIBC_SRC_DIR" apply --check --recount "$PATCH" > /dev/null 2>&1; then
+                    git -C "$WASI_LIBC_SRC_DIR" apply --recount "$PATCH" > /dev/null 2>&1
                     echo "applied"
-                else
+                elif git -C "$WASI_LIBC_SRC_DIR" apply -R --check --recount "$PATCH" > /dev/null 2>&1; then
                     echo "already applied (skipping)"
+                else
+                    echo "FAIL (does not apply)"
+                    FAILED=1
                 fi
                 ;;
             reverse)
                 echo -n "Reversing $PATCH_NAME ... "
-                if patch -R --dry-run -p1 -d "$WASI_LIBC_DIR" < "$PATCH" > /dev/null 2>&1; then
-                    patch -R -p1 -d "$WASI_LIBC_DIR" < "$PATCH" > /dev/null 2>&1
+                if git -C "$WASI_LIBC_SRC_DIR" apply -R --check --recount "$PATCH" > /dev/null 2>&1; then
+                    git -C "$WASI_LIBC_SRC_DIR" apply -R --recount "$PATCH" > /dev/null 2>&1
                     echo "reversed"
                 else
                     echo "not applied (skipping)"
@@ -171,14 +184,14 @@ if [ ! -x "$WASI_CC" ]; then
 fi
 
 # Clean previous build artifacts and sysroot for a reproducible build
-make -C "$WASI_LIBC_DIR" clean 2>/dev/null || true
+make -C "$WASI_LIBC_SRC_DIR" clean 2>/dev/null || true
 rm -rf "$SYSROOT_DIR"
 
 # Build wasi-libc with wasi-sdk's tools, output to our sysroot directory.
 # Build the `libc` target (headers + static libraries) but NOT `finish`, which
 # runs check-symbols and fails because our patches add custom undefined symbols
 # (__host_*) not in the upstream expected-symbols list.
-make -C "$WASI_LIBC_DIR" \
+make -C "$WASI_LIBC_SRC_DIR" \
     CC="$WASI_CC" \
     AR="$WASI_AR" \
     NM="$WASI_NM" \
@@ -241,8 +254,8 @@ OVERRIDES_DIR="$WASMCORE_DIR/patches/wasi-libc-overrides"
 OVERRIDE_CFLAGS="--target=wasm32-wasip1 --sysroot=$SYSROOT_DIR -O2 -D_GNU_SOURCE"
 
 # Extra flags for overrides that need musl internal headers (struct __pthread, etc.)
-MUSL_INTERNAL_DIR="$VENDOR_DIR/wasi-libc/libc-top-half/musl/src/internal"
-MUSL_ARCH_DIR="$VENDOR_DIR/wasi-libc/libc-top-half/musl/arch/wasm32"
+MUSL_INTERNAL_DIR="$WASI_LIBC_SRC_DIR/libc-top-half/musl/src/internal"
+MUSL_ARCH_DIR="$WASI_LIBC_SRC_DIR/libc-top-half/musl/arch/wasm32"
 OVERRIDE_INTERNAL_CFLAGS="-I$MUSL_INTERNAL_DIR -I$MUSL_ARCH_DIR"
 
 if [ -d "$OVERRIDES_DIR" ] && ls "$OVERRIDES_DIR"/*.c >/dev/null 2>&1; then

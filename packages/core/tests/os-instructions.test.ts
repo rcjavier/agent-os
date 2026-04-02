@@ -1,8 +1,11 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
 import { resolve } from "node:path";
 import type { KernelSpawnOptions, ManagedProcess } from "@secure-exec/core";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { AgentOs } from "../src/agent-os.js";
 import { AGENT_CONFIGS } from "../src/agents.js";
+import { createHostDirBackend } from "../src/backends/host-dir-backend.js";
 import { getOsInstructions } from "../src/os-instructions.js";
 import {
 	REGISTRY_SOFTWARE,
@@ -293,6 +296,8 @@ process.stdin.on('data', (chunk) => {
             agentInfo: {
               name: 'mock-adapter',
               version: '1.0',
+              contextPaths: process.env.OPENCODE_CONTEXTPATHS || null,
+              argv: process.argv.slice(2),
             },
           };
           break;
@@ -328,9 +333,24 @@ interface SpawnCapture {
 describe("createSession OS instructions integration", () => {
 	let vm: AgentOs;
 	let spawnCaptures: SpawnCapture[];
+	let hostWorkspaceDir: string;
 
 	beforeEach(async () => {
-		vm = await AgentOs.create({ moduleAccessCwd: MODULE_ACCESS_CWD });
+		hostWorkspaceDir = fs.mkdtempSync(
+			os.tmpdir() + "/agentos-os-instructions-",
+		);
+		vm = await AgentOs.create({
+			moduleAccessCwd: MODULE_ACCESS_CWD,
+			mounts: [
+				{
+					path: "/home/user",
+					driver: createHostDirBackend({
+						hostPath: hostWorkspaceDir,
+						readOnly: false,
+					}),
+				},
+			],
+		});
 		spawnCaptures = [];
 
 		// Spy on kernel.spawn to capture args while delegating to the real impl
@@ -347,6 +367,7 @@ describe("createSession OS instructions integration", () => {
 
 	afterEach(async () => {
 		await vm.dispose();
+		fs.rmSync(hostWorkspaceDir, { recursive: true, force: true });
 	});
 
 	/**
@@ -392,23 +413,29 @@ describe("createSession OS instructions integration", () => {
 		}
 	});
 
-	test("createSession with OpenCode sets OPENCODE_CONTEXTPATHS with absolute /etc/agentos/ path", async () => {
-		const scriptPath = "/tmp/mock-adapter.mjs";
+	test("createSession with OpenCode passes OPENCODE_CONTEXTPATHS directly to the VM adapter", async () => {
+		const scriptPath = "/tmp/mock-opencode-adapter.mjs";
 		await vm.writeFile(scriptPath, MOCK_ACP_ADAPTER);
 		const restore = useMockAdapterBin(scriptPath);
 
 		try {
 			const { sessionId } = await vm.createSession("opencode");
 
-			// Verify OPENCODE_CONTEXTPATHS was passed as env var to spawn
-			expect(spawnCaptures.length).toBeGreaterThan(0);
-			const spawnCall = spawnCaptures[0];
-			const envPaths = spawnCall.options?.env?.OPENCODE_CONTEXTPATHS;
-			expect(envPaths).toBeTruthy();
-			const contextPaths = JSON.parse(envPaths as string);
+			const agentInfo = vm.getSessionAgentInfo(sessionId) as {
+				contextPaths?: string;
+				argv?: string[];
+			};
+			const contextPaths = JSON.parse(agentInfo.contextPaths as string);
+			expect(agentInfo.argv ?? []).not.toContain("acp");
 			expect(contextPaths).toContain("/etc/agentos/instructions.md");
-			// No longer uses relative .agent-os/ path
-			expect(contextPaths).not.toContain(".agent-os/instructions.md");
+			expect(
+				contextPaths.some(
+					(entry: string) =>
+						entry.startsWith("/") &&
+						entry !== "/etc/agentos/instructions.md" &&
+						entry.endsWith("/instructions.md"),
+				),
+			).toBe(false);
 
 			// No .agent-os/ directory created in cwd
 			const agentOsDirExists = await vm.exists("/home/user/.agent-os");
@@ -442,7 +469,7 @@ describe("createSession OS instructions integration", () => {
 	});
 
 	test("user-provided env vars override instruction env vars", async () => {
-		const scriptPath = "/tmp/mock-adapter.mjs";
+		const scriptPath = "/tmp/mock-opencode-adapter.mjs";
 		await vm.writeFile(scriptPath, MOCK_ACP_ADAPTER);
 		const restore = useMockAdapterBin(scriptPath);
 
@@ -452,12 +479,10 @@ describe("createSession OS instructions integration", () => {
 				env: { OPENCODE_CONTEXTPATHS: userContextPaths },
 			});
 
-			// Verify user's OPENCODE_CONTEXTPATHS wins over prepareInstructions
-			expect(spawnCaptures.length).toBeGreaterThan(0);
-			const spawnCall = spawnCaptures[0];
-			expect(spawnCall.options?.env?.OPENCODE_CONTEXTPATHS).toBe(
-				userContextPaths,
-			);
+			const agentInfo = vm.getSessionAgentInfo(sessionId) as {
+				contextPaths?: string;
+			};
+			expect(agentInfo.contextPaths).toBe(userContextPaths);
 
 			vm.closeSession(sessionId);
 		} finally {

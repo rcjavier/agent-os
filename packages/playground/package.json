@@ -16,9 +16,11 @@
     "secure-exec": "^0.2.1"
   },
   "devDependencies": {
+    "@types/node": "^22.19.15",
     "esbuild": "^0.27.1",
     "monaco-editor": "0.52.2",
     "pyodide": "0.28.3",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "vitest": "^2.1.8"
   }
 }

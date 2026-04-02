@@ -1,251 +1,646 @@
 import { resolve } from "node:path";
-import type { ManagedProcess } from "@secure-exec/core";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { AcpClient } from "../src/acp-client.js";
+import type { Fixture, ToolCall } from "@copilotkit/llmock";
+import { describe, expect, test } from "vitest";
+import opencode from "@rivet-dev/agent-os-opencode";
 import { AgentOs } from "../src/agent-os.js";
-import { AGENT_CONFIGS } from "../src/agents.js";
-import type { JsonRpcNotification } from "../src/protocol.js";
-import { Session } from "../src/session.js";
-import { createStdoutLineIterable } from "../src/stdout-lines.js";
-
-/**
- * Full createSession('opencode') Tests
- *
- * BLOCKED: OpenCode is a native ELF binary (compiled Go), not Node.js. The
- * secure-exec VM kernel only supports JS/WASM command execution. The opencode-ai
- * npm package is a JS wrapper that calls child_process.spawnSync on the native
- * binary, which returns ENOENT inside the VM.
- *
- * Differences from PI session behavior:
- * - OpenCode speaks ACP natively (`opencode acp`), so acpAdapter and agentPackage
- *   are the same package (opencode-ai). PI uses a separate adapter (pi-acp).
- * - OpenCode's ACP mode starts directly as a JSON-RPC server; PI's pi-acp spawns
- *   the PI CLI as a child process, adding another layer of process management.
- * - Both agents use the same JSON-RPC 2.0 protocol: initialize, session/new,
- *   session/prompt, session/cancel, session/update notifications.
- * - OpenCode's agentInfo.name would be "opencode" (vs pi-acp's "pi-acp").
- * - Since OpenCode is its own adapter, createSession('opencode') has one fewer
- *   process indirection — no adapter-spawns-agent chain.
- *
- * To enable real OpenCode sessions in the VM, one of:
- * (a) Add native binary execution support to the secure-exec kernel
- * (b) Run OpenCode outside the VM and proxy ACP over a socket/pipe
- * (c) Build a WASM version of OpenCode (unlikely given it's Go + native deps)
- */
+import type { AgentCapabilities, AgentInfo } from "../src/session.js";
+import {
+	createAnthropicFixture,
+	DEFAULT_TEXT_FIXTURE,
+	startLlmock,
+	stopLlmock,
+} from "./helpers/llmock-helper.js";
+import {
+	createVmOpenCodeHome,
+	createVmWorkspace,
+	readVmText,
+} from "./helpers/opencode-helper.js";
+import { REGISTRY_SOFTWARE, registrySkipReason } from "./helpers/registry-commands.js";
 
 const MODULE_ACCESS_CWD = resolve(import.meta.dirname, "..");
 
-/**
- * Mock OpenCode ACP adapter for testing the Session lifecycle.
- * Mirrors what `opencode acp` would do: JSON-RPC 2.0 over stdio.
- * Responds to initialize, session/new, session/prompt, session/cancel.
- * session/prompt sends a session/update notification before the response.
- */
-const MOCK_OPENCODE_ACP = `
-let buffer = '';
-process.stdin.resume();
-process.stdin.on('data', (chunk) => {
-  const str = chunk instanceof Uint8Array ? new TextDecoder().decode(chunk) : String(chunk);
-  buffer += str;
+type LlmockMessage = {
+	role?: string;
+	content?: string | null;
+};
 
-  while (true) {
-    const idx = buffer.indexOf('\\n');
-    if (idx === -1) break;
-    const line = buffer.substring(0, idx);
-    buffer = buffer.substring(idx + 1);
-    if (!line.trim()) continue;
-
-    try {
-      const msg = JSON.parse(line);
-      if (msg.id === undefined) continue;
-
-      let result;
-      switch (msg.method) {
-        case 'initialize':
-          result = {
-            protocolVersion: 1,
-            agentInfo: { name: 'opencode', version: '0.1.0' },
-          };
-          break;
-        case 'session/new':
-          result = { sessionId: 'opencode-session-1' };
-          break;
-        case 'session/prompt': {
-          const sid = (msg.params && msg.params.sessionId) || 'opencode-session-1';
-          // OpenCode sends session/update notifications during prompt processing
-          process.stdout.write(JSON.stringify({
-            jsonrpc: '2.0',
-            method: 'session/update',
-            params: { sessionId: sid, type: 'text', text: 'OpenCode mock response' },
-          }) + '\\n');
-          result = { sessionId: sid };
-          break;
-        }
-        case 'session/cancel':
-          result = {};
-          break;
-        default:
-          process.stdout.write(JSON.stringify({
-            jsonrpc: '2.0', id: msg.id,
-            error: { code: -32601, message: 'Method not found' },
-          }) + '\\n');
-          continue;
-      }
-
-      process.stdout.write(JSON.stringify({
-        jsonrpc: '2.0', id: msg.id, result,
-      }) + '\\n');
-    } catch (e) {}
-  }
-});
-`;
-
-/**
- * Spawn the mock OpenCode ACP adapter inside the VM and wire up an AcpClient.
- */
-async function spawnMockOpenCodeAdapter(vm: AgentOs): Promise<{
-	proc: ManagedProcess;
-	client: AcpClient;
-}> {
-	await vm.writeFile("/tmp/mock-opencode-acp.mjs", MOCK_OPENCODE_ACP);
-
-	const { iterable, onStdout } = createStdoutLineIterable();
-
-	const proc = vm.kernel.spawn("node", ["/tmp/mock-opencode-acp.mjs"], {
-		streamStdin: true,
-		onStdout,
-		env: { HOME: "/home/user" },
-	});
-
-	const client = new AcpClient(proc, iterable);
-	return { proc, client };
-}
-
-/**
- * Initialize the mock adapter and register a Session in vm._sessions.
- */
-async function createMockOpenCodeSession(vm: AgentOs): Promise<{
-	sessionId: string;
-	proc: ManagedProcess;
-	client: AcpClient;
-}> {
-	const { proc, client } = await spawnMockOpenCodeAdapter(vm);
-
-	const initResponse = await client.request("initialize", {
-		protocolVersion: 1,
-		clientCapabilities: {},
-	});
-	if (initResponse.error) {
-		client.close();
-		throw new Error(
-			`Mock initialize failed: ${initResponse.error.message}`,
-		);
+function getLlmockMessages(req: unknown): LlmockMessage[] {
+	const directMessages = (req as { messages?: LlmockMessage[] }).messages;
+	if (Array.isArray(directMessages)) {
+		return directMessages;
 	}
 
-	const sessionResponse = await client.request("session/new", {
-		cwd: "/home/user",
-		mcpServers: [],
-	});
-	if (sessionResponse.error) {
-		client.close();
-		throw new Error(
-			`Mock session/new failed: ${sessionResponse.error.message}`,
-		);
-	}
-
-	const sessionId = (sessionResponse.result as { sessionId: string })
-		.sessionId;
-	const sessions = (vm as unknown as { _sessions: Map<string, Session> })._sessions;
-	const session = new Session(client, sessionId, "opencode", {}, () => { sessions.delete(sessionId); });
-	sessions.set(sessionId, session);
-	return { sessionId, proc, client };
+	const bodyMessages = (req as { body?: { messages?: LlmockMessage[] } }).body
+		?.messages;
+	return Array.isArray(bodyMessages) ? bodyMessages : [];
 }
 
-describe("full createSession('opencode')", () => {
-	let vm: AgentOs;
+function hasToolResultContaining(req: unknown, expected: string): boolean {
+	return getLlmockMessages(req).some(
+		(message) =>
+			message.role === "tool" &&
+			typeof message.content === "string" &&
+			message.content.includes(expected),
+	);
+}
 
-	beforeEach(async () => {
-		vm = await AgentOs.create({
-			moduleAccessCwd: MODULE_ACCESS_CWD,
-		});
+function hasUserMessageContaining(req: unknown, expected: string): boolean {
+	return getLlmockMessages(req).some(
+		(message) =>
+			message.role === "user" &&
+			typeof message.content === "string" &&
+			message.content.includes(expected),
+	);
+}
+
+function createToolFixtures(
+	toolCall: ToolCall,
+	expectedToolResult: string,
+	finalText: string,
+): Fixture[] {
+	return [
+		createAnthropicFixture(
+			{
+				predicate: (req) =>
+					!getLlmockMessages(req).some((message) => message.role === "tool"),
+			},
+			{ toolCalls: [toolCall] },
+		),
+		createAnthropicFixture(
+			{
+				predicate: (req) => hasToolResultContaining(req, expectedToolResult),
+			},
+			{ content: finalText },
+		),
+	];
+}
+
+async function createOpenCodeVm(mockUrl: string): Promise<AgentOs> {
+	return AgentOs.create({
+		loopbackExemptPorts: [Number(new URL(mockUrl).port)],
+		moduleAccessCwd: MODULE_ACCESS_CWD,
+		software: [opencode, ...REGISTRY_SOFTWARE],
 	});
+}
 
-	afterEach(async () => {
-		await vm.dispose();
-	});
-
-	test("opencode agent config is correct", () => {
-		const config = AGENT_CONFIGS.opencode;
-		expect(config).toBeDefined();
-		// OpenCode speaks ACP natively — adapter and package are the same
-		expect(config.acpAdapter).toBe("opencode-ai");
-		expect(config.agentPackage).toBe("opencode-ai");
-	});
-
-	test("createSession('opencode') fails - native binary cannot execute in VM", async () => {
-		// createSession resolves the opencode-ai bin entry from host node_modules,
-		// spawns it with `node` inside the VM. The JS wrapper runs, but when it
-		// tries to spawnSync the native Go binary, the kernel returns ENOENT.
-		// The wrapper process exits non-zero, causing the ACP client's pending
-		// initialize request to be rejected.
-		try {
-			const { sessionId } = await vm.createSession("opencode", {
-				env: { ANTHROPIC_API_KEY: "test-key" },
-			});
-			// Unexpected success — close and fail
-			vm.closeSession(sessionId);
-			expect.fail(
-				"createSession('opencode') should fail due to native binary limitation",
+describe.skipIf(registrySkipReason)(
+	"full createSession('opencode') inside the VM",
+	() => {
+		test("runs the real OpenCode ACP flow end-to-end for write tool calls", async () => {
+			const fixtures = createToolFixtures(
+				{
+					name: "write",
+					arguments: JSON.stringify({
+						filePath: "notes.txt",
+						content: "hello from tool",
+					}),
+				},
+				"hello from tool",
+				"notes.txt was created successfully.",
 			);
-		} catch (err) {
-			const message = (err as Error).message;
-			// The error comes from either:
-			// - Process exit rejecting the pending initialize request
-			// - The wrapper crashing when the native binary can't be found
-			expect(message).toBeTruthy();
-		}
-	}, 60_000);
+			const { mock, url } = await startLlmock(fixtures);
+			const vm = await createOpenCodeVm(url);
 
-	test("session.prompt() sends prompt and receives session/update events (mock)", async () => {
-		// Use mock OpenCode ACP adapter to test what the session lifecycle
-		// would look like if the native binary could run in the VM.
-		const { sessionId } = await createMockOpenCodeSession(vm);
+			let sessionId: string | undefined;
+			try {
+				const homeDir = await createVmOpenCodeHome(vm, url);
+				const workspaceDir = await createVmWorkspace(vm);
+				sessionId = (
+					await vm.createSession("opencode", {
+						cwd: workspaceDir,
+						env: {
+							HOME: homeDir,
+							ANTHROPIC_API_KEY: "mock-key",
+						},
+					})
+				).sessionId;
 
-		const events: JsonRpcNotification[] = [];
-		vm.onSessionEvent(sessionId, (event) => {
-			events.push(event);
-		});
+				const agentInfo = vm.getSessionAgentInfo(sessionId) as AgentInfo;
+				expect(agentInfo.name).toBe("OpenCode");
+				expect(agentInfo.version).toBeTruthy();
 
-		const response = await vm.prompt(sessionId, "write hello world");
+				const capabilities = vm.getSessionCapabilities(
+					sessionId,
+				) as AgentCapabilities;
+				expect(capabilities.promptCapabilities).toMatchObject({
+					embeddedContext: true,
+					image: true,
+				});
 
-		expect(response.error).toBeUndefined();
-		expect(response.result).toBeDefined();
-		const result = response.result as { sessionId: string };
-		expect(result.sessionId).toBe("opencode-session-1");
+				const modes = vm.getSessionModes(sessionId);
+				expect(modes?.currentModeId).toBe("build");
+				expect(modes?.availableModes.map((mode) => mode.id)).toEqual(
+					expect.arrayContaining(["build", "plan"]),
+				);
 
-		// Mock sends session/update notification before the prompt response
-		expect(events.length).toBeGreaterThanOrEqual(1);
-		expect(events[0].method).toBe("session/update");
-		expect((events[0].params as { text: string }).text).toBe(
-			"OpenCode mock response",
-		);
+				const configOptions = vm.getSessionConfigOptions(sessionId);
+				expect(
+					configOptions.some((option) => option.category === "model"),
+				).toBe(true);
 
-		vm.closeSession(sessionId);
-	}, 30_000);
+				const response = await vm.prompt(
+					sessionId,
+					"Create notes.txt with the text hello from tool.",
+				);
 
-	test("session.close() cleans up the opencode process (mock)", async () => {
-		const { sessionId, proc } = await createMockOpenCodeSession(vm);
+				expect(response.error).toBeUndefined();
+				expect(await readVmText(vm, `${workspaceDir}/notes.txt`)).toBe(
+					"hello from tool",
+				);
+				expect(mock.getRequests().length).toBeGreaterThanOrEqual(2);
 
-		expect(sessionId).toBe("opencode-session-1");
+				const events = vm
+					.getSessionEvents(sessionId)
+					.map((event) => event.notification);
+				expect(
+					events.some(
+						(event) =>
+							event.method === "session/update" &&
+							JSON.stringify(event.params).includes("tool_call"),
+					),
+				).toBe(true);
+				expect(events.length).toBeGreaterThan(0);
+			} finally {
+				if (sessionId) {
+					vm.closeSession(sessionId);
+				}
+				await vm.dispose();
+				await stopLlmock(mock);
+			}
+		}, 120_000);
 
-		vm.closeSession(sessionId);
+		test("runs the real OpenCode ACP flow end-to-end for bash tool calls", async () => {
+			const fixtures = createToolFixtures(
+				{
+					name: "bash",
+					arguments: JSON.stringify({
+						command: "printf 'bash-ok' > bash-output.txt",
+						description: "write bash-ok to bash-output.txt",
+					}),
+				},
+				"bash-ok",
+				"bash-output.txt was written successfully.",
+			);
+			const { mock, url } = await startLlmock(fixtures);
+			const vm = await createOpenCodeVm(url);
 
-		// After close, the AcpClient kills the process and rejects new requests.
-		await expect(
-			new AcpClient(proc, (async function* () {})()).request(
-				"initialize",
-				{},
-			),
-		).rejects.toThrow();
-	}, 30_000);
-});
+			let sessionId: string | undefined;
+			try {
+				const homeDir = await createVmOpenCodeHome(vm, url);
+				const workspaceDir = await createVmWorkspace(vm);
+				sessionId = (
+					await vm.createSession("opencode", {
+						cwd: workspaceDir,
+						env: {
+							HOME: homeDir,
+							ANTHROPIC_API_KEY: "mock-key",
+						},
+					})
+				).sessionId;
+
+				const response = await vm.prompt(
+					sessionId,
+					"Use bash to write bash-ok into bash-output.txt.",
+				);
+
+				expect(response.error).toBeUndefined();
+				expect(await readVmText(vm, `${workspaceDir}/bash-output.txt`)).toBe(
+					"bash-ok",
+				);
+				expect(mock.getRequests().length).toBeGreaterThanOrEqual(2);
+			} finally {
+				if (sessionId) {
+					vm.closeSession(sessionId);
+				}
+				await vm.dispose();
+				await stopLlmock(mock);
+			}
+		}, 120_000);
+
+		test("integrates OpenCode session metadata, plan mode, and lifecycle into the Agent OS session API", async () => {
+			const { mock, url } = await startLlmock([DEFAULT_TEXT_FIXTURE]);
+			const vm = await createOpenCodeVm(url);
+
+			let sessionId: string | undefined;
+			try {
+				const homeDir = await createVmOpenCodeHome(vm, url);
+				const workspaceDir = await createVmWorkspace(vm);
+				sessionId = (
+					await vm.createSession("opencode", {
+						cwd: workspaceDir,
+						env: {
+							HOME: homeDir,
+							ANTHROPIC_API_KEY: "mock-key",
+						},
+					})
+				).sessionId;
+
+				expect(vm.listSessions()).toContainEqual({
+					sessionId,
+					agentType: "opencode",
+				});
+				expect(vm.resumeSession(sessionId)).toEqual({ sessionId });
+
+				const modelOption = vm
+					.getSessionConfigOptions(sessionId)
+					.find((option) => option.category === "model");
+				expect(modelOption).toMatchObject({
+					id: "model",
+					category: "model",
+					currentValue: "anthropic/claude-sonnet-4-20250514",
+					readOnly: true,
+				});
+				expect(modelOption?.description).toContain(
+					"before createSession()",
+				);
+
+				const setModelResponse = await vm.setSessionModel(
+					sessionId,
+					"anthropic/claude-opus-4-1-20250805",
+				);
+				expect(setModelResponse.error?.message).toContain(
+					"configured before createSession()",
+				);
+
+				const setModeResponse = await vm.setSessionMode(sessionId, "plan");
+				expect(setModeResponse.error).toBeUndefined();
+				expect(vm.getSessionModes(sessionId)?.currentModeId).toBe("plan");
+
+				const promptResponse = await vm.prompt(
+					sessionId,
+					"Plan the next step without running tools.",
+				);
+				expect(promptResponse.error).toBeUndefined();
+				expect(
+					mock
+						.getRequests()
+						.some((request) =>
+							hasUserMessageContaining(
+								request,
+								"Plan Mode - System Reminder",
+							),
+						),
+				).toBe(true);
+
+				const modelsUsed = mock
+					.getRequests()
+					.map((request) =>
+						request.body && typeof request.body === "object"
+							? (request.body as { model?: unknown }).model
+							: undefined,
+					)
+					.filter((model): model is string => typeof model === "string");
+				expect(modelsUsed).toContain("claude-sonnet-4-20250514");
+				expect(modelsUsed).not.toContain("claude-opus-4-1-20250805");
+
+				const destroyedSessionId = sessionId;
+				await vm.destroySession(destroyedSessionId);
+				sessionId = undefined;
+				expect(vm.listSessions()).not.toContainEqual({
+					sessionId: destroyedSessionId,
+					agentType: "opencode",
+				});
+				expect(() => vm.resumeSession(destroyedSessionId)).toThrow(
+					"Session not found",
+				);
+			} finally {
+				if (sessionId) {
+					vm.closeSession(sessionId);
+				}
+				await vm.dispose();
+				await stopLlmock(mock);
+			}
+		}, 120_000);
+
+		test("surfaces OpenCode cancelSession() honestly through the Agent OS session API", async () => {
+			const { mock, url } = await startLlmock([
+				{
+					match: { predicate: () => true },
+					response: { content: "This response should outlive the cancel request." },
+					latency: 1_500,
+				},
+			]);
+			const vm = await createOpenCodeVm(url);
+
+			let sessionId: string | undefined;
+			try {
+				const homeDir = await createVmOpenCodeHome(vm, url);
+				const workspaceDir = await createVmWorkspace(vm);
+				sessionId = (
+					await vm.createSession("opencode", {
+						cwd: workspaceDir,
+						env: {
+							HOME: homeDir,
+							ANTHROPIC_API_KEY: "mock-key",
+						},
+					})
+				).sessionId;
+
+				const promptPromise = vm.prompt(
+					sessionId,
+					"Take a while and then answer.",
+				);
+				await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+
+				const cancelResponse = await vm.cancelSession(sessionId);
+				expect(cancelResponse.error).toBeUndefined();
+				expect(
+					cancelResponse.result as {
+						cancelled: boolean;
+						requested: boolean;
+						via: string;
+					},
+				).toMatchObject({
+					cancelled: false,
+					requested: true,
+					via: "notification-fallback",
+				});
+
+				const promptResponse = await promptPromise;
+				expect(promptResponse.error).toBeUndefined();
+				expect(
+					(promptResponse.result as { stopReason?: string }).stopReason,
+				).toBe("end_turn");
+				expect(
+					mock
+						.getRequests()
+						.some((request) =>
+							hasUserMessageContaining(
+								request,
+								"Take a while and then answer.",
+							),
+						),
+				).toBe(true);
+			} finally {
+				if (sessionId) {
+					vm.closeSession(sessionId);
+				}
+				await vm.dispose();
+				await stopLlmock(mock);
+			}
+		}, 120_000);
+
+		test("supports real OpenCode permission approval through the Agent OS session API", async () => {
+			const fixtures = createToolFixtures(
+				{
+					name: "bash",
+					arguments: JSON.stringify({
+						command: "printf 'perm-ok' > perm-output.txt",
+						description: "write perm-ok",
+					}),
+				},
+				"perm-ok",
+				"perm-output.txt was written after approval.",
+			);
+			const { mock, url } = await startLlmock(fixtures);
+			const vm = await createOpenCodeVm(url);
+
+			let sessionId: string | undefined;
+			const permissionIds: string[] = [];
+			try {
+				const homeDir = await createVmOpenCodeHome(vm, url, { bash: "ask" });
+				const workspaceDir = await createVmWorkspace(vm);
+				sessionId = (
+					await vm.createSession("opencode", {
+						cwd: workspaceDir,
+						env: {
+							HOME: homeDir,
+							ANTHROPIC_API_KEY: "mock-key",
+						},
+					})
+				).sessionId;
+
+				vm.onPermissionRequest(sessionId, (request) => {
+					permissionIds.push(request.permissionId);
+					expect(
+						(request.params._acpMethod as string | undefined) ?? "",
+					).toBe("session/request_permission");
+					expect(
+						(
+							request.params.options as Array<{ optionId?: string }> | undefined
+						)?.map((option) => option.optionId),
+					).toEqual(["once", "always", "reject"]);
+					void vm.respondPermission(sessionId!, request.permissionId, "once");
+				});
+
+				const response = await vm.prompt(
+					sessionId,
+					"Use bash to write perm-ok into perm-output.txt.",
+				);
+
+				expect(response.error).toBeUndefined();
+				expect(permissionIds).toHaveLength(1);
+				expect(await readVmText(vm, `${workspaceDir}/perm-output.txt`)).toBe(
+					"perm-ok",
+				);
+				expect(
+					vm.getSessionEvents(sessionId).some(
+						(entry) => entry.notification.method === "request/permission",
+					),
+				).toBe(true);
+			} finally {
+				if (sessionId) {
+					vm.closeSession(sessionId);
+				}
+				await vm.dispose();
+				await stopLlmock(mock);
+			}
+		}, 120_000);
+
+		test("supports real OpenCode permission rejection through the Agent OS session API", async () => {
+			const toolCall = {
+				name: "bash",
+				arguments: JSON.stringify({
+					command: "printf 'perm-no' > perm-output.txt",
+					description: "write perm-no",
+				}),
+			};
+			const { mock, url } = await startLlmock([
+				createAnthropicFixture(
+					{
+						predicate: (req) =>
+							hasUserMessageContaining(
+								req,
+								"Use bash to write perm-no into perm-output.txt.",
+							),
+					},
+					{ toolCalls: [toolCall] },
+				),
+				createAnthropicFixture(
+					{
+						predicate: (req) =>
+							hasUserMessageContaining(
+								req,
+								"Generate a title for this conversation:",
+							),
+					},
+					{ content: "Permission rejection check" },
+				),
+			]);
+			const vm = await createOpenCodeVm(url);
+
+			let sessionId: string | undefined;
+			const permissionIds: string[] = [];
+			try {
+				const homeDir = await createVmOpenCodeHome(vm, url, { bash: "ask" });
+				const workspaceDir = await createVmWorkspace(vm);
+				sessionId = (
+					await vm.createSession("opencode", {
+						cwd: workspaceDir,
+						env: {
+							HOME: homeDir,
+							ANTHROPIC_API_KEY: "mock-key",
+						},
+					})
+				).sessionId;
+
+				vm.onPermissionRequest(sessionId, (request) => {
+					permissionIds.push(request.permissionId);
+					void vm.respondPermission(sessionId!, request.permissionId, "reject");
+				});
+
+				const response = await vm.prompt(
+					sessionId,
+					"Use bash to write perm-no into perm-output.txt.",
+				);
+
+				expect(response.error).toBeUndefined();
+				expect(permissionIds).toHaveLength(1);
+				await expect(
+					vm.readFile(`${workspaceDir}/perm-output.txt`),
+				).rejects.toThrow();
+				expect(
+					mock
+						.getRequests()
+						.some((request) =>
+							hasUserMessageContaining(
+								request,
+								"Use bash to write perm-no into perm-output.txt.",
+							),
+						),
+				).toBe(true);
+			} finally {
+				if (sessionId) {
+					vm.closeSession(sessionId);
+				}
+				await vm.dispose();
+				await stopLlmock(mock);
+			}
+		}, 120_000);
+
+		test("supports rawSessionSend() mode changes through the Agent OS session API", async () => {
+			const { mock, url } = await startLlmock([DEFAULT_TEXT_FIXTURE]);
+			const vm = await createOpenCodeVm(url);
+
+			let sessionId: string | undefined;
+			try {
+				const homeDir = await createVmOpenCodeHome(vm, url);
+				const workspaceDir = await createVmWorkspace(vm);
+				sessionId = (
+					await vm.createSession("opencode", {
+						cwd: workspaceDir,
+						env: {
+							HOME: homeDir,
+							ANTHROPIC_API_KEY: "mock-key",
+						},
+					})
+				).sessionId;
+
+				const receivedEvents: string[] = [];
+				const unsubscribe = vm.onSessionEvent(sessionId, (event) => {
+					if (event.method !== "session/update") {
+						return;
+					}
+					const serialized = JSON.stringify(event.params);
+					if (serialized.includes("current_mode_update")) {
+						receivedEvents.push(serialized);
+					}
+				});
+
+				const setPlanResponse = await vm.setSessionMode(sessionId, "plan");
+				expect(setPlanResponse.error).toBeUndefined();
+				expect(vm.getSessionModes(sessionId)?.currentModeId).toBe("plan");
+
+				const planPrompt = "Plan once and do not run tools.";
+				const planPromptResponse = await vm.prompt(sessionId, planPrompt);
+				expect(planPromptResponse.error).toBeUndefined();
+
+				const rawBuildResponse = await vm.rawSessionSend(
+					sessionId,
+					"session/set_mode",
+					{
+						modeId: "build",
+					},
+				);
+				expect(rawBuildResponse.error).toBeUndefined();
+				expect(vm.getSessionModes(sessionId)?.currentModeId).toBe("build");
+
+				const buildPrompt = "Answer normally after returning to build mode.";
+				const buildPromptResponse = await vm.prompt(sessionId, buildPrompt);
+				expect(buildPromptResponse.error).toBeUndefined();
+
+				const modeEvents = vm
+					.getSessionEvents(sessionId)
+					.map((entry) => entry.notification)
+					.filter(
+						(event) =>
+							event.method === "session/update" &&
+							JSON.stringify(event.params).includes("current_mode_update"),
+					);
+				expect(
+					modeEvents.some((event) =>
+						JSON.stringify(event.params).includes(
+							'"currentModeId":"plan"',
+						),
+					),
+				).toBe(true);
+				expect(
+					modeEvents.some((event) =>
+						JSON.stringify(event.params).includes(
+							'"currentModeId":"build"',
+						),
+					),
+				).toBe(true);
+				expect(
+					receivedEvents.some((event) =>
+						event.includes('"currentModeId":"plan"'),
+					),
+				).toBe(true);
+				expect(
+					receivedEvents.some((event) =>
+						event.includes('"currentModeId":"build"'),
+					),
+				).toBe(true);
+				unsubscribe();
+
+				const planRequest = mock
+					.getRequests()
+					.find((request) => hasUserMessageContaining(request, planPrompt));
+				expect(planRequest).toBeDefined();
+				expect(
+					hasUserMessageContaining(
+						planRequest,
+						"Plan Mode - System Reminder",
+					),
+				).toBe(true);
+
+				const buildRequest = mock
+					.getRequests()
+					.find((request) => hasUserMessageContaining(request, buildPrompt));
+				expect(buildRequest).toBeDefined();
+				expect(
+					hasUserMessageContaining(
+						buildRequest,
+						"Plan Mode - System Reminder",
+					),
+				).toBe(false);
+			} finally {
+				if (sessionId) {
+					vm.closeSession(sessionId);
+				}
+				await vm.dispose();
+				await stopLlmock(mock);
+			}
+		}, 120_000);
+	},
+);

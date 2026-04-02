@@ -1,5 +1,99 @@
 import type { ZodType } from "zod";
 
+const TYPE_NAME_MAP: Record<string, string> = {
+	array: "ZodArray",
+	boolean: "ZodBoolean",
+	branded: "ZodBranded",
+	catch: "ZodCatch",
+	default: "ZodDefault",
+	effects: "ZodEffects",
+	enum: "ZodEnum",
+	literal: "ZodLiteral",
+	nullable: "ZodNullable",
+	number: "ZodNumber",
+	object: "ZodObject",
+	optional: "ZodOptional",
+	pipe: "ZodPipeline",
+	pipeline: "ZodPipeline",
+	readonly: "ZodReadonly",
+	string: "ZodString",
+	union: "ZodUnion",
+};
+
+const OPTIONAL_WRAPPER_TYPES = new Set(["ZodDefault", "ZodOptional"]);
+const TRANSPARENT_WRAPPER_TYPES = new Set([
+	...OPTIONAL_WRAPPER_TYPES,
+	"ZodBranded",
+	"ZodCatch",
+	"ZodEffects",
+	"ZodPipeline",
+	"ZodReadonly",
+]);
+
+function getSchemaDef(schema: unknown): Record<string, unknown> {
+	return ((schema as any)?._def ?? (schema as any)?.def ?? {}) as Record<
+		string,
+		unknown
+	>;
+}
+
+export function getZodTypeName(schema: ZodType | null | undefined): string {
+	if (!schema) return "";
+
+	const def = getSchemaDef(schema);
+	const rawType =
+		(def.typeName as string | undefined) ??
+		(def.type as string | undefined) ??
+		((schema as any).type as string | undefined) ??
+		"";
+
+	return TYPE_NAME_MAP[rawType] ?? rawType;
+}
+
+function getInnerSchema(schema: ZodType): ZodType | null {
+	const def = getSchemaDef(schema);
+	return ((def.innerType ??
+		def.schema ??
+		def.type ??
+		def.in) as ZodType | undefined) ?? null;
+}
+
+function getArrayElementSchema(schema: ZodType): ZodType | null {
+	const def = getSchemaDef(schema);
+	return ((def.element ?? def.type) as ZodType | undefined) ?? null;
+}
+
+function unwrapSchema(schema: ZodType): {
+	schema: ZodType;
+	typeName: string;
+	isOptional: boolean;
+} {
+	let current = schema;
+	let isOptional = false;
+
+	while (true) {
+		const typeName = getZodTypeName(current);
+		if (!typeName) {
+			return { schema: current, typeName, isOptional };
+		}
+
+		if (!TRANSPARENT_WRAPPER_TYPES.has(typeName)) {
+			return { schema: current, typeName, isOptional };
+		}
+
+		if (OPTIONAL_WRAPPER_TYPES.has(typeName)) {
+			isOptional = true;
+		}
+
+		const inner = getInnerSchema(current);
+		if (!inner) {
+			return { schema: current, typeName, isOptional };
+		}
+
+		current = inner;
+	}
+}
+
 /**
  * Convert camelCase to kebab-case.
  * fullPage -> full-page
@@ -23,31 +117,17 @@ export function unwrapType(schema: ZodType): {
 	typeName: string;
 	isOptional: boolean;
 } {
-	const def = (schema as any)._def;
-	const typeName: string = def.typeName ?? "";
-
-	if (typeName === "ZodOptional" || typeName === "ZodDefault") {
-		const inner = unwrapType(def.innerType);
-		return { typeName: inner.typeName, isOptional: true };
-	}
-
-	return { typeName, isOptional: false };
+	const { typeName, isOptional } = unwrapSchema(schema);
+	return { typeName, isOptional };
 }
 
 /**
  * Get the item type name for a ZodArray schema.
  */
 function getArrayItemTypeName(schema: ZodType): string | null {
-	const def = (schema as any)._def;
-	const typeName: string = def.typeName ?? "";
-
-	if (typeName === "ZodOptional" || typeName === "ZodDefault") {
-		return getArrayItemTypeName(def.innerType);
-	}
-
+	const { schema: unwrapped, typeName } = unwrapSchema(schema);
 	if (typeName === "ZodArray") {
-		const itemDef = (def.type as any)._def;
-		return itemDef.typeName ?? null;
+		return getZodTypeName(getArrayElementSchema(unwrapped)) || null;
 	}
 
 	return null;
@@ -56,20 +136,37 @@ function getArrayItemTypeName(schema: ZodType): string | null {
 /**
  * Extract field info from a ZodObject schema.
  */
-export function getFieldInfos(schema: ZodType): Map<string, FieldInfo> {
-	const def = (schema as any)._def;
-	if (def.typeName !== "ZodObject") {
-		return new Map();
+export function getZodObjectShape(schema: ZodType): Record<string, ZodType> {
+	const { schema: unwrapped, typeName } = unwrapSchema(schema);
+	if (typeName !== "ZodObject") {
+		return {};
 	}
 
-	const shape: Record<string, ZodType> = def.shape();
+	const def = getSchemaDef(unwrapped);
+	const shape =
+		typeof def.shape === "function"
+			? (def.shape as () => Record<string, ZodType>)()
+			: def.shape;
+
+	if (!shape || typeof shape !== "object") {
+		return {};
+	}
+
+	return shape as Record<string, ZodType>;
+}
+
+/**
+ * Extract field info from a ZodObject schema.
+ */
+export function getFieldInfos(schema: ZodType): Map<string, FieldInfo> {
+	const shape = getZodObjectShape(schema);
 	const fields = new Map<string, FieldInfo>();
 
 	for (const [name, fieldSchema] of Object.entries(shape)) {
 		const { typeName: innerTypeName, isOptional } = unwrapType(fieldSchema);
 		fields.set(name, {
 			camelName: name,
-			typeName: (fieldSchema as any)._def.typeName ?? "",
+			typeName: getZodTypeName(fieldSchema),
 			isOptional,
 			innerTypeName,
 			arrayItemTypeName: getArrayItemTypeName(fieldSchema),
@@ -223,13 +320,19 @@ export function parseArgv(
  * Get the description from a ZodType, unwrapping Optional/Default layers.
  */
 export function getZodDescription(schema: ZodType): string | undefined {
-	const def = (schema as any)._def;
-	const desc: string | undefined = def.description;
+	const desc =
+		((schema as any).description as string | undefined) ??
+		(getSchemaDef(schema).description as string | undefined);
 	if (desc) return desc;
-	const typeName: string = def.typeName ?? "";
-	if (typeName === "ZodOptional" || typeName === "ZodDefault") {
-		return getZodDescription(def.innerType);
+
+	const typeName = getZodTypeName(schema);
+	if (TRANSPARENT_WRAPPER_TYPES.has(typeName)) {
+		const inner = getInnerSchema(schema);
+		if (inner) {
+			return getZodDescription(inner);
+		}
 	}
+
 	return undefined;
 }
 
@@ -237,13 +340,20 @@ export function getZodDescription(schema: ZodType): string | undefined {
  * Get enum values from a ZodEnum schema, unwrapping Optional/Default layers.
  */
 export function getZodEnumValues(schema: ZodType): string[] | undefined {
-	const def = (schema as any)._def;
-	const typeName: string = def.typeName ?? "";
-	if (typeName === "ZodOptional" || typeName === "ZodDefault") {
-		return getZodEnumValues(def.innerType);
-	}
+	const { schema: unwrapped, typeName } = unwrapSchema(schema);
 	if (typeName === "ZodEnum") {
-		return def.values as string[];
+		const runtimeOptions = (unwrapped as any).options;
+		if (Array.isArray(runtimeOptions)) {
+			return runtimeOptions.map(String);
+		}
+
+		const def = getSchemaDef(unwrapped);
+		if (Array.isArray(def.values)) {
+			return (def.values as unknown[]).map(String);
+		}
+		if (def.entries && typeof def.entries === "object") {
+			return Object.values(def.entries).map(String);
+		}
 	}
 	return undefined;
 }

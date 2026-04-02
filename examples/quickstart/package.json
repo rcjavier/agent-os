@@ -22,14 +22,17 @@
 	},
 	"dependencies": {
 		"@rivet-dev/agent-os-core": "workspace:*",
-		"@rivet-dev/agent-os-sandbox": "link:../../registry/tool/sandbox",
+		"@rivet-dev/agent-os-sandbox": "workspace:*",
 		"sandbox-agent": "^0.4.2",
-		"@rivet-dev/agent-os-common": "link:../../registry/software/common",
-		"@rivet-dev/agent-os-git": "link:../../registry/software/git",
-		"@rivet-dev/agent-os-pi": "link:../../registry/agent/pi",
-		"@rivet-dev/agent-os-s3": "link:../../registry/file-system/s3",
+		"@rivet-dev/agent-os-common": "workspace:*",
+		"@rivet-dev/agent-os-git": "workspace:*",
+		"@rivet-dev/agent-os-claude": "workspace:*",
+		"@rivet-dev/agent-os-codex-agent": "workspace:*",
+		"@rivet-dev/agent-os-opencode": "workspace:*",
+		"@rivet-dev/agent-os-pi": "workspace:*",
+		"@rivet-dev/agent-os-s3": "workspace:*",
 		"pyodide": "^0.28.3",
-		"zod": "^3.25.0"
+		"zod": "^4.1.11"
 	},
 	"devDependencies": {
 		"@types/node": "^22.10.2",
