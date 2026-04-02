@@ -314,7 +314,7 @@ export function createSqliteBindings(kernel: Kernel): BindingTree {
 							? join(tempRoot, `${id}.sqlite`)
 							: null;
 					try {
-						if (hostPath) {
+						if (hostPath && vmPath) {
 							if (await kernel.exists(vmPath)) {
 								mkdirSync(hostDirname(hostPath), { recursive: true });
 								writeFileSync(

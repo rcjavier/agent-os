@@ -36,8 +36,8 @@ vm.onSessionEvent(sessionId, (event) => {
 });
 
 // Send a prompt and wait for the response
-const response = await vm.prompt(sessionId, "What is 2 + 2? Reply with just the number.");
-console.log("Response:", JSON.stringify(response.result, null, 2));
+const { response, text } = await vm.prompt(sessionId, "What is 2 + 2? Reply with just the number.");
+console.log("Response:", text);
 
 // Close the session
 vm.closeSession(sessionId);
