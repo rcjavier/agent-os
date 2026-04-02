@@ -37,8 +37,10 @@ import {
 	createAgentSession,
 } from "@mariozechner/pi-coding-agent";
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
-import { isAbsolute, resolve as resolvePath } from "node:path";
-import { readFileSync } from "node:fs";
+import { isAbsolute, join, resolve as resolvePath } from "node:path";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { homedir } from "node:os";
+import type { ExtensionFactory } from "@mariozechner/pi-coding-agent";
 
 // ── CLI argument parsing ────────────────────────────────────────────
 
@@ -49,6 +51,46 @@ for (let i = 0; i < argv.length; i++) {
 		appendSystemPrompt = argv[i + 1];
 		i++;
 	}
+}
+
+// ── Extension discovery ────────────────────────────────────────────
+// Manually discover and load Pi extensions from standard directories.
+// Pi's built-in jiti loader requires performance.now() which the VM's
+// V8 runtime doesn't provide, so we load extensions ourselves via
+// require() and pass them as extensionFactories.
+
+function discoverExtensionFactories(cwd: string): ExtensionFactory[] {
+	const factories: ExtensionFactory[] = [];
+	const dirs = [
+		join(cwd, ".pi", "extensions"),
+		join(homedir(), ".pi", "agent", "extensions"),
+	];
+
+	for (const dir of dirs) {
+		if (!existsSync(dir)) continue;
+		let entries: string[];
+		try {
+			entries = readdirSync(dir);
+		} catch {
+			continue;
+		}
+		for (const name of entries) {
+			if (!name.endsWith(".js") && !name.endsWith(".ts")) continue;
+			const filePath = join(dir, name);
+			try {
+				// biome-ignore lint/security/noGlobalEval: needed to load extensions without jiti
+				const mod = eval(`require(${JSON.stringify(filePath)})`);
+				const factory = mod?.default ?? mod;
+				if (typeof factory === "function") {
+					factories.push(factory);
+				}
+			} catch {
+				// Skip extensions that fail to load
+			}
+		}
+	}
+
+	return factories;
 }
 
 // ── Agent implementation ────────────────────────────────────────────
@@ -95,19 +137,25 @@ class PiSdkAgent implements Agent {
 	): Promise<NewSessionResponse> {
 		this.cwd = params.cwd;
 
-		const { session } = await createAgentSession({
+		// Discover extensions from standard Pi directories and load them
+		// manually (bypasses jiti which requires performance.now).
+		const extensionFactories = discoverExtensionFactories(params.cwd);
+
+		const { DefaultResourceLoader } = await import(
+			"@mariozechner/pi-coding-agent"
+		);
+		const resourceLoader = new DefaultResourceLoader({
+			cwd: params.cwd,
+			...(appendSystemPrompt ? { appendSystemPrompt } : {}),
+			noExtensions: true, // skip jiti-based discovery
+			extensionFactories,
+		});
+		await resourceLoader.reload();
+
+		const { session, extensionsResult } = await createAgentSession({
 			cwd: params.cwd,
 			sessionManager: SessionManager.inMemory(),
-			...(appendSystemPrompt
-				? {
-						resourceLoader: new (
-							await import("@mariozechner/pi-coding-agent")
-						).DefaultResourceLoader({
-							cwd: params.cwd,
-							appendSystemPrompt,
-						}),
-					}
-				: {}),
+			resourceLoader,
 		});
 
 		this.session = session;

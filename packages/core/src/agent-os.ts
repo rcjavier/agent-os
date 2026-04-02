@@ -273,6 +273,14 @@ export interface SessionInfo {
 	agentType: string;
 }
 
+/** Result from AgentOs.prompt(). */
+export interface PromptResult {
+	/** Raw JSON-RPC response from the ACP adapter. */
+	response: JsonRpcResponse;
+	/** Accumulated agent text output from streamed message chunks. */
+	text: string;
+}
+
 /** Information about a process spawned via AgentOs.spawn(). */
 export interface SpawnedProcessInfo {
 	pid: number;
@@ -978,7 +986,13 @@ export class AgentOs {
 		}
 	}
 
-	async mkdir(path: string): Promise<void> {
+	async mkdir(
+		path: string,
+		options?: { recursive?: boolean },
+	): Promise<void> {
+		if (options?.recursive) {
+			return this._mkdirp(path);
+		}
 		this._assertSafeAbsolutePath(path);
 		return this.kernel.mkdir(path);
 	}
@@ -1854,12 +1868,32 @@ export class AgentOs {
 
 	// ── Flat session API (ID-based) ───────────────────────────────
 
-	/** Send a prompt to the agent and wait for the final response. */
+	/** Send a prompt to the agent and wait for the final response.
+	 *  Returns the raw JSON-RPC response and the accumulated agent text. */
 	async prompt(
 		sessionId: string,
 		text: string,
-	): Promise<JsonRpcResponse> {
-		return this._requireSession(sessionId).prompt(text);
+	): Promise<PromptResult> {
+		const session = this._requireSession(sessionId);
+
+		// Collect streamed text while the prompt is running
+		let agentText = "";
+		const handler: SessionEventHandler = (event) => {
+			const params = event.params as Record<string, unknown> | undefined;
+			const update = params?.update as Record<string, unknown> | undefined;
+			if (update?.sessionUpdate === "agent_message_chunk") {
+				const content = update.content as { text?: string } | undefined;
+				if (content?.text) agentText += content.text;
+			}
+		};
+		session.onSessionEvent(handler);
+
+		try {
+			const response = await session.prompt(text);
+			return { response, text: agentText };
+		} finally {
+			session.removeSessionEventHandler(handler);
+		}
 	}
 
 	/** Cancel ongoing agent work for a session. */

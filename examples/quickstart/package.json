@@ -18,7 +18,8 @@
 		"nodejs": "node --import tsx src/nodejs.ts",
 		"python": "node --import tsx src/python.ts",
 		"bash": "node --import tsx src/bash.ts",
-		"s3-filesystem": "node --import tsx src/s3-filesystem.ts"
+		"s3-filesystem": "node --import tsx src/s3-filesystem.ts",
+		"pi-extensions": "node --import tsx src/pi-extensions.ts"
 	},
 	"dependencies": {
 		"@rivet-dev/agent-os-core": "workspace:*",
