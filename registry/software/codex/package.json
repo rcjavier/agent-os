@@ -21,7 +21,7 @@
     "check-types": "tsc --noEmit"
   },
   "devDependencies": {
-    "@rivet-dev/agent-os-registry-types": "link:../../../packages/registry-types",
+    "@rivet-dev/agent-os-registry-types": "workspace:*",
     "@types/node": "^22.10.2",
     "typescript": "^5.9.2"
   }

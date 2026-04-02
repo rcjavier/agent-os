@@ -595,7 +595,7 @@ importers:
   registry/software/codex:
     devDependencies:
       '@rivet-dev/agent-os-registry-types':
-        specifier: link:../../../packages/registry-types
+        specifier: workspace:*
         version: link:../../../packages/registry-types
       '@types/node':
         specifier: ^22.10.2
