@@ -12,6 +12,7 @@ const DEVICE_PATHS: &[&str] = &[
 ];
 
 const DEVICE_DIRS: &[&str] = &["/dev/fd", "/dev/pts"];
+const DEFAULT_STREAM_DEVICE_READ_BYTES: usize = 4096;
 const DEV_DIR_ENTRIES: &[(&str, bool)] = &[
     ("null", false),
     ("zero", false),
@@ -47,12 +48,11 @@ impl<V> DeviceLayer<V> {
 
 impl<V: VirtualFileSystem> VirtualFileSystem for DeviceLayer<V> {
     fn read_file(&mut self, path: &str) -> VfsResult<Vec<u8>> {
-        match path {
-            "/dev/null" => Ok(Vec::new()),
-            "/dev/zero" => Ok(vec![0; 4096]),
-            "/dev/urandom" => random_bytes(4096),
-            _ => self.inner.read_file(path),
+        if let Some(bytes) = read_stream_device(path, DEFAULT_STREAM_DEVICE_READ_BYTES) {
+            return bytes;
         }
+
+        self.inner.read_file(path)
     }
 
     fn read_dir(&mut self, path: &str) -> VfsResult<Vec<String>> {
@@ -66,6 +66,28 @@ impl<V: VirtualFileSystem> VirtualFileSystem for DeviceLayer<V> {
             return Ok(Vec::new());
         }
         self.inner.read_dir(path)
+    }
+
+    fn read_dir_limited(&mut self, path: &str, max_entries: usize) -> VfsResult<Vec<String>> {
+        if path == "/dev" {
+            let entries = DEV_DIR_ENTRIES
+                .iter()
+                .map(|(name, _)| String::from(*name))
+                .collect::<Vec<_>>();
+            if entries.len() > max_entries {
+                return Err(VfsError::new(
+                    "ENOMEM",
+                    format!(
+                        "directory listing for '{path}' exceeds configured limit of {max_entries} entries"
+                    ),
+                ));
+            }
+            return Ok(entries);
+        }
+        if DEVICE_DIRS.contains(&path) {
+            return Ok(Vec::new());
+        }
+        self.inner.read_dir_limited(path, max_entries)
     }
 
     fn read_dir_with_types(&mut self, path: &str) -> VfsResult<Vec<VirtualDirEntry>> {
@@ -91,6 +113,25 @@ impl<V: VirtualFileSystem> VirtualFileSystem for DeviceLayer<V> {
             return Ok(());
         }
         self.inner.write_file(path, content)
+    }
+
+    fn create_file_exclusive(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<()> {
+        if is_device_path(path) || is_device_dir(path) {
+            let _ = content.into();
+            return Err(VfsError::new(
+                "EEXIST",
+                format!("file already exists, open '{path}'"),
+            ));
+        }
+        self.inner.create_file_exclusive(path, content)
+    }
+
+    fn append_file(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<u64> {
+        if matches!(path, "/dev/null" | "/dev/zero" | "/dev/urandom") {
+            let _ = content.into();
+            return Ok(0);
+        }
+        self.inner.append_file(path, content)
     }
 
     fn create_dir(&mut self, path: &str) -> VfsResult<()> {
@@ -206,12 +247,11 @@ impl<V: VirtualFileSystem> VirtualFileSystem for DeviceLayer<V> {
     }
 
     fn pread(&mut self, path: &str, offset: u64, length: usize) -> VfsResult<Vec<u8>> {
-        match path {
-            "/dev/null" => Ok(Vec::new()),
-            "/dev/zero" => Ok(vec![0; length]),
-            "/dev/urandom" => random_bytes(length),
-            _ => self.inner.pread(path, offset, length),
+        if let Some(bytes) = read_stream_device(path, length) {
+            return bytes;
         }
+
+        self.inner.pread(path, offset, length)
     }
 }
 
@@ -228,6 +268,9 @@ fn device_stat(path: &str) -> VirtualStat {
     VirtualStat {
         mode: 0o666,
         size: 0,
+        blocks: 0,
+        dev: 2,
+        rdev: device_rdev(path),
         is_directory: false,
         is_symbolic_link: false,
         atime_ms: now,
@@ -246,6 +289,9 @@ fn device_dir_stat(path: &str) -> VirtualStat {
     VirtualStat {
         mode: 0o755,
         size: 0,
+        blocks: 0,
+        dev: 2,
+        rdev: 0,
         is_directory: true,
         is_symbolic_link: false,
         atime_ms: now,
@@ -271,11 +317,36 @@ fn device_ino(path: &str) -> u64 {
     }
 }
 
+fn device_rdev(path: &str) -> u64 {
+    match path {
+        "/dev/null" => encode_device_id(1, 3),
+        "/dev/zero" => encode_device_id(1, 5),
+        "/dev/stdin" => encode_device_id(5, 0),
+        "/dev/stdout" => encode_device_id(5, 1),
+        "/dev/stderr" => encode_device_id(5, 2),
+        "/dev/urandom" => encode_device_id(1, 9),
+        _ => 0,
+    }
+}
+
+fn encode_device_id(major: u64, minor: u64) -> u64 {
+    (major << 8) | minor
+}
+
 fn random_bytes(length: usize) -> VfsResult<Vec<u8>> {
     let mut buffer = vec![0; length];
     getrandom(&mut buffer)
         .map_err(|error| VfsError::io(format!("failed to read system random bytes: {error}")))?;
     Ok(buffer)
+}
+
+fn read_stream_device(path: &str, length: usize) -> Option<VfsResult<Vec<u8>>> {
+    match path {
+        "/dev/null" => Some(Ok(Vec::new())),
+        "/dev/zero" => Some(Ok(vec![0; length])),
+        "/dev/urandom" => Some(random_bytes(length)),
+        _ => None,
+    }
 }
 
 fn now_ms() -> u64 {

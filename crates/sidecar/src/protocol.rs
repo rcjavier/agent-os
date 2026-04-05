@@ -322,6 +322,8 @@ pub struct CreateVmRequest {
     pub metadata: BTreeMap<String, String>,
     #[serde(default)]
     pub root_filesystem: RootFilesystemDescriptor,
+    #[serde(default)]
+    pub permissions: Vec<PermissionDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -380,6 +382,8 @@ pub struct ConfigureVmRequest {
     pub permissions: Vec<PermissionDescriptor>,
     pub instructions: Vec<String>,
     pub projected_modules: Vec<ProjectedModuleDescriptor>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub command_permissions: BTreeMap<String, WasmPermissionTier>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -445,6 +449,15 @@ pub struct ProjectedModuleDescriptor {
     pub entrypoint: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WasmPermissionTier {
+    Full,
+    ReadWrite,
+    ReadOnly,
+    Isolated,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecuteRequest {
     pub process_id: String,
@@ -455,6 +468,8 @@ pub struct ExecuteRequest {
     pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wasm_permission_tier: Option<WasmPermissionTier>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -562,6 +577,9 @@ pub struct VmConfiguredResponse {
 pub struct GuestFilesystemStat {
     pub mode: u32,
     pub size: u64,
+    pub blocks: u64,
+    pub dev: u64,
+    pub rdev: u64,
     pub is_directory: bool,
     pub is_symbolic_link: bool,
     pub atime_ms: u64,

@@ -132,12 +132,16 @@ make publish-clean # Clear publish cache
 make clean         # Remove dist/ and wasm/ from all packages
 ```
 
+## Testing
+
+- External-network registry tests should stay behind `AGENTOS_E2E_NETWORK=1`, probe host connectivity up front so CI can skip cleanly when the internet is unavailable, and retry the in-VM command itself for transient outbound failures instead of hard-failing on the first flaky request.
+
 ## Native Source
 
 All WASM command source code lives in `native/`:
 - `native/crates/commands/` -- Rust command crates (105 commands)
 - `native/crates/libs/` -- shared Rust libraries (grep engine, awk engine, etc.)
-- `native/crates/wasi-ext/` -- WASI extension traits
+- `native/crates/wasi-ext/` -- WASI extension traits. Host-import wrappers here, matching wasi-libc patches, and uucore stubs should validate every guest buffer length crossing (`usize` -> `u32`) and reject host-returned lengths that exceed the supplied buffer; `poll()` wrappers should also enforce the exact 8-byte-per-`pollfd` layout.
 - `native/c/programs/` -- C command source (curl, wget, sqlite3, zip, unzip)
 - `native/patches/` -- Rust std patches for WASI
 - `native/Makefile` -- Rust build system

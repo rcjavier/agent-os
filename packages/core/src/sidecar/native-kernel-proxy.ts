@@ -15,26 +15,27 @@ import {
 	join as joinHostPath,
 	posix as posixPath,
 } from "node:path";
-import {
-	type ConnectTerminalOptions,
-	type Kernel,
-	type KernelExecOptions,
-	type KernelExecResult,
-	type KernelSpawnOptions,
-	type ManagedProcess,
-	type OpenShellOptions,
-	type ProcessInfo,
-	type ShellHandle,
-	type VirtualFileSystem,
-	type VirtualStat,
+import type {
+	ConnectTerminalOptions,
+	Kernel,
+	KernelExecOptions,
+	KernelExecResult,
+	KernelSpawnOptions,
+	ManagedProcess,
+	OpenShellOptions,
+	PermissionTier,
+	ProcessInfo,
+	ShellHandle,
+	VirtualFileSystem,
+	VirtualStat,
 } from "../runtime-compat.js";
-import {
+import type {
+	AuthenticatedSession,
+	CreatedVm,
+	GuestFilesystemStat,
 	NativeSidecarProcessClient,
-	type AuthenticatedSession,
-	type CreatedVm,
-	type GuestFilesystemStat,
-	type SidecarSignalHandlerRegistration,
-	type SidecarSocketStateEntry,
+	SidecarSignalHandlerRegistration,
+	SidecarSocketStateEntry,
 } from "./native-process-client.js";
 
 const SYNTHETIC_PID_BASE = 1_000_000;
@@ -45,19 +46,43 @@ const EXTRA_FS_WRITE_PATHS_ENV = "AGENT_OS_EXTRA_FS_WRITE_PATHS";
 const ALLOWED_NODE_BUILTINS_ENV = "AGENT_OS_ALLOWED_NODE_BUILTINS";
 const LOOPBACK_EXEMPT_PORTS_ENV = "AGENT_OS_LOOPBACK_EXEMPT_PORTS";
 const DEFAULT_ALLOWED_NODE_BUILTINS = [
+	"assert",
+	"buffer",
+	"console",
 	"child_process",
-	"dgram",
+	"crypto",
 	"dns",
+	"events",
+	"fs",
 	"http",
 	"http2",
 	"https",
-	"inspector",
-	"net",
+	"os",
+	"path",
+	"querystring",
+	"stream",
+	"string_decoder",
+	"timers",
 	"tls",
-	"v8",
-	"vm",
-	"worker_threads",
+	"url",
+	"util",
+	"zlib",
 ] as const;
+
+function normalizeAllowedNodeBuiltins(
+	allowedNodeBuiltins?: readonly string[],
+): string[] {
+	if (allowedNodeBuiltins === undefined) {
+		return [...DEFAULT_ALLOWED_NODE_BUILTINS];
+	}
+
+	return [
+		...new Set(
+			allowedNodeBuiltins.filter((value) => typeof value === "string"),
+		),
+	];
+}
+
 const PREFERRED_SIGNAL_NAMES = [
 	"SIGHUP",
 	"SIGINT",
@@ -112,9 +137,9 @@ function buildSignalNameByNumber(): Map<number, string> {
 	}
 	for (const [name, value] of Object.entries(signals)) {
 		if (
-			typeof value === "number"
-			&& !NON_CANONICAL_SIGNAL_NAMES.has(name)
-			&& !names.has(value)
+			typeof value === "number" &&
+			!NON_CANONICAL_SIGNAL_NAMES.has(name) &&
+			!names.has(value)
 		) {
 			names.set(value, name);
 		}
@@ -204,7 +229,9 @@ interface NativeSidecarKernelProxyOptions {
 	cwd: string;
 	localMounts: LocalCompatMount[];
 	commandGuestPaths: ReadonlyMap<string, string>;
+	wasmCommandPermissions?: Readonly<Record<string, PermissionTier>>;
 	hostPathMappings: HostPathMapping[];
+	allowedNodeBuiltins?: readonly string[];
 	loopbackExemptPorts?: number[];
 	nodeExecutionCwd: string;
 	onDispose?: () => Promise<void>;
@@ -222,7 +249,9 @@ export class NativeSidecarKernelProxy {
 	private readonly vm: CreatedVm;
 	private readonly localMounts: LocalCompatMount[];
 	private readonly commandGuestPaths: Map<string, string>;
+	private readonly wasmCommandPermissions: Readonly<Record<string, PermissionTier>>;
 	private readonly hostPathMappings: HostPathMapping[];
+	private readonly allowedNodeBuiltins: readonly string[];
 	private readonly loopbackExemptPorts: readonly number[];
 	private readonly nodeExecutionCwd: string;
 	private readonly onDispose: (() => Promise<void>) | undefined;
@@ -254,8 +283,14 @@ export class NativeSidecarKernelProxy {
 			(left, right) => right.path.length - left.path.length,
 		);
 		this.commandGuestPaths = new Map(options.commandGuestPaths);
+		this.wasmCommandPermissions = Object.freeze({
+			...(options.wasmCommandPermissions ?? {}),
+		});
 		this.hostPathMappings = [...options.hostPathMappings].sort(
 			(left, right) => right.guestPath.length - left.guestPath.length,
+		);
+		this.allowedNodeBuiltins = normalizeAllowedNodeBuiltins(
+			options.allowedNodeBuiltins,
 		);
 		this.loopbackExemptPorts = [...(options.loopbackExemptPorts ?? [])];
 		this.nodeExecutionCwd = options.nodeExecutionCwd;
@@ -281,7 +316,9 @@ export class NativeSidecarKernelProxy {
 		return this.zombieTimerCountValue;
 	}
 
-	registerCommandGuestPaths(commandGuestPaths: ReadonlyMap<string, string>): void {
+	registerCommandGuestPaths(
+		commandGuestPaths: ReadonlyMap<string, string>,
+	): void {
 		for (const [name, guestPath] of commandGuestPaths) {
 			this.commandGuestPaths.set(name, guestPath);
 			(this.commands as Map<string, string>).set(name, "wasmvm");
@@ -512,13 +549,17 @@ export class NativeSidecarKernelProxy {
 		const { onData, ...shellOptions } = options ?? {};
 		const shell = this.openShell({
 			...shellOptions,
-			onStderr: shellOptions.onStderr ?? ((data) => {
-				process.stderr.write(data);
-			}),
+			onStderr:
+				shellOptions.onStderr ??
+				((data) => {
+					process.stderr.write(data);
+				}),
 		});
-		const outputHandler = onData ?? ((data: Uint8Array) => {
-			stdout.write(data);
-		});
+		const outputHandler =
+			onData ??
+			((data: Uint8Array) => {
+				stdout.write(data);
+			});
 		const restoreRawMode =
 			stdin.isTTY && typeof stdin.setRawMode === "function";
 		const onStdinData = (data: Uint8Array | string) => {
@@ -692,10 +733,8 @@ export class NativeSidecarKernelProxy {
 		if (!cached?.pending) {
 			this.listenerLookups.set(key, {
 				value: cached?.value ?? null,
-				pending: this.refreshSocketLookup(
-					this.listenerLookups,
-					key,
-					() => this.client.findListener(this.session, this.vm, request),
+				pending: this.refreshSocketLookup(this.listenerLookups, key, () =>
+					this.client.findListener(this.session, this.vm, request),
 				),
 			});
 		}
@@ -711,10 +750,8 @@ export class NativeSidecarKernelProxy {
 		if (!cached?.pending) {
 			this.boundUdpLookups.set(key, {
 				value: cached?.value ?? null,
-				pending: this.refreshSocketLookup(
-					this.boundUdpLookups,
-					key,
-					() => this.client.findBoundUdp(this.session, this.vm, request),
+				pending: this.refreshSocketLookup(this.boundUdpLookups, key, () =>
+					this.client.findBoundUdp(this.session, this.vm, request),
 				),
 			});
 		}
@@ -755,7 +792,10 @@ export class NativeSidecarKernelProxy {
 				this.vm,
 				entry.processId,
 			);
-			this.signalStates.set(entry.pid, toKernelSignalState(signalState.handlers));
+			this.signalStates.set(
+				entry.pid,
+				toKernelSignalState(signalState.handlers),
+			);
 		} catch {
 			this.signalStates.set(
 				entry.pid,
@@ -792,6 +832,7 @@ export class NativeSidecarKernelProxy {
 			args: execution.args,
 			env: execution.env,
 			cwd: execution.cwd,
+			wasmPermissionTier: execution.wasmPermissionTier,
 		});
 		entry.hostPid = started.pid;
 		entry.started = true;
@@ -986,6 +1027,7 @@ export class NativeSidecarKernelProxy {
 		args: string[];
 		cwd?: string;
 		env?: Record<string, string>;
+		wasmPermissionTier?: PermissionTier;
 		bootstrap?: () => Promise<void>;
 	}> {
 		if (entry.command === "node") {
@@ -1023,14 +1065,15 @@ export class NativeSidecarKernelProxy {
 
 		const wasmEntrypoint = this.commandGuestPaths.get(entry.command);
 		if (wasmEntrypoint) {
-			return {
-				runtime: "web_assembly",
-				entrypoint: wasmEntrypoint,
-				args: entry.args,
-				cwd: entry.cwd,
-				env: entry.env,
-			};
-		}
+				return {
+					runtime: "web_assembly",
+					entrypoint: wasmEntrypoint,
+					args: entry.args,
+					cwd: entry.cwd,
+					env: entry.env,
+					wasmPermissionTier: this.wasmCommandPermissions[entry.command],
+				};
+			}
 
 		throw new Error(
 			`command not found on native sidecar path: ${entry.command}`,
@@ -1142,9 +1185,7 @@ export class NativeSidecarKernelProxy {
 			[GUEST_PATH_MAPPINGS_ENV]: JSON.stringify(pathMappings),
 			[EXTRA_FS_READ_PATHS_ENV]: JSON.stringify(extraReadPaths),
 			[EXTRA_FS_WRITE_PATHS_ENV]: JSON.stringify(extraWritePaths),
-			[ALLOWED_NODE_BUILTINS_ENV]: JSON.stringify(
-				DEFAULT_ALLOWED_NODE_BUILTINS,
-			),
+			[ALLOWED_NODE_BUILTINS_ENV]: JSON.stringify(this.allowedNodeBuiltins),
 			[LOOPBACK_EXEMPT_PORTS_ENV]: JSON.stringify(
 				this.loopbackExemptPorts.map((port) => String(port)),
 			),
@@ -1614,6 +1655,9 @@ function toVirtualStat(stat: GuestFilesystemStat): VirtualStat {
 	return {
 		mode: stat.mode,
 		size: stat.size,
+		blocks: stat.blocks,
+		dev: stat.dev,
+		rdev: stat.rdev,
 		isDirectory: stat.is_directory,
 		isSymbolicLink: stat.is_symbolic_link,
 		atimeMs: stat.atime_ms,

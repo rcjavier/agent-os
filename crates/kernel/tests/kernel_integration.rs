@@ -1,13 +1,17 @@
 use agent_os_kernel::bridge::LifecycleState;
 use agent_os_kernel::command_registry::CommandDriver;
 use agent_os_kernel::kernel::{KernelVm, KernelVmConfig, SpawnOptions};
+use agent_os_kernel::permissions::Permissions;
+use agent_os_kernel::process_table::SIGPIPE;
 use agent_os_kernel::pty::LineDisciplineConfig;
 use agent_os_kernel::vfs::MemoryFileSystem;
 use std::time::Duration;
 
 #[test]
 fn minimal_vm_lifecycle_transitions_between_ready_busy_and_terminated() {
-    let mut kernel = KernelVm::new(MemoryFileSystem::new(), KernelVmConfig::new("vm-kernel"));
+    let mut config = KernelVmConfig::new("vm-kernel");
+    config.permissions = Permissions::allow_all();
+    let mut kernel = KernelVm::new(MemoryFileSystem::new(), config);
     kernel
         .register_driver(CommandDriver::new("shell", ["sh"]))
         .expect("register shell");
@@ -62,7 +66,9 @@ fn minimal_vm_lifecycle_transitions_between_ready_busy_and_terminated() {
 
 #[test]
 fn dispose_kills_running_processes_and_cleans_special_resources() {
-    let mut kernel = KernelVm::new(MemoryFileSystem::new(), KernelVmConfig::new("vm-dispose"));
+    let mut config = KernelVmConfig::new("vm-dispose");
+    config.permissions = Permissions::allow_all();
+    let mut kernel = KernelVm::new(MemoryFileSystem::new(), config);
     kernel
         .register_driver(CommandDriver::new("shell", ["sh"]))
         .expect("register shell");
@@ -94,10 +100,9 @@ fn dispose_kills_running_processes_and_cleans_special_resources() {
 
 #[test]
 fn process_exit_cleanup_closes_pipe_writers_and_returns_eof_to_readers() {
-    let mut kernel = KernelVm::new(
-        MemoryFileSystem::new(),
-        KernelVmConfig::new("vm-process-exit-pipe"),
-    );
+    let mut config = KernelVmConfig::new("vm-process-exit-pipe");
+    config.permissions = Permissions::allow_all();
+    let mut kernel = KernelVm::new(MemoryFileSystem::new(), config);
     kernel
         .register_driver(CommandDriver::new("shell", ["sh"]))
         .expect("register shell");
@@ -154,11 +159,45 @@ fn process_exit_cleanup_closes_pipe_writers_and_returns_eof_to_readers() {
 }
 
 #[test]
+fn broken_pipe_writes_deliver_sigpipe_and_return_epipe() {
+    let mut config = KernelVmConfig::new("vm-broken-pipe-sigpipe");
+    config.permissions = Permissions::allow_all();
+    let mut kernel = KernelVm::new(MemoryFileSystem::new(), config);
+    kernel
+        .register_driver(CommandDriver::new("shell", ["sh"]))
+        .expect("register shell");
+
+    let writer = kernel
+        .spawn_process(
+            "sh",
+            Vec::new(),
+            SpawnOptions {
+                requester_driver: Some(String::from("shell")),
+                ..SpawnOptions::default()
+            },
+        )
+        .expect("spawn writer");
+    let (read_fd, write_fd) = kernel
+        .open_pipe("shell", writer.pid())
+        .expect("open writer pipe");
+
+    kernel
+        .fd_close("shell", writer.pid(), read_fd)
+        .expect("close inherited read end");
+
+    let error = kernel
+        .fd_write("shell", writer.pid(), write_fd, b"fail")
+        .expect_err("broken pipe writes should fail");
+    assert_eq!(error.code(), "EPIPE");
+    assert_eq!(writer.kill_signals(), vec![SIGPIPE]);
+    assert_eq!(writer.wait(Duration::from_millis(50)), Some(128 + SIGPIPE));
+}
+
+#[test]
 fn process_exit_cleanup_removes_fd_tables_before_and_after_reap() {
-    let mut kernel = KernelVm::new(
-        MemoryFileSystem::new(),
-        KernelVmConfig::new("vm-process-exit-fds"),
-    );
+    let mut config = KernelVmConfig::new("vm-process-exit-fds");
+    config.permissions = Permissions::allow_all();
+    let mut kernel = KernelVm::new(MemoryFileSystem::new(), config);
     kernel
         .register_driver(CommandDriver::new("shell", ["sh"]))
         .expect("register shell");
@@ -199,4 +238,89 @@ fn process_exit_cleanup_removes_fd_tables_before_and_after_reap() {
             .code(),
         "ESRCH"
     );
+}
+
+#[test]
+fn spawn_process_executes_shebang_scripts_with_registered_interpreters() {
+    let mut config = KernelVmConfig::new("vm-shebang");
+    config.permissions = Permissions::allow_all();
+    let mut kernel = KernelVm::new(MemoryFileSystem::new(), config);
+    kernel
+        .register_driver(CommandDriver::new("shell", ["sh"]))
+        .expect("register shell");
+    kernel
+        .register_driver(CommandDriver::new("node", ["node"]))
+        .expect("register node");
+
+    kernel
+        .write_file("/tmp/script.sh", b"#!/bin/sh -eu\necho shell\n".to_vec())
+        .expect("write shell script");
+    kernel
+        .chmod("/tmp/script.sh", 0o755)
+        .expect("chmod shell script");
+    let shell_process = kernel
+        .spawn_process(
+            "/tmp/script.sh",
+            vec![String::from("arg")],
+            SpawnOptions::default(),
+        )
+        .expect("spawn shell script");
+    assert_eq!(
+        kernel
+            .read_file(&format!("/proc/{}/cmdline", shell_process.pid()))
+            .expect("read shell cmdline"),
+        b"sh\0-eu\0/tmp/script.sh\0arg\0".to_vec()
+    );
+
+    kernel
+        .write_file(
+            "/tmp/script.mjs",
+            b"#!/usr/bin/env node --trace-warnings\nconsole.log('node');\n".to_vec(),
+        )
+        .expect("write node script");
+    kernel
+        .chmod("/tmp/script.mjs", 0o755)
+        .expect("chmod node script");
+    let node_process = kernel
+        .spawn_process("/tmp/script.mjs", Vec::new(), SpawnOptions::default())
+        .expect("spawn node script");
+    assert_eq!(
+        kernel
+            .read_file(&format!("/proc/{}/cmdline", node_process.pid()))
+            .expect("read node cmdline"),
+        b"node\0--trace-warnings\0/tmp/script.mjs\0".to_vec()
+    );
+}
+
+#[test]
+fn spawn_process_rejects_invalid_shebang_scripts() {
+    let mut config = KernelVmConfig::new("vm-shebang-errors");
+    config.permissions = Permissions::allow_all();
+    let mut kernel = KernelVm::new(MemoryFileSystem::new(), config);
+    kernel
+        .register_driver(CommandDriver::new("shell", ["sh"]))
+        .expect("register shell");
+
+    kernel
+        .write_file("/tmp/missing.sh", b"#!/missing/interpreter\n".to_vec())
+        .expect("write missing-interpreter script");
+    kernel
+        .chmod("/tmp/missing.sh", 0o755)
+        .expect("chmod missing-interpreter script");
+    let missing = kernel
+        .spawn_process("/tmp/missing.sh", Vec::new(), SpawnOptions::default())
+        .expect_err("missing interpreter should fail");
+    assert_eq!(missing.code(), "ENOENT");
+
+    let long_shebang = format!("#!/{0}\n", "a".repeat(256));
+    kernel
+        .write_file("/tmp/long.sh", long_shebang.into_bytes())
+        .expect("write long-shebang script");
+    kernel
+        .chmod("/tmp/long.sh", 0o755)
+        .expect("chmod long-shebang script");
+    let long_error = kernel
+        .spawn_process("/tmp/long.sh", Vec::new(), SpawnOptions::default())
+        .expect_err("overlong shebang should fail");
+    assert_eq!(long_error.code(), "ENOEXEC");
 }

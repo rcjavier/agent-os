@@ -8,8 +8,36 @@ pub trait MountedFileSystem: Any {
     fn as_any_mut(&mut self) -> &mut dyn Any;
     fn read_file(&mut self, path: &str) -> VfsResult<Vec<u8>>;
     fn read_dir(&mut self, path: &str) -> VfsResult<Vec<String>>;
+    fn read_dir_limited(&mut self, path: &str, max_entries: usize) -> VfsResult<Vec<String>> {
+        let entries = self.read_dir(path)?;
+        if entries.len() > max_entries {
+            return Err(VfsError::new(
+                "ENOMEM",
+                format!(
+                    "directory listing for '{path}' exceeds configured limit of {max_entries} entries"
+                ),
+            ));
+        }
+        Ok(entries)
+    }
     fn read_dir_with_types(&mut self, path: &str) -> VfsResult<Vec<VirtualDirEntry>>;
     fn write_file(&mut self, path: &str, content: Vec<u8>) -> VfsResult<()>;
+    fn create_file_exclusive(&mut self, path: &str, content: Vec<u8>) -> VfsResult<()> {
+        if self.exists(path) {
+            return Err(VfsError::new(
+                "EEXIST",
+                format!("file already exists, open '{path}'"),
+            ));
+        }
+        self.write_file(path, content)
+    }
+    fn append_file(&mut self, path: &str, content: Vec<u8>) -> VfsResult<u64> {
+        let mut existing = self.read_file(path)?;
+        existing.extend_from_slice(&content);
+        let new_len = existing.len() as u64;
+        self.write_file(path, existing)?;
+        Ok(new_len)
+    }
     fn create_dir(&mut self, path: &str) -> VfsResult<()>;
     fn mkdir(&mut self, path: &str, recursive: bool) -> VfsResult<()>;
     fn exists(&self, path: &str) -> bool;
@@ -70,12 +98,24 @@ where
         VirtualFileSystem::read_dir(&mut self.inner, path)
     }
 
+    fn read_dir_limited(&mut self, path: &str, max_entries: usize) -> VfsResult<Vec<String>> {
+        VirtualFileSystem::read_dir_limited(&mut self.inner, path, max_entries)
+    }
+
     fn read_dir_with_types(&mut self, path: &str) -> VfsResult<Vec<VirtualDirEntry>> {
         VirtualFileSystem::read_dir_with_types(&mut self.inner, path)
     }
 
     fn write_file(&mut self, path: &str, content: Vec<u8>) -> VfsResult<()> {
         VirtualFileSystem::write_file(&mut self.inner, path, content)
+    }
+
+    fn create_file_exclusive(&mut self, path: &str, content: Vec<u8>) -> VfsResult<()> {
+        VirtualFileSystem::create_file_exclusive(&mut self.inner, path, content)
+    }
+
+    fn append_file(&mut self, path: &str, content: Vec<u8>) -> VfsResult<u64> {
+        VirtualFileSystem::append_file(&mut self.inner, path, content)
     }
 
     fn create_dir(&mut self, path: &str) -> VfsResult<()> {
@@ -165,6 +205,10 @@ where
 
     fn read_dir(&mut self, path: &str) -> VfsResult<Vec<String>> {
         (**self).read_dir(path)
+    }
+
+    fn read_dir_limited(&mut self, path: &str, max_entries: usize) -> VfsResult<Vec<String>> {
+        (**self).read_dir_limited(path, max_entries)
     }
 
     fn read_dir_with_types(&mut self, path: &str) -> VfsResult<Vec<VirtualDirEntry>> {
@@ -276,6 +320,10 @@ where
 
     fn read_dir(&mut self, path: &str) -> VfsResult<Vec<String>> {
         self.inner.read_dir(path)
+    }
+
+    fn read_dir_limited(&mut self, path: &str, max_entries: usize) -> VfsResult<Vec<String>> {
+        self.inner.read_dir_limited(path, max_entries)
     }
 
     fn read_dir_with_types(&mut self, path: &str) -> VfsResult<Vec<VirtualDirEntry>> {
@@ -609,6 +657,31 @@ impl VirtualFileSystem for MountTable {
         Ok(merged.into_iter().collect())
     }
 
+    fn read_dir_limited(&mut self, path: &str, max_entries: usize) -> VfsResult<Vec<String>> {
+        let normalized = normalize_path(path);
+        let (index, relative_path) = self.resolve_index(&normalized)?;
+        let mut entries = self.mounts[index]
+            .filesystem
+            .read_dir_limited(&relative_path, max_entries)?;
+        let child_mounts = self.child_mount_basenames(&normalized);
+        if child_mounts.is_empty() {
+            return Ok(entries);
+        }
+
+        let mut merged = BTreeSet::new();
+        merged.extend(entries.drain(..));
+        merged.extend(child_mounts);
+        if merged.len() > max_entries {
+            return Err(VfsError::new(
+                "ENOMEM",
+                format!(
+                    "directory listing for '{path}' exceeds configured limit of {max_entries} entries"
+                ),
+            ));
+        }
+        Ok(merged.into_iter().collect())
+    }
+
     fn read_dir_with_types(&mut self, path: &str) -> VfsResult<Vec<VirtualDirEntry>> {
         let normalized = normalize_path(path);
         let (index, relative_path) = self.resolve_index(&normalized)?;
@@ -642,6 +715,20 @@ impl VirtualFileSystem for MountTable {
         self.mounts[index]
             .filesystem
             .write_file(&relative_path, content.into())
+    }
+
+    fn create_file_exclusive(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<()> {
+        let (index, relative_path) = self.resolve_index(path)?;
+        self.mounts[index]
+            .filesystem
+            .create_file_exclusive(&relative_path, content.into())
+    }
+
+    fn append_file(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<u64> {
+        let (index, relative_path) = self.resolve_index(path)?;
+        self.mounts[index]
+            .filesystem
+            .append_file(&relative_path, content.into())
     }
 
     fn create_dir(&mut self, path: &str) -> VfsResult<()> {
@@ -710,7 +797,23 @@ impl VirtualFileSystem for MountTable {
     }
 
     fn symlink(&mut self, target: &str, link_path: &str) -> VfsResult<()> {
-        let (index, relative_path) = self.resolve_index(link_path)?;
+        let normalized_link_path = normalize_path(link_path);
+        let link_parent = parent_path(&normalized_link_path);
+        let absolute_target = if target.starts_with('/') {
+            normalize_path(target)
+        } else {
+            normalize_path(&format!("{link_parent}/{target}"))
+        };
+
+        let (index, relative_path) = self.resolve_index(&normalized_link_path)?;
+        let (target_index, _) = self.resolve_index(&absolute_target)?;
+        if index != target_index {
+            return Err(VfsError::new(
+                "EXDEV",
+                format!("symlink across mounts: {link_path} -> {target}"),
+            ));
+        }
+
         self.mounts[index]
             .filesystem
             .symlink(target, &relative_path)

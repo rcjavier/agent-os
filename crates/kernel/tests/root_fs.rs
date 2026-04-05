@@ -147,6 +147,79 @@ fn overlay_remove_dir_rejects_lower_only_children_in_merged_view() {
 }
 
 #[test]
+fn overlay_remove_dir_rejects_lower_children_after_directory_copy_up() {
+    let mut lower = MemoryFileSystem::new();
+    lower
+        .mkdir("/tmp/nonempty", true)
+        .expect("create lower directory");
+    lower
+        .write_file("/tmp/nonempty/child.txt", b"child".to_vec())
+        .expect("seed lower child");
+
+    let mut overlay = OverlayFileSystem::new(vec![lower], OverlayMode::Ephemeral);
+    overlay
+        .chmod("/tmp/nonempty", 0o700)
+        .expect("copy up lower directory");
+
+    assert_error_code(overlay.remove_dir("/tmp/nonempty"), "ENOTEMPTY");
+    assert!(overlay.exists("/tmp/nonempty/child.txt"));
+}
+
+#[test]
+fn overlay_rename_rejects_directory_trees_that_exceed_snapshot_depth_limit() {
+    let mut lower = MemoryFileSystem::new();
+    let mut path = String::from("/deep");
+    lower.create_dir(&path).expect("create root of deep tree");
+    for _ in 0..1025 {
+        path.push_str("/d");
+        lower.create_dir(&path).expect("create nested directory");
+    }
+
+    let mut overlay = OverlayFileSystem::new(vec![lower], OverlayMode::Ephemeral);
+    assert_error_code(overlay.rename("/deep", "/renamed"), "EINVAL");
+}
+
+#[test]
+fn overlay_link_and_rename_preserve_upper_hardlinks_after_copy_up() {
+    let mut lower = MemoryFileSystem::new();
+    lower
+        .write_file("/src.txt", b"base".to_vec())
+        .expect("seed lower file");
+
+    let mut overlay = OverlayFileSystem::new(vec![lower], OverlayMode::Ephemeral);
+    overlay
+        .link("/src.txt", "/alias.txt")
+        .expect("hardlink copied-up file");
+
+    overlay
+        .write_file("/alias.txt", b"mutated".to_vec())
+        .expect("mutate linked file");
+    assert_eq!(
+        overlay.read_file("/src.txt").expect("read linked source"),
+        b"mutated".to_vec()
+    );
+
+    overlay
+        .rename("/src.txt", "/renamed.txt")
+        .expect("rename hardlinked source");
+
+    let alias_stat = overlay.stat("/alias.txt").expect("stat alias");
+    let renamed_stat = overlay.stat("/renamed.txt").expect("stat renamed");
+    assert_eq!(alias_stat.ino, renamed_stat.ino);
+    assert_eq!(alias_stat.nlink, 2);
+    assert_eq!(renamed_stat.nlink, 2);
+    assert_eq!(
+        overlay.read_file("/alias.txt").expect("read alias"),
+        b"mutated".to_vec()
+    );
+    assert_eq!(
+        overlay.read_file("/renamed.txt").expect("read renamed"),
+        b"mutated".to_vec()
+    );
+    assert_error_code(overlay.read_file("/src.txt"), "ENOENT");
+}
+
+#[test]
 fn root_filesystem_uses_bundled_base_and_round_trips_snapshots() {
     let mut root = RootFileSystem::from_descriptor(RootFilesystemDescriptor::default())
         .expect("create default root");

@@ -1,5 +1,7 @@
 use agent_os_kernel::fd_table::{
-    FdResult, FdTableManager, FILETYPE_CHARACTER_DEVICE, FILETYPE_REGULAR_FILE, O_RDONLY, O_WRONLY,
+    FdResult, FdTableManager, FileDescription, FileLockManager, FileLockTarget, FlockOperation,
+    FILETYPE_CHARACTER_DEVICE, FILETYPE_REGULAR_FILE, LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN,
+    MAX_FDS_PER_PROCESS, O_NONBLOCK, O_RDONLY, O_WRONLY,
 };
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -78,6 +80,36 @@ fn dup2_replaces_the_target_fd() {
 }
 
 #[test]
+fn dup2_rejects_target_fds_past_the_process_limit() {
+    let mut manager = FdTableManager::new();
+    manager.create(1);
+
+    let table = manager.get_mut(1).expect("FD table should exist");
+    let fd = table
+        .open("/tmp/test.txt", O_RDONLY)
+        .expect("open source FD");
+    let result = table.dup2(fd, MAX_FDS_PER_PROCESS as u32);
+
+    assert_error_code(result, "EBADF");
+}
+
+#[test]
+fn open_with_rejects_target_fds_past_the_process_limit() {
+    let mut manager = FdTableManager::new();
+    manager.create(1);
+
+    let table = manager.get_mut(1).expect("FD table should exist");
+    let description = Arc::new(FileDescription::new(999, "/tmp/test.txt", O_RDONLY));
+    let result = table.open_with(
+        description,
+        FILETYPE_REGULAR_FILE,
+        Some(MAX_FDS_PER_PROCESS as u32),
+    );
+
+    assert_error_code(result, "EBADF");
+}
+
+#[test]
 fn close_decrements_refcount() {
     let mut manager = FdTableManager::new();
     manager.create(1);
@@ -150,6 +182,42 @@ fn stat_returns_fd_metadata() {
 }
 
 #[test]
+fn nonblocking_status_flags_are_tracked_per_fd_entry() {
+    let mut manager = FdTableManager::new();
+    manager.create(1);
+
+    let table = manager.get_mut(1).expect("FD table should exist");
+    let fd = table
+        .open_with_filetype(
+            "/tmp/test.txt",
+            O_WRONLY | O_NONBLOCK,
+            FILETYPE_REGULAR_FILE,
+        )
+        .expect("open regular file");
+    let dup_fd = table
+        .dup_with_status_flags(fd, Some(0))
+        .expect("duplicate regular file without nonblocking");
+
+    let original = table.stat(fd).expect("stat original FD");
+    let duplicated = table.stat(dup_fd).expect("stat duplicate FD");
+
+    assert_eq!(original.flags, O_WRONLY | O_NONBLOCK);
+    assert_eq!(duplicated.flags, O_WRONLY);
+    assert_eq!(
+        table.get(fd).expect("original entry").description.flags(),
+        O_WRONLY
+    );
+    assert_eq!(
+        table
+            .get(dup_fd)
+            .expect("duplicate entry")
+            .description
+            .flags(),
+        O_WRONLY
+    );
+}
+
+#[test]
 fn stat_reports_ebadf_for_invalid_fd() {
     let mut manager = FdTableManager::new();
     manager.create(1);
@@ -157,4 +225,88 @@ fn stat_reports_ebadf_for_invalid_fd() {
     let result = manager.get(1).expect("FD table should exist").stat(999);
 
     assert_error_code(result, "EBADF");
+}
+
+#[test]
+fn open_reuses_a_freed_fd_after_next_fd_moves_past_the_limit() {
+    let mut manager = FdTableManager::new();
+    manager.create(1);
+
+    let table = manager.get_mut(1).expect("FD table should exist");
+    let mut opened = Vec::new();
+    for _ in 3..MAX_FDS_PER_PROCESS {
+        opened.push(
+            table
+                .open("/tmp/test.txt", O_RDONLY)
+                .expect("open should fill remaining slots"),
+        );
+    }
+
+    assert!(table.close(5), "fd 5 should be open before reuse");
+
+    let reused = table
+        .open("/tmp/reused.txt", O_RDONLY)
+        .expect("open should wrap and reuse a freed fd");
+    assert_eq!(reused, 5);
+}
+
+#[test]
+fn flock_operation_parser_accepts_supported_modes() {
+    assert_eq!(
+        FlockOperation::from_bits(LOCK_SH).expect("shared operation"),
+        FlockOperation::Shared { nonblocking: false }
+    );
+    assert_eq!(
+        FlockOperation::from_bits(LOCK_EX | LOCK_NB).expect("exclusive nonblocking operation"),
+        FlockOperation::Exclusive { nonblocking: true }
+    );
+    assert_eq!(
+        FlockOperation::from_bits(LOCK_UN).expect("unlock operation"),
+        FlockOperation::Unlock
+    );
+}
+
+#[test]
+fn flock_manager_enforces_shared_and_exclusive_conflicts() {
+    let locks = FileLockManager::new();
+    let target = FileLockTarget::new(42);
+
+    locks
+        .apply(1, target, FlockOperation::Shared { nonblocking: false })
+        .expect("first shared lock");
+    locks
+        .apply(2, target, FlockOperation::Shared { nonblocking: false })
+        .expect("second shared lock");
+
+    let blocked = locks.apply(3, target, FlockOperation::Exclusive { nonblocking: true });
+    assert_error_code(blocked, "EWOULDBLOCK");
+
+    locks
+        .apply(1, target, FlockOperation::Unlock)
+        .expect("unlock first shared lock");
+    locks
+        .apply(2, target, FlockOperation::Unlock)
+        .expect("unlock second shared lock");
+    locks
+        .apply(3, target, FlockOperation::Exclusive { nonblocking: true })
+        .expect("exclusive lock becomes available");
+}
+
+#[test]
+fn flock_manager_treats_reacquire_on_same_description_as_non_conflicting() {
+    let locks = FileLockManager::new();
+    let target = FileLockTarget::new(7);
+
+    locks
+        .apply(99, target, FlockOperation::Exclusive { nonblocking: false })
+        .expect("initial exclusive lock");
+    locks
+        .apply(99, target, FlockOperation::Exclusive { nonblocking: true })
+        .expect("same description can reacquire exclusive lock");
+    locks
+        .apply(99, target, FlockOperation::Shared { nonblocking: true })
+        .expect("same description can downgrade to shared lock");
+
+    let shared = locks.apply(100, target, FlockOperation::Shared { nonblocking: true });
+    shared.expect("downgrade should allow other shared holders");
 }

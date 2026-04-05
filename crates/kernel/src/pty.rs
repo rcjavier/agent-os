@@ -2,16 +2,20 @@ use crate::fd_table::{
     FdResult, FileDescription, ProcessFdTable, SharedFileDescription, FILETYPE_CHARACTER_DEVICE,
     O_RDWR,
 };
+use crate::poll::{PollEvents, PollNotifier, POLLHUP, POLLIN, POLLOUT};
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 pub const MAX_PTY_BUFFER_BYTES: usize = 65_536;
 pub const MAX_CANON: usize = 4_096;
 pub const SIGINT: i32 = 2;
 pub const SIGQUIT: i32 = 3;
 pub const SIGTSTP: i32 = 20;
+const DEFAULT_PTY_COLUMNS: u16 = 80;
+const DEFAULT_PTY_ROWS: u16 = 24;
 
 pub type PtyResult<T> = Result<T, PtyError>;
 pub type SignalHandler = Arc<dyn Fn(u32, i32) + Send + Sync>;
@@ -102,6 +106,21 @@ pub struct PartialTermiosControlChars {
     pub vsusp: Option<u8>,
     pub veof: Option<u8>,
     pub verase: Option<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtyWindowSize {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+impl Default for PtyWindowSize {
+    fn default() -> Self {
+        Self {
+            cols: DEFAULT_PTY_COLUMNS,
+            rows: DEFAULT_PTY_ROWS,
+        }
+    }
 }
 
 impl Default for Termios {
@@ -212,6 +231,7 @@ struct PtyState {
     termios: Termios,
     line_buffer: Vec<u8>,
     foreground_pgid: u32,
+    window_size: PtyWindowSize,
 }
 
 #[derive(Debug)]
@@ -247,6 +267,7 @@ struct PtyManagerInner {
 pub struct PtyManager {
     inner: Arc<PtyManagerInner>,
     on_signal: Option<SignalHandler>,
+    notifier: Option<PollNotifier>,
 }
 
 impl Default for PtyManager {
@@ -257,6 +278,7 @@ impl Default for PtyManager {
                 waiters: Condvar::new(),
             }),
             on_signal: None,
+            notifier: None,
         }
     }
 }
@@ -270,6 +292,22 @@ impl PtyManager {
         let mut manager = Self::new();
         manager.on_signal = Some(on_signal);
         manager
+    }
+
+    pub(crate) fn with_signal_handler_and_notifier(
+        on_signal: SignalHandler,
+        notifier: PollNotifier,
+    ) -> Self {
+        let mut manager = Self::with_notifier(notifier);
+        manager.on_signal = Some(on_signal);
+        manager
+    }
+
+    pub(crate) fn with_notifier(notifier: PollNotifier) -> Self {
+        Self {
+            notifier: Some(notifier),
+            ..Self::default()
+        }
     }
 
     pub fn create_pty(&self) -> PtyPair {
@@ -288,6 +326,7 @@ impl PtyManager {
             PtyState {
                 path: path.clone(),
                 termios: Termios::default(),
+                window_size: PtyWindowSize::default(),
                 ..PtyState::default()
             },
         );
@@ -352,6 +391,51 @@ impl PtyManager {
         }
     }
 
+    pub fn poll(&self, description_id: u64, requested: PollEvents) -> PtyResult<PollEvents> {
+        let state = lock_or_recover(&self.inner.state);
+        let pty_ref = state
+            .desc_to_pty
+            .get(&description_id)
+            .copied()
+            .ok_or_else(|| PtyError::bad_file_descriptor("not a PTY end"))?;
+        let pty = state
+            .ptys
+            .get(&pty_ref.pty_id)
+            .ok_or_else(|| PtyError::bad_file_descriptor("PTY not found"))?;
+
+        let mut events = PollEvents::empty();
+        match pty_ref.end {
+            PtyEndKind::Master => {
+                if requested.intersects(POLLIN) && !pty.output_buffer.is_empty() {
+                    events |= POLLIN;
+                }
+                if pty.closed_slave {
+                    events |= POLLHUP;
+                } else if requested.intersects(POLLOUT)
+                    && (available_capacity(&pty.input_buffer) > 0
+                        || !pty.waiting_input_reads.is_empty())
+                {
+                    events |= POLLOUT;
+                }
+            }
+            PtyEndKind::Slave => {
+                if requested.intersects(POLLIN) && !pty.input_buffer.is_empty() {
+                    events |= POLLIN;
+                }
+                if pty.closed_master {
+                    events |= POLLHUP;
+                } else if requested.intersects(POLLOUT)
+                    && (available_capacity(&pty.output_buffer) > 0
+                        || !pty.waiting_output_reads.is_empty())
+                {
+                    events |= POLLOUT;
+                }
+            }
+        }
+
+        Ok(events)
+    }
+
     pub fn write(&self, description_id: u64, data: impl AsRef<[u8]>) -> PtyResult<usize> {
         let payload = data.as_ref();
         let mut signals = Vec::new();
@@ -392,7 +476,7 @@ impl PtyManager {
             }
         }
 
-        self.inner.waiters.notify_all();
+        self.notify_waiters_and_pollers();
         if let Some(on_signal) = &self.on_signal {
             for (pgid, signal) in signals {
                 if pgid > 0 {
@@ -405,6 +489,15 @@ impl PtyManager {
     }
 
     pub fn read(&self, description_id: u64, length: usize) -> PtyResult<Option<Vec<u8>>> {
+        self.read_with_timeout(description_id, length, None)
+    }
+
+    pub fn read_with_timeout(
+        &self,
+        description_id: u64,
+        length: usize,
+        timeout: Option<Duration>,
+    ) -> PtyResult<Option<Vec<u8>>> {
         let mut state = lock_or_recover(&self.inner.state);
         let pty_ref = state
             .desc_to_pty
@@ -412,6 +505,7 @@ impl PtyManager {
             .copied()
             .ok_or_else(|| PtyError::bad_file_descriptor("not a PTY end"))?;
         let mut waiter_id = None;
+        let deadline = timeout.map(|duration| Instant::now() + duration);
 
         loop {
             if let Some(id) = waiter_id {
@@ -439,7 +533,9 @@ impl PtyManager {
                         }
 
                         if !pty.output_buffer.is_empty() {
-                            return Ok(Some(drain_buffer(&mut pty.output_buffer, length)));
+                            let result = drain_buffer(&mut pty.output_buffer, length);
+                            self.notify_waiters_and_pollers();
+                            return Ok(Some(result));
                         }
 
                         if pty.closed_slave {
@@ -458,7 +554,9 @@ impl PtyManager {
                         }
 
                         if !pty.input_buffer.is_empty() {
-                            return Ok(Some(drain_buffer(&mut pty.input_buffer, length)));
+                            let result = drain_buffer(&mut pty.input_buffer, length);
+                            self.notify_waiters_and_pollers();
+                            return Ok(Some(result));
                         }
 
                         if pty.closed_master {
@@ -485,14 +583,49 @@ impl PtyManager {
                     PtyEndKind::Master => pty.waiting_output_reads.push_back(next),
                     PtyEndKind::Slave => pty.waiting_input_reads.push_back(next),
                 }
+                self.notify_waiters_and_pollers();
                 waiter_id = Some(next);
                 next
             };
 
-            state = wait_or_recover(&self.inner.waiters, state);
+            let Some(deadline) = deadline else {
+                state = wait_or_recover(&self.inner.waiters, state);
+                if !state.waiters.contains_key(&id) {
+                    waiter_id = None;
+                }
+                continue;
+            };
 
+            let now = Instant::now();
+            if now >= deadline {
+                if let Some(id) = waiter_id.take() {
+                    state.waiters.remove(&id);
+                    if let Some(pty) = state.ptys.get_mut(&pty_ref.pty_id) {
+                        pty.waiting_input_reads.retain(|queued| *queued != id);
+                        pty.waiting_output_reads.retain(|queued| *queued != id);
+                    }
+                    self.notify_waiters_and_pollers();
+                }
+                return Err(PtyError::would_block("PTY read timed out"));
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            let (next_state, wait_result) =
+                wait_timeout_or_recover(&self.inner.waiters, state, remaining);
+            state = next_state;
             if !state.waiters.contains_key(&id) {
                 waiter_id = None;
+            }
+            if wait_result.timed_out() {
+                if let Some(id) = waiter_id.take() {
+                    state.waiters.remove(&id);
+                    if let Some(pty) = state.ptys.get_mut(&pty_ref.pty_id) {
+                        pty.waiting_input_reads.retain(|queued| *queued != id);
+                        pty.waiting_output_reads.retain(|queued| *queued != id);
+                    }
+                    self.notify_waiters_and_pollers();
+                }
+                return Err(PtyError::would_block("PTY read timed out"));
             }
         }
     }
@@ -531,7 +664,7 @@ impl PtyManager {
         if remove_pty {
             state.ptys.remove(&pty_ref.pty_id);
         }
-        self.inner.waiters.notify_all();
+        self.notify_waiters_and_pollers();
     }
 
     pub fn is_pty(&self, description_id: u64) -> bool {
@@ -634,6 +767,25 @@ impl PtyManager {
             .ok_or_else(|| PtyError::bad_file_descriptor("PTY not found"))
     }
 
+    pub fn resize(&self, description_id: u64, cols: u16, rows: u16) -> PtyResult<Option<u32>> {
+        let mut state = lock_or_recover(&self.inner.state);
+        let pty_ref = state
+            .desc_to_pty
+            .get(&description_id)
+            .copied()
+            .ok_or_else(|| PtyError::bad_file_descriptor("not a PTY end"))?;
+        let pty = state
+            .ptys
+            .get_mut(&pty_ref.pty_id)
+            .ok_or_else(|| PtyError::bad_file_descriptor("PTY not found"))?;
+        let next_size = PtyWindowSize { cols, rows };
+        if pty.window_size == next_size {
+            return Ok(None);
+        }
+        pty.window_size = next_size;
+        Ok((pty.foreground_pgid > 0).then_some(pty.foreground_pgid))
+    }
+
     pub fn pty_count(&self) -> usize {
         lock_or_recover(&self.inner.state).ptys.len()
     }
@@ -658,6 +810,13 @@ impl PtyManager {
         let state = lock_or_recover(&self.inner.state);
         let pty_ref = state.desc_to_pty.get(&description_id)?;
         state.ptys.get(&pty_ref.pty_id).map(|pty| pty.path.clone())
+    }
+
+    fn notify_waiters_and_pollers(&self) {
+        self.inner.waiters.notify_all();
+        if let Some(notifier) = &self.notifier {
+            notifier.notify();
+        }
     }
 }
 
@@ -838,6 +997,10 @@ fn buffer_size(buffer: &VecDeque<Vec<u8>>) -> usize {
     buffer.iter().map(Vec::len).sum()
 }
 
+fn available_capacity(buffer: &VecDeque<Vec<u8>>) -> usize {
+    MAX_PTY_BUFFER_BYTES.saturating_sub(buffer_size(buffer))
+}
+
 fn drain_buffer(buffer: &mut VecDeque<Vec<u8>>, length: usize) -> Vec<u8> {
     let mut chunks = Vec::new();
     let mut remaining = length;
@@ -879,6 +1042,17 @@ fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>) -> MutexGuard<'a, T> {
 fn wait_or_recover<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
     match condvar.wait(guard) {
         Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn wait_timeout_or_recover<'a, T>(
+    condvar: &Condvar,
+    guard: MutexGuard<'a, T>,
+    timeout: Duration,
+) -> (MutexGuard<'a, T>, std::sync::WaitTimeoutResult) {
+    match condvar.wait_timeout(guard, timeout) {
+        Ok(result) => result,
         Err(poisoned) => poisoned.into_inner(),
     }
 }

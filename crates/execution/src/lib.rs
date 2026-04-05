@@ -5,6 +5,7 @@
 mod common;
 mod node_import_cache;
 mod node_process;
+mod runtime_support;
 
 pub mod benchmark;
 pub mod javascript;
@@ -15,8 +16,9 @@ pub use agent_os_bridge::GuestRuntime;
 pub use javascript::{
     CreateJavascriptContextRequest, JavascriptContext, JavascriptExecution,
     JavascriptExecutionEngine, JavascriptExecutionError, JavascriptExecutionEvent,
-    JavascriptExecutionResult, StartJavascriptExecutionRequest,
+    JavascriptExecutionResult, JavascriptSyncRpcRequest, StartJavascriptExecutionRequest,
 };
+pub use node_process::{NodeSignalDispositionAction, NodeSignalHandlerRegistration};
 pub use python::{
     CreatePythonContextRequest, PythonContext, PythonExecution, PythonExecutionEngine,
     PythonExecutionError, PythonExecutionEvent, PythonExecutionResult, PythonVfsRpcMethod,
@@ -26,6 +28,7 @@ pub use python::{
 pub use wasm::{
     CreateWasmContextRequest, StartWasmExecutionRequest, WasmContext, WasmExecution,
     WasmExecutionEngine, WasmExecutionError, WasmExecutionEvent, WasmExecutionResult,
+    WasmPermissionTier,
 };
 
 pub trait NativeExecutionBridge: agent_os_bridge::ExecutionBridge {}

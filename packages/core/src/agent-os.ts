@@ -1,7 +1,4 @@
-import {
-	execFileSync,
-	spawn as spawnChildProcess,
-} from "node:child_process";
+import { execFileSync, spawn as spawnChildProcess } from "node:child_process";
 import {
 	existsSync,
 	mkdtempSync,
@@ -13,21 +10,32 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import {
+	sep as hostPathSeparator,
 	join,
 	posix as posixPath,
 	relative as relativeHostPath,
 	resolve as resolveHostPath,
-	sep as hostPathSeparator,
 } from "node:path";
 import { fileURLToPath } from "node:url";
+import { type ToolKit, validateToolkits } from "./host-tools.js";
+import { generateToolReference } from "./host-tools-prompt.js";
 import {
+	type HostToolsServer,
+	startHostToolsServer,
+} from "./host-tools-server.js";
+import {
+	createShimFilesystem,
+	generateMasterShim,
+	generateToolkitShim,
+} from "./host-tools-shims.js";
+import {
+	type ConnectTerminalOptions,
 	createInMemoryFileSystem,
 	type Kernel,
 	type KernelExecOptions,
 	type KernelExecResult,
 	type ProcessInfo as KernelProcessInfo,
 	type KernelSpawnOptions,
-	type ConnectTerminalOptions,
 	type ManagedProcess,
 	type OpenShellOptions,
 	type Permissions,
@@ -35,17 +43,6 @@ import {
 	type VirtualFileSystem,
 	type VirtualStat,
 } from "./runtime-compat.js";
-import { type ToolKit, validateToolkits } from "./host-tools.js";
-import { generateToolReference } from "./host-tools-prompt.js";
-import {
-	startHostToolsServer,
-	type HostToolsServer,
-} from "./host-tools-server.js";
-import {
-	createShimFilesystem,
-	generateMasterShim,
-	generateToolkitShim,
-} from "./host-tools-shims.js";
 
 export type { ConnectTerminalOptions } from "./runtime-compat.js";
 
@@ -98,33 +95,12 @@ export interface AgentRegistryEntry {
 	installed: boolean;
 }
 
-import {
-	createNodeHostNetworkAdapter,
-} from "./runtime-compat.js";
 import { AcpClient } from "./acp-client.js";
+import { AGENT_CONFIGS, type AgentConfig, type AgentType } from "./agents.js";
 import {
 	getBaseEnvironment,
 	getBaseFilesystemEntries,
 } from "./base-filesystem.js";
-import {
-	snapshotVirtualFilesystem,
-	type FilesystemEntry,
-} from "./filesystem-snapshot.js";
-import {
-	createSnapshotExport,
-	type LayerStore,
-	type OverlayFilesystemMode,
-	type RootSnapshotExport,
-	type SnapshotLayerHandle,
-} from "./layers.js";
-import { AGENT_CONFIGS, type AgentConfig, type AgentType } from "./agents.js";
-import { createHostDirBackend } from "./host-dir-mount.js";
-import {
-	type CommandPackageMetadata,
-	type SoftwareInput,
-	type SoftwareRoot,
-	processSoftware,
-} from "./packages.js";
 import { CronManager } from "./cron/cron-manager.js";
 import type { ScheduleDriver } from "./cron/schedule-driver.js";
 import { TimerScheduleDriver } from "./cron/timer-driver.js";
@@ -135,38 +111,62 @@ import type {
 	CronJobInfo,
 	CronJobOptions,
 } from "./cron/types.js";
+import {
+	type FilesystemEntry,
+	snapshotVirtualFilesystem,
+} from "./filesystem-snapshot.js";
+import { createHostDirBackend } from "./host-dir-mount.js";
+import {
+	createSnapshotExport,
+	type LayerStore,
+	type OverlayFilesystemMode,
+	type RootSnapshotExport,
+	type SnapshotLayerHandle,
+} from "./layers.js";
 import { getOsInstructions } from "./os-instructions.js";
 import {
-	Session,
-	type SessionInitData,
+	type CommandPackageMetadata,
+	processSoftware,
+	type SoftwareInput,
+	type SoftwareRoot,
+} from "./packages.js";
+import type { JsonRpcRequest, JsonRpcResponse } from "./protocol.js";
+import { createNodeHostNetworkAdapter } from "./runtime-compat.js";
+import {
 	type AgentCapabilities,
 	type AgentInfo,
 	type GetEventsOptions,
 	type PermissionReply,
+	type PermissionRequestHandler,
 	type SequencedEvent,
+	Session,
 	type SessionConfigOption,
 	type SessionEventHandler,
+	type SessionInitData,
 	type SessionModeState,
-	type PermissionRequestHandler,
 } from "./session.js";
-import type { JsonRpcRequest, JsonRpcResponse } from "./protocol.js";
-import type { InProcessSidecarVmAdmin } from "./sidecar/in-process-transport.js";
 import {
-	AgentOsSidecar,
+	type AgentOsCreateSidecarOptions,
+	type AgentOsSharedSidecarOptions,
+	type AgentOsSidecar,
+	type AgentOsSidecarConfig,
+	type AgentOsSidecarVmLease,
 	createAgentOsSidecar,
 	getSharedAgentOsSidecar,
 	leaseAgentOsSidecarVm,
-	type AgentOsCreateSidecarOptions,
-	type AgentOsSharedSidecarOptions,
-	type AgentOsSidecarConfig,
-	type AgentOsSidecarVmLease,
 } from "./sidecar/handle.js";
-import { NativeSidecarKernelProxy, type LocalCompatMount } from "./sidecar/native-kernel-proxy.js";
-import { NativeSidecarProcessClient } from "./sidecar/native-process-client.js";
+import type { InProcessSidecarVmAdmin } from "./sidecar/in-process-transport.js";
 import { serializeMountConfigForSidecar } from "./sidecar/mount-descriptors.js";
+import {
+	type LocalCompatMount,
+	NativeSidecarKernelProxy,
+} from "./sidecar/native-kernel-proxy.js";
+import { serializePermissionsForSidecar } from "./sidecar/permission-descriptors.js";
+import type { RootFilesystemEntry } from "./sidecar/native-process-client.js";
+import { NativeSidecarProcessClient } from "./sidecar/native-process-client.js";
 import { serializeRootFilesystemForSidecar } from "./sidecar/root-filesystem-descriptors.js";
 import { createStdoutLineIterable } from "./stdout-lines.js";
-import type { RootFilesystemEntry } from "./sidecar/native-process-client.js";
+
 export type {
 	AgentOsCreateSidecarOptions,
 	AgentOsSharedSidecarOptions,
@@ -272,6 +272,11 @@ export interface AgentOsOptions {
 	software?: SoftwareInput[];
 	/** Loopback ports to exempt from SSRF checks (for testing with host-side mock servers). */
 	loopbackExemptPorts?: number[];
+	/**
+	 * Allowed Node.js builtins for guest Node processes.
+	 * Defaults to the hardened builtin set used by the native sidecar bridge.
+	 */
+	allowedNodeBuiltins?: string[];
 	/**
 	 * Host-side CWD for module access resolution. Sets the directory whose
 	 * node_modules are projected into the VM at /root/node_modules/.
@@ -893,9 +898,9 @@ function convertSidecarRootSnapshotEntries(
 
 function ensureNativeSidecarBinary(): string {
 	if (
-		ensuredSidecarBinary
-		&& existsSync(ensuredSidecarBinary)
-		&& !sidecarBinaryNeedsBuild()
+		ensuredSidecarBinary &&
+		existsSync(ensuredSidecarBinary) &&
+		!sidecarBinaryNeedsBuild()
 	) {
 		return ensuredSidecarBinary;
 	}
@@ -1017,7 +1022,9 @@ function collectSidecarMountPlan(options: {
 	hostMounts: HostMountInfo[];
 	hostPathMappings: HostMountInfo[];
 } {
-	const sidecarMounts: Array<ReturnType<typeof serializeMountConfigForSidecar>> = [];
+	const sidecarMounts: Array<
+		ReturnType<typeof serializeMountConfigForSidecar>
+	> = [];
 	const hostMounts: HostMountInfo[] = [];
 	const hostPathMappings: HostMountInfo[] = [];
 	const seenMounts = new Set<string>();
@@ -1059,7 +1066,9 @@ function collectSidecarMountPlan(options: {
 		pushMount(mount);
 	}
 
-	const moduleNodeModules = resolveHostPath(join(options.moduleAccessCwd, "node_modules"));
+	const moduleNodeModules = resolveHostPath(
+		join(options.moduleAccessCwd, "node_modules"),
+	);
 	if (existsSync(moduleNodeModules)) {
 		pushMount({
 			path: "/root/node_modules",
@@ -1105,7 +1114,9 @@ function collectSidecarMountPlan(options: {
 	}
 
 	hostMounts.sort((left, right) => right.vmPath.length - left.vmPath.length);
-	hostPathMappings.sort((left, right) => right.vmPath.length - left.vmPath.length);
+	hostPathMappings.sort(
+		(left, right) => right.vmPath.length - left.vmPath.length,
+	);
 	return { sidecarMounts, hostMounts, hostPathMappings };
 }
 
@@ -1259,13 +1270,14 @@ export class AgentOs {
 				const commandGuestPaths = collectGuestCommandPaths(
 					preparedCommandDirs.commandDirs,
 				);
-				const { sidecarMounts, hostMounts, hostPathMappings } = collectSidecarMountPlan({
-					mounts: options?.mounts,
-					moduleAccessCwd,
-					softwareRoots: processed.softwareRoots,
-					commandDirs: preparedCommandDirs.commandDirs,
-					shimDir: toolShimDir,
-				});
+				const { sidecarMounts, hostMounts, hostPathMappings } =
+					collectSidecarMountPlan({
+						mounts: options?.mounts,
+						moduleAccessCwd,
+						softwareRoots: processed.softwareRoots,
+						commandDirs: preparedCommandDirs.commandDirs,
+						shimDir: toolShimDir,
+					});
 
 				client = NativeSidecarProcessClient.spawn({
 					cwd: REPO_ROOT,
@@ -1274,6 +1286,9 @@ export class AgentOs {
 					frameTimeoutMs: 60_000,
 				});
 				const session = await client.authenticateAndOpenSession();
+				const sidecarPermissions = serializePermissionsForSidecar(
+					options?.permissions,
+				);
 				const nativeVm = await client.createVm(session, {
 					runtime: "java_script",
 					metadata: {
@@ -1286,15 +1301,18 @@ export class AgentOs {
 						options?.rootFilesystem,
 						bootstrapLower,
 					),
+					permissions: sidecarPermissions,
 				});
 				await client.waitForEvent(
 					(event) =>
-						event.payload.type === "vm_lifecycle"
-						&& event.payload.state === "ready",
+						event.payload.type === "vm_lifecycle" &&
+						event.payload.state === "ready",
 					10_000,
 				);
 				await client.configureVm(session, nativeVm, {
 					mounts: sidecarMounts,
+					permissions: sidecarPermissions,
+					commandPermissions: processed.commandPermissions,
 				});
 
 				rootBridge = new NativeSidecarKernelProxy({
@@ -1305,10 +1323,12 @@ export class AgentOs {
 					cwd: "/home/user",
 					localMounts,
 					commandGuestPaths,
+					wasmCommandPermissions: processed.commandPermissions,
 					hostPathMappings: hostPathMappings.map((mapping) => ({
 						guestPath: mapping.vmPath,
 						hostPath: mapping.hostPath,
 					})),
+					allowedNodeBuiltins: options?.allowedNodeBuiltins,
 					loopbackExemptPorts: options?.loopbackExemptPorts,
 					nodeExecutionCwd: "/home/user",
 					onDispose: cleanup,
@@ -1646,15 +1666,12 @@ export class AgentOs {
 		}
 	}
 
-	async mkdir(
-		path: string,
-		options?: { recursive?: boolean },
-	): Promise<void> {
+	async mkdir(path: string, options?: { recursive?: boolean }): Promise<void> {
 		if (options?.recursive) {
 			return this._mkdirp(path);
 		}
 		this._assertSafeAbsolutePath(path);
-		return this.kernel.mkdir(path);
+		return this.#kernel.mkdir(path);
 	}
 
 	async readdir(path: string): Promise<string[]> {
@@ -2333,7 +2350,7 @@ export class AgentOs {
 		const { iterable, onStdout } = createStdoutLineIterable();
 		const launchArgs = [...(config.launchArgs ?? []), ...extraArgs];
 		let launchEnv = { ...config.defaultEnv, ...extraEnv, ...options?.env };
-		let sessionCwd = options?.cwd ?? "/home/user";
+		const sessionCwd = options?.cwd ?? "/home/user";
 		const binPath = this._resolveAdapterBin(config.acpAdapter);
 		if (
 			(agentType === "pi" || agentType === "pi-cli") &&
@@ -2544,10 +2561,7 @@ export class AgentOs {
 
 	/** Send a prompt to the agent and wait for the final response.
 	 *  Returns the raw JSON-RPC response and the accumulated agent text. */
-	async prompt(
-		sessionId: string,
-		text: string,
-	): Promise<PromptResult> {
+	async prompt(sessionId: string, text: string): Promise<PromptResult> {
 		const session = this._requireSession(sessionId);
 
 		// Collect streamed text while the prompt is running

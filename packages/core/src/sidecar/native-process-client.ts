@@ -20,6 +20,7 @@ type SidecarPlacement =
 	| { kind: "explicit"; sidecar_id: string };
 
 type GuestRuntimeKind = "java_script" | "web_assembly";
+type WasmPermissionTier = "full" | "read-write" | "read-only" | "isolated";
 type RootFilesystemEntryEncoding = "utf8" | "base64";
 
 type RootFilesystemDescriptor = {
@@ -73,6 +74,9 @@ type WireRootFilesystemEntry = {
 export interface GuestFilesystemStat {
 	mode: number;
 	size: number;
+	blocks: number;
+	dev: number;
+	rdev: number;
 	is_directory: boolean;
 	is_symbolic_link: boolean;
 	atime_ms: number;
@@ -144,6 +148,7 @@ type RequestPayload =
 			runtime: GuestRuntimeKind;
 			metadata: Record<string, string>;
 			root_filesystem: WireRootFilesystemDescriptor;
+			permissions: WirePermissionDescriptor[];
 	  }
 	| {
 			type: "configure_vm";
@@ -152,6 +157,7 @@ type RequestPayload =
 			permissions: WirePermissionDescriptor[];
 			instructions: string[];
 			projected_modules: WireProjectedModuleDescriptor[];
+			command_permissions: Record<string, WasmPermissionTier>;
 	  }
 	| {
 			type: "dispose_vm";
@@ -188,6 +194,7 @@ type RequestPayload =
 			args: string[];
 			env?: Record<string, string>;
 			cwd?: string;
+			wasm_permission_tier?: WasmPermissionTier;
 	  }
 	| {
 			type: "write_stdin";
@@ -550,6 +557,7 @@ export class NativeSidecarProcessClient {
 			runtime: GuestRuntimeKind;
 			metadata?: Record<string, string>;
 			rootFilesystem?: RootFilesystemDescriptor;
+			permissions?: SidecarPermissionDescriptor[];
 		},
 	): Promise<CreatedVm> {
 		const response = await this.sendRequest({
@@ -563,6 +571,7 @@ export class NativeSidecarProcessClient {
 				runtime: options.runtime,
 				metadata: options.metadata ?? {},
 				root_filesystem: toWireRootFilesystemDescriptor(options.rootFilesystem),
+				permissions: (options.permissions ?? []).map(toWirePermissionDescriptor),
 			},
 		});
 		if (response.payload.type !== "vm_created") {
@@ -585,6 +594,7 @@ export class NativeSidecarProcessClient {
 			permissions?: SidecarPermissionDescriptor[];
 			instructions?: string[];
 			projectedModules?: SidecarProjectedModuleDescriptor[];
+			commandPermissions?: Record<string, WasmPermissionTier>;
 		},
 	): Promise<void> {
 		const response = await this.sendRequest({
@@ -605,6 +615,7 @@ export class NativeSidecarProcessClient {
 				projected_modules: (options.projectedModules ?? []).map(
 					toWireProjectedModuleDescriptor,
 				),
+				command_permissions: options.commandPermissions ?? {},
 			},
 		});
 		if (response.payload.type !== "vm_configured") {
@@ -926,6 +937,7 @@ export class NativeSidecarProcessClient {
 			args?: string[];
 			env?: Record<string, string>;
 			cwd?: string;
+			wasmPermissionTier?: WasmPermissionTier;
 		},
 	): Promise<{ pid: number | null }> {
 		const response = await this.sendRequest({
@@ -943,6 +955,9 @@ export class NativeSidecarProcessClient {
 				args: options.args ?? [],
 				...(options.env ? { env: options.env } : {}),
 				...(options.cwd ? { cwd: options.cwd } : {}),
+				...(options.wasmPermissionTier
+					? { wasm_permission_tier: options.wasmPermissionTier }
+					: {}),
 			},
 		});
 		if (response.payload.type !== "process_started") {

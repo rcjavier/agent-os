@@ -7,10 +7,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const S_IFREG: u32 = 0o100000;
 pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFLNK: u32 = 0o120000;
+const MEMORY_FILESYSTEM_DEVICE_ID: u64 = 1;
 
 const DEFAULT_UID: u32 = 1000;
 const DEFAULT_GID: u32 = 1000;
 const DIRECTORY_SIZE: u64 = 4096;
+pub const MAX_PATH_LENGTH: usize = 4096;
 const MAX_SYMLINK_DEPTH: usize = 40;
 
 pub type VfsResult<T> = Result<T, VfsError>;
@@ -65,6 +67,10 @@ impl VfsError {
 
     fn not_directory(op: &'static str, path: &str) -> Self {
         Self::new("ENOTDIR", format!("not a directory, {op} '{path}'"))
+    }
+
+    fn path_too_long(path: &str) -> Self {
+        Self::new("ENAMETOOLONG", format!("file name too long: {path}"))
     }
 
     fn not_empty(path: &str) -> Self {
@@ -126,6 +132,9 @@ pub struct VirtualDirEntry {
 pub struct VirtualStat {
     pub mode: u32,
     pub size: u64,
+    pub blocks: u64,
+    pub dev: u64,
+    pub rdev: u64,
     pub is_directory: bool,
     pub is_symbolic_link: bool,
     pub atime_ms: u64,
@@ -144,8 +153,35 @@ pub trait VirtualFileSystem {
         String::from_utf8(self.read_file(path)?).map_err(|_| VfsError::invalid_utf8(path))
     }
     fn read_dir(&mut self, path: &str) -> VfsResult<Vec<String>>;
+    fn read_dir_limited(&mut self, path: &str, max_entries: usize) -> VfsResult<Vec<String>> {
+        let entries = self.read_dir(path)?;
+        if entries.len() > max_entries {
+            return Err(VfsError::new(
+                "ENOMEM",
+                format!(
+                    "directory listing for '{path}' exceeds configured limit of {max_entries} entries"
+                ),
+            ));
+        }
+        Ok(entries)
+    }
     fn read_dir_with_types(&mut self, path: &str) -> VfsResult<Vec<VirtualDirEntry>>;
     fn write_file(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<()>;
+    fn create_file_exclusive(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<()> {
+        let content = content.into();
+        if self.exists(path) {
+            return Err(VfsError::already_exists("open", path));
+        }
+        self.write_file(path, content)
+    }
+    fn append_file(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<u64> {
+        let content = content.into();
+        let mut existing = self.read_file(path)?;
+        existing.extend_from_slice(&content);
+        let new_len = existing.len() as u64;
+        self.write_file(path, existing)?;
+        Ok(new_len)
+    }
     fn create_dir(&mut self, path: &str) -> VfsResult<()>;
     fn mkdir(&mut self, path: &str, recursive: bool) -> VfsResult<()>;
     fn exists(&self, path: &str) -> bool;
@@ -327,6 +363,7 @@ impl MemoryFileSystem {
         follow_final_symlink: bool,
         depth: usize,
     ) -> VfsResult<String> {
+        validate_path(path)?;
         if depth > MAX_SYMLINK_DEPTH {
             return Err(VfsError::symlink_loop(path));
         }
@@ -351,13 +388,13 @@ impl MemoryFileSystem {
             let is_final = index + 1 == components.len();
             let should_follow = !is_final || follow_final_symlink;
 
-            if should_follow {
-                if let Some(ino) = self.path_index.get(&candidate) {
-                    let inode = self
-                        .inodes
-                        .get(ino)
-                        .expect("path index should always point at a valid inode");
+            if let Some(ino) = self.path_index.get(&candidate) {
+                let inode = self
+                    .inodes
+                    .get(ino)
+                    .expect("path index should always point at a valid inode");
 
+                if should_follow {
                     if let InodeKind::SymbolicLink { target } = &inode.kind {
                         let target_path = if target.starts_with('/') {
                             target.clone()
@@ -376,6 +413,10 @@ impl MemoryFileSystem {
                             depth + 1,
                         );
                     }
+                }
+
+                if !is_final && !matches!(inode.kind, InodeKind::Directory) {
+                    return Err(VfsError::not_directory("stat", &candidate));
                 }
             }
 
@@ -462,6 +503,11 @@ impl MemoryFileSystem {
             return Err(VfsError::is_directory("unlink", path));
         }
 
+        self.inodes
+            .get_mut(&ino)
+            .expect("inode should exist when unlinking")
+            .metadata
+            .ctime_ms = now_ms();
         self.path_index.remove(&normalized);
         self.decrement_link_count(ino);
         Ok(())
@@ -489,6 +535,11 @@ impl MemoryFileSystem {
             }
         }
 
+        self.inodes
+            .get_mut(&ino)
+            .expect("inode should exist when removing destination")
+            .metadata
+            .ctime_ms = now_ms();
         self.path_index.remove(&normalized);
         self.decrement_link_count(ino);
         Ok(())
@@ -500,7 +551,7 @@ impl MemoryFileSystem {
                 .inodes
                 .get_mut(&ino)
                 .expect("inode should exist when decrementing link count");
-            inode.metadata.nlink -= 1;
+            inode.metadata.nlink = inode.metadata.nlink.saturating_sub(1);
             inode.metadata.nlink == 0
         };
 
@@ -519,6 +570,9 @@ impl MemoryFileSystem {
         VirtualStat {
             mode: inode.metadata.mode,
             size,
+            blocks: block_count_for_size(size),
+            dev: MEMORY_FILESYSTEM_DEVICE_ID,
+            rdev: 0,
             is_directory: matches!(inode.kind, InodeKind::Directory),
             is_symbolic_link: matches!(inode.kind, InodeKind::SymbolicLink { .. }),
             atime_ms: inode.metadata.atime_ms,
@@ -636,9 +690,49 @@ impl VirtualFileSystem for MemoryFileSystem {
             .collect())
     }
 
+    fn read_dir_limited(&mut self, path: &str, max_entries: usize) -> VfsResult<Vec<String>> {
+        self.assert_directory_path(path, "scandir")?;
+        let resolved = self.resolve_path(path, 0)?;
+        self.inode_mut_for_existing_path(&resolved, "scandir", false)?
+            .metadata
+            .atime_ms = now_ms();
+        let prefix = if resolved == "/" {
+            String::from("/")
+        } else {
+            format!("{resolved}/")
+        };
+
+        let mut entries = BTreeMap::<String, String>::new();
+        for (candidate_path, _) in self.path_index.range(prefix.clone()..) {
+            if !candidate_path.starts_with(&prefix) {
+                break;
+            }
+
+            let rest = &candidate_path[prefix.len()..];
+            if rest.is_empty() || rest.contains('/') {
+                continue;
+            }
+
+            entries.insert(String::from(rest), String::from(rest));
+            if entries.len() > max_entries {
+                return Err(VfsError::new(
+                    "ENOMEM",
+                    format!(
+                        "directory listing for '{path}' exceeds configured limit of {max_entries} entries"
+                    ),
+                ));
+            }
+        }
+
+        Ok(entries.into_values().collect())
+    }
+
     fn read_dir_with_types(&mut self, path: &str) -> VfsResult<Vec<VirtualDirEntry>> {
         self.assert_directory_path(path, "scandir")?;
         let resolved = self.resolve_path(path, 0)?;
+        self.inode_mut_for_existing_path(&resolved, "scandir", false)?
+            .metadata
+            .atime_ms = now_ms();
         let prefix = if resolved == "/" {
             String::from("/")
         } else {
@@ -646,9 +740,9 @@ impl VirtualFileSystem for MemoryFileSystem {
         };
 
         let mut entries = BTreeMap::<String, VirtualDirEntry>::new();
-        for (candidate_path, ino) in &self.path_index {
+        for (candidate_path, ino) in self.path_index.range(prefix.clone()..) {
             if !candidate_path.starts_with(&prefix) {
-                continue;
+                break;
             }
 
             let rest = &candidate_path[prefix.len()..];
@@ -696,6 +790,40 @@ impl VirtualFileSystem for MemoryFileSystem {
         let ino = self.allocate_inode(InodeKind::File { data }, S_IFREG | 0o644);
         self.path_index.insert(normalized, ino);
         Ok(())
+    }
+
+    fn create_file_exclusive(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<()> {
+        let normalized = self.resolve_path(path, 0)?;
+        self.mkdir(&dirname(&normalized), true)?;
+        if self.path_index.contains_key(&normalized) {
+            return Err(VfsError::already_exists("open", path));
+        }
+
+        let ino = self.allocate_inode(
+            InodeKind::File {
+                data: content.into(),
+            },
+            S_IFREG | 0o644,
+        );
+        self.path_index.insert(normalized, ino);
+        Ok(())
+    }
+
+    fn append_file(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<u64> {
+        let normalized = self.resolve_path(path, 0)?;
+        let data = content.into();
+        let inode = self.inode_mut_for_existing_path(&normalized, "open", false)?;
+        let now = now_ms();
+        match &mut inode.kind {
+            InodeKind::File { data: existing } => {
+                existing.extend_from_slice(&data);
+                inode.metadata.mtime_ms = now;
+                inode.metadata.ctime_ms = now;
+                Ok(existing.len() as u64)
+            }
+            InodeKind::Directory => Err(VfsError::is_directory("open", path)),
+            InodeKind::SymbolicLink { .. } => Err(VfsError::not_found("open", path)),
+        }
     }
 
     fn create_dir(&mut self, path: &str) -> VfsResult<()> {
@@ -855,6 +983,11 @@ impl VirtualFileSystem for MemoryFileSystem {
         if !is_directory {
             self.path_index.remove(&old_normalized);
             self.path_index.insert(new_normalized, ino);
+            self.inodes
+                .get_mut(&ino)
+                .expect("renamed inode should exist")
+                .metadata
+                .ctime_ms = now_ms();
             return Ok(());
         }
 
@@ -878,6 +1011,12 @@ impl VirtualFileSystem for MemoryFileSystem {
             };
             self.path_index.insert(relocated_path, inode_id);
         }
+
+        self.inodes
+            .get_mut(&ino)
+            .expect("renamed directory inode should exist")
+            .metadata
+            .ctime_ms = now_ms();
 
         Ok(())
     }
@@ -926,11 +1065,12 @@ impl VirtualFileSystem for MemoryFileSystem {
 
         self.assert_directory_path(&dirname(&normalized), "link")?;
         self.path_index.insert(normalized, ino);
-        self.inodes
+        let inode = self
+            .inodes
             .get_mut(&ino)
-            .expect("path index should always point at a valid inode")
-            .metadata
-            .nlink += 1;
+            .expect("path index should always point at a valid inode");
+        inode.metadata.nlink += 1;
+        inode.metadata.ctime_ms = now_ms();
         Ok(())
     }
 
@@ -1001,6 +1141,14 @@ impl Default for MemoryFileSystem {
     }
 }
 
+pub fn validate_path(path: &str) -> VfsResult<()> {
+    let normalized = normalize_path(path);
+    if normalized.len() > MAX_PATH_LENGTH {
+        return Err(VfsError::path_too_long(path));
+    }
+    Ok(())
+}
+
 pub fn normalize_path(path: &str) -> String {
     if path.is_empty() {
         return String::from("/");
@@ -1027,6 +1175,14 @@ pub fn normalize_path(path: &str) -> String {
         String::from("/")
     } else {
         format!("/{}", resolved.join("/"))
+    }
+}
+
+fn block_count_for_size(size: u64) -> u64 {
+    if size == 0 {
+        0
+    } else {
+        size.div_ceil(512)
     }
 }
 

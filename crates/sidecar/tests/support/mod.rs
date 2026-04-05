@@ -161,6 +161,7 @@ pub fn create_vm_with_metadata(
                 runtime,
                 metadata,
                 root_filesystem: Default::default(),
+                permissions: Vec::new(),
             }),
         ))
         .expect("create sidecar VM");
@@ -194,6 +195,7 @@ pub fn execute(
                 args,
                 env: BTreeMap::new(),
                 cwd: None,
+                wasm_permission_tier: None,
             }),
         ))
         .expect("start sidecar execution");
@@ -301,4 +303,47 @@ pub fn wasm_stdout_module() -> Vec<u8> {
 "#,
     )
     .expect("compile wasm fixture")
+}
+
+pub fn wasm_signal_state_module() -> Vec<u8> {
+    wat::parse_str(
+        r#"
+(module
+  (type $fd_write_t (func (param i32 i32 i32 i32) (result i32)))
+  (type $proc_sigaction_t (func (param i32 i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (type $fd_write_t)))
+  (import "host_process" "proc_sigaction" (func $proc_sigaction (type $proc_sigaction_t)))
+  (memory (export "memory") 1)
+  (data (i32.const 32) "signal-registered\n")
+  (func $_start (export "_start")
+    (local $spin i32)
+    (drop
+      (call $proc_sigaction
+        (i32.const 2)
+        (i32.const 2)
+        (i32.const 16384)
+        (i32.const 0)
+        (i32.const 4660)
+      )
+    )
+    (i32.store (i32.const 0) (i32.const 32))
+    (i32.store (i32.const 4) (i32.const 18))
+    (drop
+      (call $fd_write
+        (i32.const 1)
+        (i32.const 0)
+        (i32.const 1)
+        (i32.const 24)
+      )
+    )
+    (local.set $spin (i32.const 5000000))
+    (loop $wait
+      (local.set $spin (i32.sub (local.get $spin) (i32.const 1)))
+      (br_if $wait (i32.gt_s (local.get $spin) (i32.const 0)))
+    )
+  )
+)
+"#,
+    )
+    .expect("compile signal-state wasm fixture")
 }

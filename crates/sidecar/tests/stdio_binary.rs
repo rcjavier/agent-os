@@ -187,6 +187,7 @@ fn native_sidecar_binary_runs_the_framed_protocol_over_stdio() {
                     temp.to_string_lossy().into_owned(),
                 )]),
                 root_filesystem: Default::default(),
+                permissions: Vec::new(),
             }),
         ),
     );
@@ -527,6 +528,7 @@ fn native_sidecar_binary_runs_the_framed_protocol_over_stdio() {
                 args: Vec::new(),
                 env: BTreeMap::new(),
                 cwd: None,
+                wasm_permission_tier: None,
             }),
         ),
     );
@@ -624,6 +626,7 @@ fn native_sidecar_binary_supports_js_bridge_host_filesystem_access() {
                 runtime: GuestRuntimeKind::JavaScript,
                 metadata: BTreeMap::new(),
                 root_filesystem: Default::default(),
+                permissions: Vec::new(),
             }),
         ),
     );
@@ -660,6 +663,7 @@ fn native_sidecar_binary_supports_js_bridge_host_filesystem_access() {
                 permissions: Vec::new(),
                 instructions: Vec::new(),
                 projected_modules: Vec::new(),
+                command_permissions: BTreeMap::new(),
             }),
         ),
     );

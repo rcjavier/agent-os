@@ -235,12 +235,24 @@ impl VirtualFileSystem for RootFileSystem {
         self.overlay.read_dir(path)
     }
 
+    fn read_dir_limited(&mut self, path: &str, max_entries: usize) -> VfsResult<Vec<String>> {
+        self.overlay.read_dir_limited(path, max_entries)
+    }
+
     fn read_dir_with_types(&mut self, path: &str) -> VfsResult<Vec<crate::vfs::VirtualDirEntry>> {
         self.overlay.read_dir_with_types(path)
     }
 
     fn write_file(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<()> {
         self.overlay.write_file(path, content.into())
+    }
+
+    fn create_file_exclusive(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<()> {
+        self.overlay.create_file_exclusive(path, content.into())
+    }
+
+    fn append_file(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<u64> {
+        self.overlay.append_file(path, content.into())
     }
 
     fn create_dir(&mut self, path: &str) -> VfsResult<()> {
