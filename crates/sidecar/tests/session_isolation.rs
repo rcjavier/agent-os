@@ -26,7 +26,7 @@ fn sessions_and_vms_reject_cross_connection_access() {
     );
 
     let session_reject = sidecar
-        .dispatch(request(
+        .dispatch_blocking(request(
             5,
             OwnershipScope::session(&connection_b, &session_a),
             RequestPayload::CreateVm(CreateVmRequest {
@@ -36,7 +36,7 @@ fn sessions_and_vms_reject_cross_connection_access() {
                     cwd.to_string_lossy().into_owned(),
                 )]),
                 root_filesystem: Default::default(),
-                permissions: Vec::new(),
+                permissions: None,
             }),
         ))
         .expect("dispatch mismatched session create_vm");
@@ -49,7 +49,7 @@ fn sessions_and_vms_reject_cross_connection_access() {
     }
 
     let vm_reject = sidecar
-        .dispatch(request(
+        .dispatch_blocking(request(
             6,
             OwnershipScope::vm(&connection_b, &session_b, &vm_a),
             RequestPayload::GetSignalState(GetSignalStateRequest {
@@ -66,7 +66,7 @@ fn sessions_and_vms_reject_cross_connection_access() {
     }
 
     let owner_signal_state = sidecar
-        .dispatch(request(
+        .dispatch_blocking(request(
             7,
             OwnershipScope::vm(&connection_a, &session_a, &vm_a),
             RequestPayload::GetSignalState(GetSignalStateRequest {

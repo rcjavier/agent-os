@@ -5,8 +5,8 @@ mod bridge_support;
 
 use agent_os_sidecar::protocol::{
     AuthenticateRequest, CreateVmRequest, EventPayload, ExecuteRequest, GuestRuntimeKind,
-    OpenSessionRequest, OwnershipScope, ProcessOutputEvent, RequestFrame, RequestPayload,
-    ResponsePayload, SidecarPlacement,
+    OpenSessionRequest, OwnershipScope, ProcessOutputEvent, RequestFrame, RequestId,
+    RequestPayload, ResponsePayload, SidecarPlacement,
 };
 use agent_os_sidecar::{DispatchResult, NativeSidecar, NativeSidecarConfig};
 pub use bridge_support::RecordingBridge;
@@ -62,7 +62,7 @@ pub fn new_sidecar_with_auth_token(
     .expect("create native sidecar")
 }
 
-pub fn request(id: u64, ownership: OwnershipScope, payload: RequestPayload) -> RequestFrame {
+pub fn request(id: RequestId, ownership: OwnershipScope, payload: RequestPayload) -> RequestFrame {
     RequestFrame::new(id, ownership, payload)
 }
 
@@ -83,12 +83,12 @@ pub fn authenticate(sidecar: &mut NativeSidecar<RecordingBridge>, connection_hin
 
 pub fn authenticate_with_token(
     sidecar: &mut NativeSidecar<RecordingBridge>,
-    request_id: u64,
+    request_id: RequestId,
     connection_hint: &str,
     auth_token: &str,
 ) -> DispatchResult {
     sidecar
-        .dispatch(request(
+        .dispatch_blocking(request(
             request_id,
             OwnershipScope::connection(connection_hint),
             RequestPayload::Authenticate(AuthenticateRequest {
@@ -101,11 +101,11 @@ pub fn authenticate_with_token(
 
 pub fn open_session(
     sidecar: &mut NativeSidecar<RecordingBridge>,
-    request_id: u64,
+    request_id: RequestId,
     connection_id: &str,
 ) -> String {
     let result = sidecar
-        .dispatch(request(
+        .dispatch_blocking(request(
             request_id,
             OwnershipScope::connection(connection_id),
             RequestPayload::OpenSession(OpenSessionRequest {
@@ -123,7 +123,7 @@ pub fn open_session(
 
 pub fn create_vm(
     sidecar: &mut NativeSidecar<RecordingBridge>,
-    request_id: u64,
+    request_id: RequestId,
     connection_id: &str,
     session_id: &str,
     runtime: GuestRuntimeKind,
@@ -142,7 +142,7 @@ pub fn create_vm(
 
 pub fn create_vm_with_metadata(
     sidecar: &mut NativeSidecar<RecordingBridge>,
-    request_id: u64,
+    request_id: RequestId,
     connection_id: &str,
     session_id: &str,
     runtime: GuestRuntimeKind,
@@ -154,14 +154,14 @@ pub fn create_vm_with_metadata(
         .or_insert_with(|| cwd.to_string_lossy().into_owned());
 
     let result = sidecar
-        .dispatch(request(
+        .dispatch_blocking(request(
             request_id,
             OwnershipScope::session(connection_id, session_id),
             RequestPayload::CreateVm(CreateVmRequest {
                 runtime,
                 metadata,
                 root_filesystem: Default::default(),
-                permissions: Vec::new(),
+                permissions: None,
             }),
         ))
         .expect("create sidecar VM");
@@ -175,7 +175,7 @@ pub fn create_vm_with_metadata(
 
 pub fn execute(
     sidecar: &mut NativeSidecar<RecordingBridge>,
-    request_id: u64,
+    request_id: RequestId,
     connection_id: &str,
     session_id: &str,
     vm_id: &str,
@@ -185,13 +185,14 @@ pub fn execute(
     args: Vec<String>,
 ) {
     let result = sidecar
-        .dispatch(request(
+        .dispatch_blocking(request(
             request_id,
             OwnershipScope::vm(connection_id, session_id, vm_id),
             RequestPayload::Execute(ExecuteRequest {
                 process_id: process_id.to_owned(),
-                runtime,
-                entrypoint: entrypoint.to_string_lossy().into_owned(),
+                command: None,
+                runtime: Some(runtime),
+                entrypoint: Some(entrypoint.to_string_lossy().into_owned()),
                 args,
                 env: BTreeMap::new(),
                 cwd: None,
@@ -237,38 +238,44 @@ pub fn collect_process_output_with_timeout(
     let deadline = Instant::now() + timeout;
     let mut stdout = String::new();
     let mut stderr = String::new();
+    let mut exit = None;
 
     loop {
         let event = sidecar
-            .poll_event(&ownership, Duration::from_millis(100))
+            .poll_event_blocking(&ownership, Duration::from_millis(100))
             .expect("poll sidecar event");
-        let Some(event) = event else {
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for process events"
+        if let Some(event) = event {
+            assert_eq!(
+                event.ownership,
+                OwnershipScope::vm(connection_id, session_id, vm_id)
             );
-            continue;
-        };
 
-        assert_eq!(
-            event.ownership,
-            OwnershipScope::vm(connection_id, session_id, vm_id)
-        );
-
-        match event.payload {
-            EventPayload::ProcessOutput(ProcessOutputEvent {
-                process_id: event_process_id,
-                channel,
-                chunk,
-            }) if event_process_id == process_id => match channel {
-                agent_os_sidecar::protocol::StreamChannel::Stdout => stdout.push_str(&chunk),
-                agent_os_sidecar::protocol::StreamChannel::Stderr => stderr.push_str(&chunk),
-            },
-            EventPayload::ProcessExited(exited) if exited.process_id == process_id => {
-                return (stdout, stderr, exited.exit_code);
+            match event.payload {
+                EventPayload::ProcessOutput(ProcessOutputEvent {
+                    process_id: event_process_id,
+                    channel,
+                    chunk,
+                }) if event_process_id == process_id => match channel {
+                    agent_os_sidecar::protocol::StreamChannel::Stdout => stdout.push_str(&chunk),
+                    agent_os_sidecar::protocol::StreamChannel::Stderr => stderr.push_str(&chunk),
+                },
+                EventPayload::ProcessExited(exited) if exited.process_id == process_id => {
+                    exit = Some((exited.exit_code, Instant::now()));
+                }
+                _ => {}
             }
-            _ => {}
         }
+
+        if let Some((exit_code, seen_at)) = exit {
+            if Instant::now().duration_since(seen_at) >= Duration::from_millis(200) {
+                return (stdout, stderr, exit_code);
+            }
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for process events\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
     }
 }
 
@@ -314,9 +321,8 @@ pub fn wasm_signal_state_module() -> Vec<u8> {
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (type $fd_write_t)))
   (import "host_process" "proc_sigaction" (func $proc_sigaction (type $proc_sigaction_t)))
   (memory (export "memory") 1)
-  (data (i32.const 32) "signal-registered\n")
+  (data (i32.const 32) "signal:ready\n")
   (func $_start (export "_start")
-    (local $spin i32)
     (drop
       (call $proc_sigaction
         (i32.const 2)
@@ -327,7 +333,7 @@ pub fn wasm_signal_state_module() -> Vec<u8> {
       )
     )
     (i32.store (i32.const 0) (i32.const 32))
-    (i32.store (i32.const 4) (i32.const 18))
+    (i32.store (i32.const 4) (i32.const 13))
     (drop
       (call $fd_write
         (i32.const 1)
@@ -335,11 +341,6 @@ pub fn wasm_signal_state_module() -> Vec<u8> {
         (i32.const 1)
         (i32.const 24)
       )
-    )
-    (local.set $spin (i32.const 5000000))
-    (loop $wait
-      (local.set $spin (i32.sub (local.get $spin) (i32.const 1)))
-      (br_if $wait (i32.gt_s (local.get $spin) (i32.const 0)))
     )
   )
 )

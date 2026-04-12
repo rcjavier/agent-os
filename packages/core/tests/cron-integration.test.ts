@@ -41,8 +41,8 @@ class MockScheduleDriver implements ScheduleDriver {
 // ---------------------------------------------------------------------------
 
 import {
-	REGISTRY_SOFTWARE,
 	hasRegistryCommands,
+	REGISTRY_SOFTWARE,
 } from "./helpers/registry-commands.js";
 
 describe("cron integration via AgentOs API", () => {
@@ -78,6 +78,27 @@ describe("cron integration via AgentOs API", () => {
 			const data = await vm.readFile("/tmp/cron-marker");
 			const text = new TextDecoder().decode(data);
 			expect(text).toContain("cron-wrote-this");
+		},
+	);
+
+	it.skipIf(!hasRegistryCommands)(
+		"scheduleCron with exec action preserves shell cwd semantics",
+		async () => {
+			vm.scheduleCron({
+				id: "exec-cwd-job",
+				schedule: "* * * * *",
+				action: {
+					type: "exec",
+					command:
+						"mkdir -p /tmp/cron-cwd && cd /tmp/cron-cwd && printf from-cron > marker.txt",
+				},
+			});
+
+			await driver.fire("exec-cwd-job");
+
+			const data = await vm.readFile("/tmp/cron-cwd/marker.txt");
+			const text = new TextDecoder().decode(data);
+			expect(text).toBe("from-cron");
 		},
 	);
 

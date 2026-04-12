@@ -49,12 +49,15 @@ The following packages exist but **cannot be compiled** until a patched wasi-lib
 
 | Package | Reason |
 |---|---|
-| @rivet-dev/agent-os-curl | Needs `<netdb.h>` (patched wasi-libc) |
 | @rivet-dev/agent-os-wget | Needs `<netdb.h>` (patched wasi-libc) |
 | @rivet-dev/agent-os-sqlite3 | Needs patched wasi-libc |
 | @rivet-dev/agent-os-git | WASM binary not yet built |
 
-To unblock: run `cd native && ./scripts/patch-wasi-libc.sh` to build the patched sysroot, then `cd .. && make build-wasm-c copy-wasm`.
+To unblock the remaining C packages: run `cd native && ./scripts/patch-wasi-libc.sh` to build the patched sysroot, then `cd .. && make build-wasm-c copy-wasm`.
+
+The published `@rivet-dev/agent-os-curl` package is currently backed by the Rust `native/crates/commands/curl/` binary built on `crates/libs/wasi-http`. Keep curl CLI compatibility fixes there until the patched-sysroot C curl path is restored.
+When patching the OpenCode ACP Node bundle in `registry/agent/opencode/scripts/build-opencode-acp.mjs`, run result-returning SQLite PRAGMAs through `db.$client.exec(...)` instead of drizzle `db.run(...)`. The VM `node:sqlite` shim treats `journal_mode`, `busy_timeout`, `foreign_keys`, and `wal_checkpoint` as queries with rows, so `db.run(...)` breaks `createSession("opencode")` during database bootstrap.
+OpenCode ACP bundle patches that touch `packages/opencode/src/util/filesystem.ts` should resolve absolute guest paths through `AGENT_OS_GUEST_PATH_MAPPINGS` before calling `node:fs`, or tool writes can report success while landing outside the mounted project on the host. When patching streamed LLM or tool execution paths, keep the current `Instance` restored around the async work itself, not just the ACP entrypoint, or VM runs will fail with `No context found for instance`.
 
 ### Meta-packages
 
@@ -82,6 +85,9 @@ Commands declare a default permission tier that controls WASI host imports:
 - Rust command source lives in `native/crates/commands/` with shared libraries in `native/crates/libs/`.
 - C command source lives in `native/c/programs/`.
 - All WASM binaries are built in-repo via `make build-wasm`. No external dependencies except Rust toolchain and wasi-sdk.
+- If you patch a vendored Rust dependency under `native/vendor/`, add the same patch under `native/patches/crates/<crate>/` so `native/scripts/patch-vendor.sh` reapplies it on future rebuilds instead of silently losing the fix.
+- When you rebuild a Rust command locally, the fresh artifacts are the top-level `native/target/wasm32-wasip1/release/<command>.wasm` files. `release/commands/<command>` can lag until the packaging/copy step rewrites the published command directory.
+- For vendored `brush-core` on WASI, command lookup must require `is_file()` before treating a PATH candidate as executable, and once the shell resolves a guest binary path (for example `/bin/printf`) it should spawn that resolved path instead of falling back to the bare command name. Pi prepends `~/.pi/agent/bin` even when it does not exist, so bare-name WASI lookup can fail on the first PATH entry.
 
 ### Descriptor Format
 
@@ -135,6 +141,8 @@ make clean         # Remove dist/ and wasm/ from all packages
 ## Testing
 
 - External-network registry tests should stay behind `AGENTOS_E2E_NETWORK=1`, probe host connectivity up front so CI can skip cleanly when the internet is unavailable, and retry the in-VM command itself for transient outbound failures instead of hard-failing on the first flaky request.
+- Cross-runtime kernel networking tests should prefer shipped first-party command artifacts from `native/target/wasm32-wasip1/release/commands` plus explicit `loopbackExemptPorts` host fixtures over optional `native/c` programs, unless the story is specifically about the patched-sysroot C command surface.
+- WASI command shims that poll child-process state must sleep through `wasi_ext::host_sleep_ms()` instead of `std::thread::sleep()`: the host import blocks inside the VM kernel, while `std::thread::sleep()` returns immediately on wasm32-wasip1 and turns retry loops like `timeout` into CPU-burning busy-waits.
 
 ## Native Source
 

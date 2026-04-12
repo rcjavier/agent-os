@@ -3,11 +3,14 @@
 // Requires Docker. Starts a sandbox-agent container, mounts its filesystem
 // at /sandbox, and registers the sandbox toolkit for running commands.
 
-import { AgentOs } from "@rivet-dev/agent-os";
+import { AgentOs } from "@rivet-dev/agent-os-core";
 import common from "@rivet-dev/agent-os-common";
+import {
+	createSandboxFs,
+	createSandboxToolkit,
+} from "@rivet-dev/agent-os-sandbox";
 import { SandboxAgent } from "sandbox-agent";
 import { docker } from "sandbox-agent/docker";
-import { createSandboxFs, createSandboxToolkit } from "@rivet-dev/agent-os-sandbox";
 
 // Start a Docker-backed sandbox.
 const sandbox = await SandboxAgent.start({

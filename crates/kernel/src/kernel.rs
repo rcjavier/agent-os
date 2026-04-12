@@ -1,19 +1,25 @@
 use crate::bridge::LifecycleState;
 use crate::command_registry::{CommandDriver, CommandRegistry};
 use crate::device_layer::{create_device_layer, DeviceLayer};
+use crate::dns::{
+    format_dns_resource, resolve_dns, DnsConfig, DnsLookupPolicy, DnsResolution,
+    DnsResolverErrorKind, HickoryDnsResolver, SharedDnsResolver,
+};
 use crate::fd_table::{
     FdEntry, FdStat, FdTableError, FdTableManager, FileDescription, FileLockManager,
     FileLockTarget, FlockOperation, ProcessFdTable, FILETYPE_CHARACTER_DEVICE, FILETYPE_DIRECTORY,
-    FILETYPE_PIPE, FILETYPE_REGULAR_FILE, FILETYPE_SYMBOLIC_LINK, O_APPEND, O_CREAT, O_EXCL,
-    O_NONBLOCK, O_TRUNC,
+    FILETYPE_PIPE, FILETYPE_REGULAR_FILE, FILETYPE_SYMBOLIC_LINK, F_DUPFD, O_APPEND, O_CREAT,
+    O_EXCL, O_NONBLOCK, O_TRUNC,
 };
 use crate::mount_table::{MountEntry, MountOptions, MountTable, MountedFileSystem};
 use crate::permissions::{
-    check_command_execution, FsOperation, PermissionError, PermissionedFileSystem, Permissions,
+    check_command_execution, check_network_access, FsOperation, NetworkOperation, PermissionError,
+    PermissionedFileSystem, Permissions,
 };
 use crate::pipe_manager::{PipeError, PipeManager};
 use crate::poll::{
-    PollEvents, PollFd, PollNotifier, PollResult, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT,
+    PollEvents, PollFd, PollNotifier, PollResult, PollTarget, PollTargetEntry, PollTargetResult,
+    POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT,
 };
 use crate::process_table::{
     DriverProcess, ProcessContext, ProcessExitCallback, ProcessInfo, ProcessStatus, ProcessTable,
@@ -26,7 +32,11 @@ use crate::resource_accounting::{
     ResourceSnapshot,
 };
 use crate::root_fs::{RootFileSystem, RootFilesystemError, RootFilesystemSnapshot};
-use crate::user::UserManager;
+use crate::socket_table::{
+    InetSocketAddress, ReceivedDatagram, SocketId, SocketRecord, SocketShutdown, SocketSpec,
+    SocketState, SocketTable, SocketTableError,
+};
+use crate::user::{ProcessIdentity, UserConfig, UserManager};
 use crate::vfs::{normalize_path, VfsError, VfsResult, VirtualFileSystem, VirtualStat};
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -96,7 +106,10 @@ pub struct KernelVmConfig {
     pub vm_id: String,
     pub env: BTreeMap<String, String>,
     pub cwd: String,
+    pub user: UserConfig,
     pub permissions: Permissions,
+    pub dns: DnsConfig,
+    pub dns_resolver: SharedDnsResolver,
     pub resources: ResourceLimits,
     pub zombie_ttl: Duration,
 }
@@ -107,7 +120,10 @@ impl KernelVmConfig {
             vm_id: vm_id.into(),
             env: BTreeMap::new(),
             cwd: String::from("/home/user"),
+            user: UserConfig::default(),
             permissions: Permissions::default(),
+            dns: DnsConfig::default(),
+            dns_resolver: Arc::new(HickoryDnsResolver),
             resources: ResourceLimits::default(),
             zombie_ttl: Duration::from_secs(60),
         }
@@ -117,6 +133,13 @@ impl KernelVmConfig {
 #[derive(Debug, Clone, Default)]
 pub struct SpawnOptions {
     pub requester_driver: Option<String>,
+    pub parent_pid: Option<u32>,
+    pub env: BTreeMap<String, String>,
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VirtualProcessOptions {
     pub parent_pid: Option<u32>,
     pub env: BTreeMap<String, String>,
     pub cwd: Option<String>,
@@ -241,6 +264,8 @@ pub struct KernelVm<F> {
     vm_id: String,
     filesystem: PermissionedFileSystem<DeviceLayer<F>>,
     permissions: Permissions,
+    dns: DnsConfig,
+    dns_resolver: SharedDnsResolver,
     env: BTreeMap<String, String>,
     cwd: String,
     commands: CommandRegistry,
@@ -248,6 +273,7 @@ pub struct KernelVm<F> {
     processes: ProcessTable,
     pipes: PipeManager,
     ptys: PtyManager,
+    sockets: SocketTable,
     poll_notifier: PollNotifier,
     users: UserManager,
     resources: ResourceAccountant,
@@ -261,6 +287,7 @@ fn cleanup_process_resources(
     file_locks: &FileLockManager,
     pipes: &PipeManager,
     ptys: &PtyManager,
+    sockets: &SocketTable,
     driver_pids: &Mutex<BTreeMap<String, BTreeSet<u32>>>,
     pid: u32,
 ) {
@@ -292,6 +319,8 @@ fn cleanup_process_resources(
     for (description, filetype) in cleanup {
         close_special_resource_if_needed(file_locks, pipes, ptys, &description, filetype);
     }
+
+    sockets.remove_all_for_pid(pid);
 
     let mut owners = lock_or_recover(driver_pids);
     for pids in owners.values_mut() {
@@ -339,6 +368,7 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
     pub fn new(filesystem: F, config: KernelVmConfig) -> Self {
         let vm_id = config.vm_id;
         let permissions = config.permissions.clone();
+        let users = UserManager::from_config(config.user);
         let process_table = ProcessTable::with_zombie_ttl(config.zombie_ttl);
         let process_table_for_pty = process_table.clone();
         let fd_tables = Arc::new(Mutex::new(FdTableManager::new()));
@@ -352,18 +382,21 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             }),
             poll_notifier.clone(),
         );
+        let sockets = SocketTable::new();
 
         let fd_tables_for_exit = Arc::clone(&fd_tables);
         let file_locks_for_exit = file_locks.clone();
         let driver_pids_for_exit = Arc::clone(&driver_pids);
         let pipes_for_exit = pipes.clone();
         let ptys_for_exit = ptys.clone();
+        let sockets_for_exit = sockets.clone();
         process_table.set_on_process_exit(Some(Arc::new(move |pid| {
             cleanup_process_resources(
                 fd_tables_for_exit.as_ref(),
                 &file_locks_for_exit,
                 &pipes_for_exit,
                 &ptys_for_exit,
+                &sockets_for_exit,
                 driver_pids_for_exit.as_ref(),
                 pid,
             );
@@ -377,6 +410,8 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
                 permissions.clone(),
             ),
             permissions,
+            dns: config.dns,
+            dns_resolver: config.dns_resolver,
             env: config.env,
             cwd: config.cwd,
             commands: CommandRegistry::new(),
@@ -384,8 +419,9 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             processes: process_table,
             pipes,
             ptys,
+            sockets,
             poll_notifier,
-            users: UserManager::new(),
+            users,
             resources: ResourceAccountant::new(config.resources),
             file_locks,
             driver_pids,
@@ -423,14 +459,85 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         &self.users
     }
 
+    pub fn process_identity(
+        &self,
+        requester_driver: &str,
+        pid: u32,
+    ) -> KernelResult<ProcessIdentity> {
+        self.assert_driver_owns(requester_driver, pid)?;
+        Ok(self
+            .processes
+            .get(pid)
+            .ok_or_else(|| KernelError::no_such_process(pid))?
+            .identity)
+    }
+
+    pub fn user_profile(&self) -> UserManager {
+        self.users.clone()
+    }
+
+    pub fn getuid(&self, requester_driver: &str, pid: u32) -> KernelResult<u32> {
+        Ok(self.process_identity(requester_driver, pid)?.uid)
+    }
+
+    pub fn getgid(&self, requester_driver: &str, pid: u32) -> KernelResult<u32> {
+        Ok(self.process_identity(requester_driver, pid)?.gid)
+    }
+
+    pub fn geteuid(&self, requester_driver: &str, pid: u32) -> KernelResult<u32> {
+        Ok(self.process_identity(requester_driver, pid)?.euid)
+    }
+
+    pub fn getegid(&self, requester_driver: &str, pid: u32) -> KernelResult<u32> {
+        Ok(self.process_identity(requester_driver, pid)?.egid)
+    }
+
+    pub fn getgroups(&self, requester_driver: &str, pid: u32) -> KernelResult<Vec<u32>> {
+        Ok(self
+            .process_identity(requester_driver, pid)?
+            .supplementary_gids)
+    }
+
+    pub fn getpwuid(&self, uid: u32) -> String {
+        self.users.getpwuid(uid)
+    }
+
+    pub fn getgrgid(&self, gid: u32) -> String {
+        self.users.getgrgid(gid)
+    }
+
     pub fn resource_snapshot(&self) -> ResourceSnapshot {
         let fd_tables = lock_or_recover(&self.fd_tables);
-        self.resources
-            .snapshot(&self.processes, &fd_tables, &self.pipes, &self.ptys)
+        self.resources.snapshot(
+            &self.processes,
+            &fd_tables,
+            &self.pipes,
+            &self.ptys,
+            &self.sockets,
+        )
     }
 
     pub fn resource_limits(&self) -> &ResourceLimits {
         self.resources.limits()
+    }
+
+    pub fn resolve_dns(
+        &self,
+        hostname: &str,
+        policy: DnsLookupPolicy,
+    ) -> KernelResult<DnsResolution> {
+        self.assert_not_terminated()?;
+        if matches!(policy, DnsLookupPolicy::CheckPermissions) {
+            let resource = format_dns_resource(hostname).map_err(map_dns_resolver_error)?;
+            check_network_access(
+                &self.vm_id,
+                &self.permissions,
+                NetworkOperation::Dns,
+                &resource,
+            )?;
+        }
+
+        resolve_dns(&self.dns, self.dns_resolver.as_ref(), hostname).map_err(map_dns_resolver_error)
     }
 
     pub fn register_driver(&mut self, driver: CommandDriver) -> KernelResult<()> {
@@ -869,10 +976,133 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         self.resources
             .check_process_spawn(&self.resource_snapshot(), inherited_fds)?;
 
+        self.register_process(
+            resolved.driver.name().to_owned(),
+            resolved.command,
+            resolved.args,
+            ProcessContext {
+                pid: 0,
+                ppid: options.parent_pid.unwrap_or(0),
+                env,
+                cwd,
+                umask: DEFAULT_PROCESS_UMASK,
+                fds: Default::default(),
+                identity: self.users.identity(),
+            },
+            options.requester_driver.as_deref(),
+        )
+    }
+
+    pub fn create_virtual_process(
+        &mut self,
+        requester_driver: &str,
+        driver: &str,
+        command: &str,
+        args: Vec<String>,
+        options: VirtualProcessOptions,
+    ) -> KernelResult<KernelProcessHandle> {
+        self.assert_not_terminated()?;
+        if let Some(parent_pid) = options.parent_pid {
+            self.assert_driver_owns(requester_driver, parent_pid)?;
+        }
+
+        let cwd = options.cwd.clone().unwrap_or_else(|| self.cwd.clone());
+        self.resources.check_process_argv_bytes(command, &args)?;
+        self.resources
+            .check_process_env_bytes(&self.env, &options.env)?;
+
+        let mut env = self.env.clone();
+        env.extend(options.env.clone());
+        check_command_execution(
+            &self.vm_id,
+            &self.permissions,
+            command,
+            &args,
+            Some(&cwd),
+            &env,
+        )?;
+
+        let inherited_fds = {
+            let tables = lock_or_recover(&self.fd_tables);
+            options
+                .parent_pid
+                .and_then(|pid| tables.get(pid).map(ProcessFdTable::len))
+                .unwrap_or(3)
+        };
+        self.resources
+            .check_process_spawn(&self.resource_snapshot(), inherited_fds)?;
+
+        self.register_process(
+            String::from(driver),
+            String::from(command),
+            args,
+            ProcessContext {
+                pid: 0,
+                ppid: options.parent_pid.unwrap_or(0),
+                env,
+                cwd,
+                umask: DEFAULT_PROCESS_UMASK,
+                fds: Default::default(),
+                identity: self.users.identity(),
+            },
+            Some(requester_driver),
+        )
+    }
+
+    pub fn read_process_stdin(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        length: usize,
+        timeout: Option<Duration>,
+    ) -> KernelResult<Option<Vec<u8>>> {
+        self.fd_read_with_timeout_result(requester_driver, pid, 0, length, timeout)
+    }
+
+    pub fn write_process_stdout(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        data: &[u8],
+    ) -> KernelResult<usize> {
+        self.fd_write(requester_driver, pid, 1, data)
+    }
+
+    pub fn write_process_stderr(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        data: &[u8],
+    ) -> KernelResult<usize> {
+        self.fd_write(requester_driver, pid, 2, data)
+    }
+
+    pub fn exit_process(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        exit_code: i32,
+    ) -> KernelResult<()> {
+        self.assert_driver_owns(requester_driver, pid)?;
+        self.processes.mark_exited(pid, exit_code);
+        Ok(())
+    }
+
+    fn register_process(
+        &mut self,
+        driver_name: String,
+        command: String,
+        args: Vec<String>,
+        mut ctx: ProcessContext,
+        requester_driver: Option<&str>,
+    ) -> KernelResult<KernelProcessHandle> {
         let pid = self.processes.allocate_pid();
+        ctx.pid = pid;
+
         {
             let mut tables = lock_or_recover(&self.fd_tables);
-            if let Some(parent_pid) = options.parent_pid {
+            if ctx.ppid != 0 {
+                let parent_pid = ctx.ppid;
                 tables.fork(parent_pid, pid);
             } else {
                 tables.create(pid);
@@ -880,27 +1110,22 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         }
 
         let process = Arc::new(StubDriverProcess::default());
-        let driver_name = resolved.driver.name().to_owned();
         self.processes.register(
             pid,
             driver_name.clone(),
-            resolved.command,
-            resolved.args,
-            ProcessContext {
-                pid,
-                ppid: options.parent_pid.unwrap_or(0),
-                env,
-                cwd,
-                umask: DEFAULT_PROCESS_UMASK,
-                fds: Default::default(),
-            },
+            command,
+            args,
+            ctx,
             process.clone(),
         );
 
         let mut owners = lock_or_recover(&self.driver_pids);
         owners.entry(driver_name.clone()).or_default().insert(pid);
-        if let Some(requester) = options.requester_driver {
-            owners.entry(requester).or_default().insert(pid);
+        if let Some(requester) = requester_driver {
+            owners
+                .entry(String::from(requester))
+                .or_default()
+                .insert(pid);
         }
 
         Ok(KernelProcessHandle {
@@ -959,6 +1184,473 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             .get_mut(pid)
             .ok_or_else(|| KernelError::no_such_process(pid))?;
         Ok(self.ptys.create_pty_fds(table)?)
+    }
+
+    pub fn socket_create(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        spec: SocketSpec,
+    ) -> KernelResult<SocketId> {
+        self.assert_not_terminated()?;
+        self.assert_driver_owns(requester_driver, pid)?;
+        self.resources
+            .check_socket_allocation(&self.resource_snapshot())?;
+        Ok(self.sockets.allocate(pid, spec).id())
+    }
+
+    pub fn socket_get(&self, socket_id: SocketId) -> Option<SocketRecord> {
+        self.sockets.get(socket_id)
+    }
+
+    pub fn socket_bind_inet(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        socket_id: SocketId,
+        address: InetSocketAddress,
+    ) -> KernelResult<()> {
+        self.assert_not_terminated()?;
+        self.assert_driver_owns(requester_driver, pid)?;
+        let existing = self
+            .sockets
+            .get(socket_id)
+            .ok_or_else(|| KernelError::new("ENOENT", format!("no such socket {socket_id}")))?;
+        if existing.owner_pid() != pid {
+            return Err(KernelError::permission_denied(format!(
+                "process {pid} does not own socket {socket_id}"
+            )));
+        }
+
+        self.sockets.bind_inet(socket_id, address)?;
+        self.poll_notifier.notify();
+        Ok(())
+    }
+
+    pub fn socket_bind_unix(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        socket_id: SocketId,
+        path: impl Into<String>,
+    ) -> KernelResult<()> {
+        self.assert_not_terminated()?;
+        self.assert_driver_owns(requester_driver, pid)?;
+        let existing = self
+            .sockets
+            .get(socket_id)
+            .ok_or_else(|| KernelError::new("ENOENT", format!("no such socket {socket_id}")))?;
+        if existing.owner_pid() != pid {
+            return Err(KernelError::permission_denied(format!(
+                "process {pid} does not own socket {socket_id}"
+            )));
+        }
+
+        self.sockets
+            .bind_unix(socket_id, normalize_path(&path.into()))?;
+        self.poll_notifier.notify();
+        Ok(())
+    }
+
+    pub fn socket_listen(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        socket_id: SocketId,
+        backlog: usize,
+    ) -> KernelResult<()> {
+        self.assert_not_terminated()?;
+        self.assert_driver_owns(requester_driver, pid)?;
+        let existing = self
+            .sockets
+            .get(socket_id)
+            .ok_or_else(|| KernelError::new("ENOENT", format!("no such socket {socket_id}")))?;
+        if existing.owner_pid() != pid {
+            return Err(KernelError::permission_denied(format!(
+                "process {pid} does not own socket {socket_id}"
+            )));
+        }
+
+        self.sockets.listen(socket_id, backlog)?;
+        self.poll_notifier.notify();
+        Ok(())
+    }
+
+    pub fn socket_queue_incoming_tcp_connection(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        listener_socket_id: SocketId,
+        peer_address: InetSocketAddress,
+    ) -> KernelResult<()> {
+        self.assert_not_terminated()?;
+        self.assert_driver_owns(requester_driver, pid)?;
+        let existing = self.sockets.get(listener_socket_id).ok_or_else(|| {
+            KernelError::new("ENOENT", format!("no such socket {listener_socket_id}"))
+        })?;
+        if existing.owner_pid() != pid {
+            return Err(KernelError::permission_denied(format!(
+                "process {pid} does not own socket {listener_socket_id}"
+            )));
+        }
+
+        self.sockets
+            .enqueue_incoming_tcp_connection(listener_socket_id, peer_address)?;
+        self.poll_notifier.notify();
+        Ok(())
+    }
+
+    pub fn socket_accept(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        listener_socket_id: SocketId,
+    ) -> KernelResult<SocketId> {
+        self.assert_not_terminated()?;
+        self.assert_driver_owns(requester_driver, pid)?;
+        let existing = self.sockets.get(listener_socket_id).ok_or_else(|| {
+            KernelError::new("ENOENT", format!("no such socket {listener_socket_id}"))
+        })?;
+        if existing.owner_pid() != pid {
+            return Err(KernelError::permission_denied(format!(
+                "process {pid} does not own socket {listener_socket_id}"
+            )));
+        }
+
+        let snapshot = self.resource_snapshot();
+        self.resources.check_socket_allocation(&snapshot)?;
+        self.resources.check_socket_state_transition(
+            &snapshot,
+            SocketState::Created,
+            SocketState::Connected,
+        )?;
+
+        let socket_id = self.sockets.accept(listener_socket_id)?.id();
+        self.poll_notifier.notify();
+        Ok(socket_id)
+    }
+
+    pub fn socket_connect_pair(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        socket_id: SocketId,
+        peer_socket_id: SocketId,
+    ) -> KernelResult<()> {
+        self.assert_not_terminated()?;
+        self.assert_driver_owns(requester_driver, pid)?;
+        let existing = self
+            .sockets
+            .get(socket_id)
+            .ok_or_else(|| KernelError::new("ENOENT", format!("no such socket {socket_id}")))?;
+        if existing.owner_pid() != pid {
+            return Err(KernelError::permission_denied(format!(
+                "process {pid} does not own socket {socket_id}"
+            )));
+        }
+
+        let peer = self.sockets.get(peer_socket_id).ok_or_else(|| {
+            KernelError::new("ENOENT", format!("no such socket {peer_socket_id}"))
+        })?;
+        self.assert_driver_owns(requester_driver, peer.owner_pid())?;
+
+        let mut snapshot = self.resource_snapshot();
+        for current_state in [existing.state(), peer.state()] {
+            self.resources.check_socket_state_transition(
+                &snapshot,
+                current_state,
+                SocketState::Connected,
+            )?;
+            if !current_state.counts_as_connection() {
+                snapshot.socket_connections = snapshot.socket_connections.saturating_add(1);
+            }
+        }
+
+        self.sockets.connect_pair(socket_id, peer_socket_id)?;
+        self.poll_notifier.notify();
+        Ok(())
+    }
+
+    pub fn socket_connect_unix(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        socket_id: SocketId,
+        target_path: impl Into<String>,
+    ) -> KernelResult<()> {
+        self.assert_not_terminated()?;
+        self.assert_driver_owns(requester_driver, pid)?;
+        let existing = self
+            .sockets
+            .get(socket_id)
+            .ok_or_else(|| KernelError::new("ENOENT", format!("no such socket {socket_id}")))?;
+        if existing.owner_pid() != pid {
+            return Err(KernelError::permission_denied(format!(
+                "process {pid} does not own socket {socket_id}"
+            )));
+        }
+
+        let target_path = normalize_path(&target_path.into());
+        self.sockets
+            .find_bound_unix_socket(&target_path)
+            .ok_or_else(|| {
+                KernelError::new(
+                    "ECONNREFUSED",
+                    format!("no listening socket bound at path {target_path}"),
+                )
+            })?;
+
+        let mut snapshot = self.resource_snapshot();
+        self.resources.check_socket_allocation(&snapshot)?;
+        for current_state in [existing.state(), SocketState::Created] {
+            self.resources.check_socket_state_transition(
+                &snapshot,
+                current_state,
+                SocketState::Connected,
+            )?;
+            if !current_state.counts_as_connection() {
+                snapshot.socket_connections = snapshot.socket_connections.saturating_add(1);
+            }
+        }
+
+        self.sockets
+            .connect_to_bound_unix_stream(socket_id, target_path)?;
+        self.poll_notifier.notify();
+        Ok(())
+    }
+
+    pub fn socket_connect_inet_loopback(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        socket_id: SocketId,
+        target_address: InetSocketAddress,
+    ) -> KernelResult<()> {
+        self.assert_not_terminated()?;
+        self.assert_driver_owns(requester_driver, pid)?;
+        let existing = self
+            .sockets
+            .get(socket_id)
+            .ok_or_else(|| KernelError::new("ENOENT", format!("no such socket {socket_id}")))?;
+        if existing.owner_pid() != pid {
+            return Err(KernelError::permission_denied(format!(
+                "process {pid} does not own socket {socket_id}"
+            )));
+        }
+
+        self.sockets
+            .find_bound_inet_socket(SocketSpec::tcp(), &target_address)
+            .ok_or_else(|| {
+                KernelError::new(
+                    "ECONNREFUSED",
+                    format!(
+                        "no listening socket bound at {}:{}",
+                        target_address.host(),
+                        target_address.port()
+                    ),
+                )
+            })?;
+
+        let mut snapshot = self.resource_snapshot();
+        self.resources.check_socket_allocation(&snapshot)?;
+        for current_state in [existing.state(), SocketState::Created] {
+            self.resources.check_socket_state_transition(
+                &snapshot,
+                current_state,
+                SocketState::Connected,
+            )?;
+            if !current_state.counts_as_connection() {
+                snapshot.socket_connections = snapshot.socket_connections.saturating_add(1);
+            }
+        }
+
+        self.sockets
+            .connect_to_bound_inet_stream(socket_id, target_address)?;
+        self.poll_notifier.notify();
+        Ok(())
+    }
+
+    pub fn socket_send_to_inet_loopback(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        socket_id: SocketId,
+        target_address: InetSocketAddress,
+        data: &[u8],
+    ) -> KernelResult<usize> {
+        self.assert_not_terminated()?;
+        self.assert_driver_owns(requester_driver, pid)?;
+        let existing = self
+            .sockets
+            .get(socket_id)
+            .ok_or_else(|| KernelError::new("ENOENT", format!("no such socket {socket_id}")))?;
+        if existing.owner_pid() != pid {
+            return Err(KernelError::permission_denied(format!(
+                "process {pid} does not own socket {socket_id}"
+            )));
+        }
+
+        let written = self
+            .sockets
+            .send_to_bound_udp_socket(socket_id, target_address, data)?;
+        if written > 0 {
+            self.poll_notifier.notify();
+        }
+        Ok(written)
+    }
+
+    pub fn socket_recv_datagram(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        socket_id: SocketId,
+        max_bytes: usize,
+    ) -> KernelResult<Option<ReceivedDatagram>> {
+        self.assert_not_terminated()?;
+        self.assert_driver_owns(requester_driver, pid)?;
+        let existing = self
+            .sockets
+            .get(socket_id)
+            .ok_or_else(|| KernelError::new("ENOENT", format!("no such socket {socket_id}")))?;
+        if existing.owner_pid() != pid {
+            return Err(KernelError::permission_denied(format!(
+                "process {pid} does not own socket {socket_id}"
+            )));
+        }
+
+        let result = self.sockets.recv_datagram(socket_id, max_bytes)?;
+        if result.is_some() {
+            self.poll_notifier.notify();
+        }
+        Ok(result)
+    }
+
+    pub fn socket_set_state(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        socket_id: SocketId,
+        state: SocketState,
+    ) -> KernelResult<()> {
+        self.assert_not_terminated()?;
+        self.assert_driver_owns(requester_driver, pid)?;
+        let existing = self
+            .sockets
+            .get(socket_id)
+            .ok_or_else(|| KernelError::new("ENOENT", format!("no such socket {socket_id}")))?;
+        if existing.owner_pid() != pid {
+            return Err(KernelError::permission_denied(format!(
+                "process {pid} does not own socket {socket_id}"
+            )));
+        }
+
+        self.resources.check_socket_state_transition(
+            &self.resource_snapshot(),
+            existing.state(),
+            state,
+        )?;
+        self.sockets.update_state(socket_id, state)?;
+        self.poll_notifier.notify();
+        Ok(())
+    }
+
+    pub fn socket_write(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        socket_id: SocketId,
+        data: &[u8],
+    ) -> KernelResult<usize> {
+        self.assert_not_terminated()?;
+        self.assert_driver_owns(requester_driver, pid)?;
+        let existing = self
+            .sockets
+            .get(socket_id)
+            .ok_or_else(|| KernelError::new("ENOENT", format!("no such socket {socket_id}")))?;
+        if existing.owner_pid() != pid {
+            return Err(KernelError::permission_denied(format!(
+                "process {pid} does not own socket {socket_id}"
+            )));
+        }
+
+        let written = self.sockets.write(socket_id, data)?;
+        if written > 0 {
+            self.poll_notifier.notify();
+        }
+        Ok(written)
+    }
+
+    pub fn socket_read(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        socket_id: SocketId,
+        max_bytes: usize,
+    ) -> KernelResult<Option<Vec<u8>>> {
+        self.assert_not_terminated()?;
+        self.assert_driver_owns(requester_driver, pid)?;
+        let existing = self
+            .sockets
+            .get(socket_id)
+            .ok_or_else(|| KernelError::new("ENOENT", format!("no such socket {socket_id}")))?;
+        if existing.owner_pid() != pid {
+            return Err(KernelError::permission_denied(format!(
+                "process {pid} does not own socket {socket_id}"
+            )));
+        }
+
+        let result = self.sockets.read(socket_id, max_bytes)?;
+        if result.is_some() {
+            self.poll_notifier.notify();
+        }
+        Ok(result)
+    }
+
+    pub fn socket_shutdown(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        socket_id: SocketId,
+        how: SocketShutdown,
+    ) -> KernelResult<()> {
+        self.assert_not_terminated()?;
+        self.assert_driver_owns(requester_driver, pid)?;
+        let existing = self
+            .sockets
+            .get(socket_id)
+            .ok_or_else(|| KernelError::new("ENOENT", format!("no such socket {socket_id}")))?;
+        if existing.owner_pid() != pid {
+            return Err(KernelError::permission_denied(format!(
+                "process {pid} does not own socket {socket_id}"
+            )));
+        }
+
+        self.sockets.shutdown(socket_id, how)?;
+        self.poll_notifier.notify();
+        Ok(())
+    }
+
+    pub fn socket_close(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        socket_id: SocketId,
+    ) -> KernelResult<()> {
+        self.assert_not_terminated()?;
+        self.assert_driver_owns(requester_driver, pid)?;
+        let existing = self
+            .sockets
+            .get(socket_id)
+            .ok_or_else(|| KernelError::new("ENOENT", format!("no such socket {socket_id}")))?;
+        if existing.owner_pid() != pid {
+            return Err(KernelError::permission_denied(format!(
+                "process {pid} does not own socket {socket_id}"
+            )));
+        }
+
+        self.sockets.remove(socket_id)?;
+        self.poll_notifier.notify();
+        Ok(())
     }
 
     pub fn fd_open(
@@ -1045,6 +1737,19 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         fd: u32,
         length: usize,
     ) -> KernelResult<Vec<u8>> {
+        Ok(self
+            .fd_read_with_timeout_result(requester_driver, pid, fd, length, None)?
+            .unwrap_or_default())
+    }
+
+    pub fn fd_read_with_timeout_result(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        fd: u32,
+        length: usize,
+        timeout: Option<Duration>,
+    ) -> KernelResult<Option<Vec<u8>>> {
         self.assert_driver_owns(requester_driver, pid)?;
         let entry = {
             let tables = lock_or_recover(&self.fd_tables);
@@ -1056,33 +1761,27 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         };
 
         if self.pipes.is_pipe(entry.description.id()) {
-            return Ok(self
-                .pipes
-                .read_with_timeout(
-                    entry.description.id(),
-                    length,
-                    if entry.status_flags & O_NONBLOCK != 0 {
-                        Some(Duration::ZERO)
-                    } else {
-                        self.blocking_read_timeout()
-                    },
-                )?
-                .unwrap_or_default());
+            return Ok(self.pipes.read_with_timeout(
+                entry.description.id(),
+                length,
+                if entry.status_flags & O_NONBLOCK != 0 {
+                    Some(Duration::ZERO)
+                } else {
+                    timeout.or_else(|| self.blocking_read_timeout())
+                },
+            )?);
         }
 
         if self.ptys.is_pty(entry.description.id()) {
-            return Ok(self
-                .ptys
-                .read_with_timeout(
-                    entry.description.id(),
-                    length,
-                    if entry.status_flags & O_NONBLOCK != 0 {
-                        Some(Duration::ZERO)
-                    } else {
-                        self.blocking_read_timeout()
-                    },
-                )?
-                .unwrap_or_default());
+            return Ok(self.ptys.read_with_timeout(
+                entry.description.id(),
+                length,
+                if entry.status_flags & O_NONBLOCK != 0 {
+                    Some(Duration::ZERO)
+                } else {
+                    timeout.or_else(|| self.blocking_read_timeout())
+                },
+            )?);
         }
 
         if is_proc_path(entry.description.path()) {
@@ -1100,7 +1799,7 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
                     .cursor()
                     .saturating_add(chunk.len() as u64),
             );
-            return Ok(chunk);
+            return Ok(Some(chunk));
         }
 
         let cursor = entry.description.cursor();
@@ -1113,7 +1812,7 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         entry
             .description
             .set_cursor(cursor.saturating_add(bytes.len() as u64));
-        Ok(bytes)
+        Ok(Some(bytes))
     }
 
     pub fn fd_write(
@@ -1195,9 +1894,38 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         &self,
         requester_driver: &str,
         pid: u32,
-        mut fds: Vec<PollFd>,
+        fds: Vec<PollFd>,
         timeout_ms: i32,
     ) -> KernelResult<PollResult> {
+        let targets = fds
+            .into_iter()
+            .map(|poll_fd| PollTargetEntry::fd(poll_fd.fd, poll_fd.events))
+            .collect::<Vec<_>>();
+        let result = self.poll_targets(requester_driver, pid, targets, timeout_ms)?;
+        Ok(PollResult {
+            ready_count: result.ready_count,
+            fds: result
+                .targets
+                .into_iter()
+                .map(|target| match target.target {
+                    PollTarget::Fd(fd) => PollFd {
+                        fd,
+                        events: target.events,
+                        revents: target.revents,
+                    },
+                    PollTarget::Socket(_) => unreachable!("fd poll should only include fd targets"),
+                })
+                .collect(),
+        })
+    }
+
+    pub fn poll_targets(
+        &self,
+        requester_driver: &str,
+        pid: u32,
+        mut targets: Vec<PollTargetEntry>,
+        timeout_ms: i32,
+    ) -> KernelResult<PollTargetResult> {
         self.assert_driver_owns(requester_driver, pid)?;
         if timeout_ms < -1 {
             return Err(KernelError::new(
@@ -1215,21 +1943,30 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
 
         loop {
             let observed_generation = self.poll_notifier.snapshot();
-            let ready_count = self.populate_poll_revents(pid, &mut fds)?;
+            let ready_count = self.populate_poll_target_revents(pid, &mut targets)?;
             if ready_count > 0 || matches!(timeout, Some(duration) if duration.is_zero()) {
-                return Ok(PollResult { ready_count, fds });
+                return Ok(PollTargetResult {
+                    ready_count,
+                    targets,
+                });
             }
 
             let remaining = deadline.map(|target| target.saturating_duration_since(Instant::now()));
             if matches!(remaining, Some(duration) if duration.is_zero()) {
-                return Ok(PollResult { ready_count, fds });
+                return Ok(PollTargetResult {
+                    ready_count,
+                    targets,
+                });
             }
 
             if !self
                 .poll_notifier
                 .wait_for_change(observed_generation, remaining)
             {
-                return Ok(PollResult { ready_count, fds });
+                return Ok(PollTargetResult {
+                    ready_count,
+                    targets,
+                });
             }
         }
     }
@@ -1421,6 +2158,26 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         };
         self.close_special_resource_if_needed(&description, filetype);
         Ok(())
+    }
+
+    pub fn fd_fcntl(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        fd: u32,
+        command: u32,
+        arg: u32,
+    ) -> KernelResult<u32> {
+        self.assert_driver_owns(requester_driver, pid)?;
+        let mut tables = lock_or_recover(&self.fd_tables);
+        let table = tables
+            .get_mut(pid)
+            .ok_or_else(|| KernelError::no_such_process(pid))?;
+        let result = table.fcntl(fd, command, arg)?;
+        if command == F_DUPFD {
+            self.poll_notifier.notify();
+        }
+        Ok(result)
     }
 
     pub fn fd_flock(
@@ -1703,30 +2460,58 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         ))
     }
 
-    fn populate_poll_revents(&self, pid: u32, fds: &mut [PollFd]) -> KernelResult<usize> {
-        let entries = {
-            let tables = lock_or_recover(&self.fd_tables);
-            let table = tables
-                .get(pid)
-                .ok_or_else(|| KernelError::no_such_process(pid))?;
-            fds.iter()
-                .map(|poll_fd| table.get(poll_fd.fd).cloned())
-                .collect::<Vec<_>>()
-        };
-
+    fn populate_poll_target_revents(
+        &self,
+        pid: u32,
+        targets: &mut [PollTargetEntry],
+    ) -> KernelResult<usize> {
         let mut ready_count = 0;
-        for (poll_fd, entry) in fds.iter_mut().zip(entries.into_iter()) {
-            poll_fd.revents = if let Some(entry) = entry {
-                self.poll_entry(&entry, poll_fd.events)?
-            } else {
-                POLLNVAL
-            };
-            if !poll_fd.revents.is_empty() {
+        for target in targets.iter_mut() {
+            target.revents = self.poll_target_entry(pid, target.target, target.events)?;
+            if !target.revents.is_empty() {
                 ready_count += 1;
             }
         }
 
         Ok(ready_count)
+    }
+
+    fn poll_target_entry(
+        &self,
+        pid: u32,
+        target: PollTarget,
+        requested: PollEvents,
+    ) -> KernelResult<PollEvents> {
+        match target {
+            PollTarget::Fd(fd) => {
+                let entry = {
+                    let tables = lock_or_recover(&self.fd_tables);
+                    tables
+                        .get(pid)
+                        .ok_or_else(|| KernelError::no_such_process(pid))?
+                        .get(fd)
+                        .cloned()
+                };
+                if let Some(entry) = entry {
+                    self.poll_entry(&entry, requested)
+                } else {
+                    Ok(POLLNVAL)
+                }
+            }
+            PollTarget::Socket(socket_id) => {
+                let socket = self.sockets.get(socket_id);
+                if let Some(socket) = socket {
+                    if socket.owner_pid() != pid {
+                        return Err(KernelError::permission_denied(format!(
+                            "process {pid} does not own socket {socket_id}"
+                        )));
+                    }
+                    Ok(self.sockets.poll(socket_id, requested)?)
+                } else {
+                    Ok(POLLNVAL)
+                }
+            }
+        }
     }
 
     fn poll_entry(
@@ -1806,6 +2591,7 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             &self.file_locks,
             &self.pipes,
             &self.ptys,
+            &self.sockets,
             self.driver_pids.as_ref(),
             pid,
         );
@@ -1880,7 +2666,7 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
 
     fn resolve_registered_command_path(&self, path: &str) -> Option<String> {
         let normalized = normalize_path(path);
-        for prefix in ["/bin/", "/usr/bin/"] {
+        for prefix in ["/bin/", "/usr/bin/", "/usr/local/bin/"] {
             let Some(name) = normalized.strip_prefix(prefix) else {
                 continue;
             };
@@ -1888,6 +2674,16 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
                 return Some(name.to_owned());
             }
         }
+
+        if let Some(name) = normalized
+            .strip_prefix("/__agentos/commands/")
+            .and_then(|suffix| suffix.rsplit('/').next())
+        {
+            if !name.is_empty() && !name.contains('/') && self.commands.resolve(name).is_some() {
+                return Some(name.to_owned());
+            }
+        }
+
         None
     }
 
@@ -2413,7 +3209,12 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
     }
 
     fn filesystem_usage(&mut self) -> KernelResult<FileSystemUsage> {
-        Ok(measure_filesystem_usage(self.raw_filesystem_mut())?)
+        let filesystem = self.raw_filesystem_mut();
+        let filesystem_any = filesystem as &mut dyn Any;
+        if let Some(mount_table) = filesystem_any.downcast_mut::<MountTable>() {
+            return Ok(mount_table.root_usage()?);
+        }
+        Ok(measure_filesystem_usage(filesystem)?)
     }
 
     fn storage_stat(&mut self, path: &str) -> KernelResult<Option<VirtualStat>> {
@@ -2845,10 +3646,24 @@ impl From<ResourceError> for KernelError {
     }
 }
 
+impl From<SocketTableError> for KernelError {
+    fn from(error: SocketTableError) -> Self {
+        map_error(error.code(), error.to_string())
+    }
+}
+
 impl From<RootFilesystemError> for KernelError {
     fn from(error: RootFilesystemError) -> Self {
         map_error("EINVAL", error.to_string())
     }
+}
+
+fn map_dns_resolver_error(error: crate::dns::DnsResolverError) -> KernelError {
+    let code = match error.kind() {
+        DnsResolverErrorKind::InvalidInput => "EINVAL",
+        DnsResolverErrorKind::LookupFailed => "EHOSTUNREACH",
+    };
+    map_error(code, error.to_string())
 }
 
 fn map_error(code: &'static str, message: String) -> KernelError {
@@ -3134,6 +3949,7 @@ mod tests {
                 cwd: String::from("/"),
                 umask: DEFAULT_PROCESS_UMASK,
                 fds: Default::default(),
+                identity: ProcessIdentity::default(),
             },
             Arc::new(StubDriverProcess::default()),
         );
@@ -3151,6 +3967,7 @@ mod tests {
                 cwd: String::from("/"),
                 umask: DEFAULT_PROCESS_UMASK,
                 fds: Default::default(),
+                identity: ProcessIdentity::default(),
             },
             Arc::new(StubDriverProcess::default()),
         );

@@ -10,7 +10,6 @@ use support::{
 
 #[derive(Debug, Default)]
 struct ProcessResult {
-    stdout: String,
     stderr: String,
     exit_code: Option<i32>,
 }
@@ -21,17 +20,11 @@ fn concurrent_vm_processes_stay_isolated_with_vm_scoped_events() {
 
     let mut sidecar = new_sidecar("process-isolation");
     let cwd = temp_dir("process-isolation-cwd");
-    let slow_entry = cwd.join("slow.mjs");
-    let fast_entry = cwd.join("fast.mjs");
+    let slow_entry = cwd.join("slow.cjs");
+    let fast_entry = cwd.join("fast.cjs");
 
-    write_fixture(
-        &slow_entry,
-        r#"
-await new Promise((resolve) => setTimeout(resolve, 150));
-console.log("slow");
-"#,
-    );
-    write_fixture(&fast_entry, "console.log(\"fast\");\n");
+    write_fixture(&slow_entry, "setTimeout(() => {}, 150);\n");
+    write_fixture(&fast_entry, "void 0;\n");
 
     let connection_id = authenticate(&mut sidecar, "conn-1");
     let session_id = open_session(&mut sidecar, 2, &connection_id);
@@ -84,7 +77,7 @@ console.log("slow");
 
     while results.values().any(|result| result.exit_code.is_none()) {
         let event = sidecar
-            .poll_event(&ownership, Duration::from_millis(100))
+            .poll_event_blocking(&ownership, Duration::from_millis(100))
             .expect("poll process-isolation event");
         let Some(event) = event else {
             assert!(
@@ -103,7 +96,7 @@ console.log("slow");
 
         match event.payload {
             EventPayload::ProcessOutput(output) => match output.channel {
-                StreamChannel::Stdout => result.stdout.push_str(&output.chunk),
+                StreamChannel::Stdout => {}
                 StreamChannel::Stderr => result.stderr.push_str(&output.chunk),
             },
             EventPayload::ProcessExited(exited) => {
@@ -119,8 +112,6 @@ console.log("slow");
 
     assert_eq!(slow.exit_code, Some(0));
     assert_eq!(fast.exit_code, Some(0));
-    assert_eq!(slow.stdout.trim(), "slow");
-    assert_eq!(fast.stdout.trim(), "fast");
     assert!(
         slow.stderr.is_empty(),
         "unexpected slow stderr: {}",

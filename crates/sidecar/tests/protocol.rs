@@ -1,13 +1,20 @@
 use agent_os_sidecar::protocol::{
     validate_frame, AuthenticateRequest, AuthenticatedResponse, CreateVmRequest, EventFrame,
-    GetZombieTimerCountRequest, GuestRuntimeKind, NativeFrameCodec, OpenSessionRequest,
-    OwnershipScope, PermissionDescriptor, PermissionMode, ProcessStartedResponse,
-    ProjectedModuleDescriptor, ProtocolCodecError, ProtocolFrame, RequestFrame, RequestPayload,
-    ResponseFrame, ResponsePayload, ResponseTracker, ResponseTrackerError, SidecarPlacement,
-    SoftwareDescriptor, StructuredEvent, VmLifecycleEvent, VmLifecycleState, WriteStdinRequest,
+    GetZombieTimerCountRequest, GuestRuntimeKind, NativeFrameCodec, NativePayloadCodec,
+    OpenSessionRequest, OwnershipScope, PatternPermissionScope, PermissionMode, PermissionsPolicy,
+    ProcessStartedResponse, ProjectedModuleDescriptor, ProtocolCodecError, ProtocolFrame,
+    RequestFrame, RequestPayload, ResponseFrame, ResponsePayload, ResponseTracker,
+    ResponseTrackerError, RootFilesystemDescriptor, RootFilesystemEntry, RootFilesystemEntryKind,
+    RootFilesystemLowerDescriptor, SidecarPlacement, SidecarRequestFrame, SidecarRequestPayload,
+    SidecarResponseFrame, SidecarResponsePayload, SidecarResponseTracker,
+    SidecarResponseTrackerError, SoftwareDescriptor, StructuredEvent, ToolInvocationRequest,
+    ToolInvocationResultResponse, VmLifecycleEvent, VmLifecycleState, WriteStdinRequest,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
+
+const BARE_SCHEMA_V1: &str = include_str!("../protocol/agent_os_sidecar_v1.bare");
+const BARE_MIGRATION_PLAN: &str = include_str!("../protocol/README.md");
 
 #[test]
 fn guest_runtime_kind_serializes_python_in_snake_case() {
@@ -80,6 +87,179 @@ fn codec_round_trips_vm_scoped_events_and_responses() {
 }
 
 #[test]
+fn codec_round_trips_sidecar_request_and_response_frames() {
+    let codec = NativeFrameCodec::default();
+    let request = ProtocolFrame::SidecarRequest(SidecarRequestFrame::new(
+        -7,
+        OwnershipScope::vm("conn-1", "session-1", "vm-1"),
+        SidecarRequestPayload::ToolInvocation(ToolInvocationRequest {
+            invocation_id: "invoke-1".to_string(),
+            tool_key: "toolkit:tool".to_string(),
+            input: json!({ "prompt": "ping" }),
+            timeout_ms: 5_000,
+        }),
+    ));
+    let response = ProtocolFrame::SidecarResponse(SidecarResponseFrame::new(
+        -7,
+        OwnershipScope::vm("conn-1", "session-1", "vm-1"),
+        SidecarResponsePayload::ToolInvocationResult(ToolInvocationResultResponse {
+            invocation_id: "invoke-1".to_string(),
+            result: Some(json!({ "ok": true })),
+            error: None,
+        }),
+    ));
+
+    assert_eq!(
+        codec.decode(&codec.encode(&request).unwrap()).unwrap(),
+        request
+    );
+    assert_eq!(
+        codec.decode(&codec.encode(&response).unwrap()).unwrap(),
+        response
+    );
+}
+
+#[test]
+fn bare_codec_round_trips_frames_with_json_utf8_fields() {
+    let codec = NativeFrameCodec::with_payload_codec(1024 * 1024, NativePayloadCodec::Bare);
+    let frame = ProtocolFrame::SidecarRequest(SidecarRequestFrame::new(
+        -12,
+        OwnershipScope::vm("conn-1", "session-1", "vm-1"),
+        SidecarRequestPayload::ToolInvocation(ToolInvocationRequest {
+            invocation_id: "invoke-12".to_string(),
+            tool_key: "toolkit:search".to_string(),
+            input: json!({
+                "cursor": "abc123",
+                "includeSchema": true,
+            }),
+            timeout_ms: 2_000,
+        }),
+    ));
+
+    let encoded = codec.encode(&frame).expect("encode bare frame");
+    assert_eq!(
+        encoded[4], 4,
+        "BARE sidecar_request frames should start with tag 4"
+    );
+
+    let decoded = codec.decode(&encoded).expect("decode bare frame");
+    assert_eq!(decoded, frame);
+}
+
+#[test]
+fn bare_codec_round_trips_authenticate_request_frames() {
+    let codec = NativeFrameCodec::with_payload_codec(1024 * 1024, NativePayloadCodec::Bare);
+    let frame = ProtocolFrame::Request(RequestFrame::new(
+        1,
+        OwnershipScope::connection("client-hint"),
+        RequestPayload::Authenticate(AuthenticateRequest {
+            client_name: "packages-core-vitest".to_string(),
+            auth_token: "packages-core-vitest-token".to_string(),
+        }),
+    ));
+
+    let encoded = codec
+        .encode(&frame)
+        .expect("encode bare authenticate request");
+    let decoded = codec
+        .decode(&encoded)
+        .expect("decode bare authenticate request");
+
+    assert_eq!(decoded, frame);
+}
+
+#[test]
+fn bare_codec_round_trips_root_filesystem_lower_descriptors() {
+    let lower = RootFilesystemLowerDescriptor::BundledBaseFilesystem;
+    let encoded = serde_bare::to_vec(&lower).expect("encode bare root filesystem lower");
+    let decoded: RootFilesystemLowerDescriptor =
+        serde_bare::from_slice(&encoded).expect("decode bare root filesystem lower");
+
+    assert_eq!(decoded, lower);
+}
+
+#[test]
+fn bare_codec_round_trips_root_filesystem_descriptors_with_snapshot_lowers() {
+    let descriptor = RootFilesystemDescriptor {
+        disable_default_base_layer: true,
+        lowers: vec![
+            RootFilesystemLowerDescriptor::Snapshot {
+                entries: vec![RootFilesystemEntry {
+                    path: String::from("/workspace"),
+                    kind: RootFilesystemEntryKind::Directory,
+                    ..Default::default()
+                }],
+            },
+            RootFilesystemLowerDescriptor::BundledBaseFilesystem,
+        ],
+        ..Default::default()
+    };
+
+    let encoded = serde_bare::to_vec(&descriptor).expect("encode bare root filesystem descriptor");
+    let decoded: RootFilesystemDescriptor =
+        serde_bare::from_slice(&encoded).expect("decode bare root filesystem descriptor");
+
+    assert_eq!(decoded, descriptor);
+}
+
+#[test]
+fn bare_codec_round_trips_create_vm_requests_with_snapshot_lowers() {
+    let codec = NativeFrameCodec::with_payload_codec(1024 * 1024, NativePayloadCodec::Bare);
+    let frame = ProtocolFrame::Request(RequestFrame::new(
+        2,
+        OwnershipScope::session("conn-1", "session-1"),
+        RequestPayload::CreateVm(CreateVmRequest {
+            runtime: GuestRuntimeKind::JavaScript,
+            metadata: BTreeMap::from([(String::from("cwd"), String::from("/workspace"))]),
+            root_filesystem: RootFilesystemDescriptor {
+                disable_default_base_layer: true,
+                lowers: vec![
+                    RootFilesystemLowerDescriptor::Snapshot {
+                        entries: vec![RootFilesystemEntry {
+                            path: String::from("/workspace"),
+                            kind: RootFilesystemEntryKind::Directory,
+                            ..Default::default()
+                        }],
+                    },
+                    RootFilesystemLowerDescriptor::BundledBaseFilesystem,
+                ],
+                ..Default::default()
+            },
+            permissions: None,
+        }),
+    ));
+
+    let encoded = codec.encode(&frame).expect("encode bare create_vm request");
+    let decoded = codec
+        .decode(&encoded)
+        .expect("decode bare create_vm request");
+
+    assert_eq!(decoded, frame);
+}
+
+#[test]
+fn codec_auto_detects_json_and_bare_payloads() {
+    let json_codec = NativeFrameCodec::default();
+    let bare_codec = NativeFrameCodec::with_payload_codec(1024 * 1024, NativePayloadCodec::Bare);
+    let frame = ProtocolFrame::SidecarRequest(SidecarRequestFrame::new(
+        -11,
+        OwnershipScope::vm("conn-1", "session-1", "vm-1"),
+        SidecarRequestPayload::ToolInvocation(ToolInvocationRequest {
+            invocation_id: "invoke-1".to_string(),
+            tool_key: "toolkit:search".to_string(),
+            input: json!({ "query": "ping" }),
+            timeout_ms: 2_000,
+        }),
+    ));
+
+    let json_encoded = json_codec.encode(&frame).expect("encode json frame");
+    let bare_encoded = bare_codec.encode(&frame).expect("encode bare frame");
+
+    assert_eq!(json_codec.decode(&json_encoded).unwrap(), frame);
+    assert_eq!(json_codec.decode(&bare_encoded).unwrap(), frame);
+}
+
+#[test]
 fn codec_rejects_invalid_ownership_binding() {
     let frame = ProtocolFrame::Request(RequestFrame::new(
         9,
@@ -88,7 +268,7 @@ fn codec_rejects_invalid_ownership_binding() {
             runtime: GuestRuntimeKind::JavaScript,
             metadata: BTreeMap::new(),
             root_filesystem: Default::default(),
-            permissions: Vec::new(),
+            permissions: None,
         }),
     ));
 
@@ -129,7 +309,7 @@ fn response_tracker_enforces_request_response_correlation_and_duplicate_hardenin
             runtime: GuestRuntimeKind::JavaScript,
             metadata: BTreeMap::new(),
             root_filesystem: Default::default(),
-            permissions: Vec::new(),
+            permissions: None,
         }),
     );
     tracker
@@ -171,7 +351,7 @@ fn response_tracker_rejects_kind_and_ownership_mismatches() {
             runtime: GuestRuntimeKind::WebAssembly,
             metadata: BTreeMap::from([(String::from("runtime"), String::from("wasm"))]),
             root_filesystem: Default::default(),
-            permissions: Vec::new(),
+            permissions: None,
         }),
     );
     tracker
@@ -243,7 +423,7 @@ fn response_tracker_accepts_zombie_timer_count_responses() {
 fn response_tracker_caps_completed_entries() {
     let mut tracker = ResponseTracker::with_completed_cap(3);
 
-    for request_id in 0..10 {
+    for request_id in 1..=10 {
         let request = RequestFrame::new(
             request_id,
             OwnershipScope::connection("conn-1"),
@@ -277,6 +457,87 @@ fn response_tracker_caps_completed_entries() {
 }
 
 #[test]
+fn sidecar_response_tracker_enforces_request_response_correlation() {
+    let mut tracker = SidecarResponseTracker::default();
+    let request = SidecarRequestFrame::new(
+        -9,
+        OwnershipScope::vm("conn-1", "session-1", "vm-1"),
+        SidecarRequestPayload::ToolInvocation(ToolInvocationRequest {
+            invocation_id: "invoke-1".to_string(),
+            tool_key: "toolkit:tool".to_string(),
+            input: json!({ "value": 1 }),
+            timeout_ms: 1_000,
+        }),
+    );
+    tracker
+        .register_request(&request)
+        .expect("register sidecar request");
+
+    tracker
+        .accept_response(&SidecarResponseFrame::new(
+            -9,
+            OwnershipScope::vm("conn-1", "session-1", "vm-1"),
+            SidecarResponsePayload::ToolInvocationResult(ToolInvocationResultResponse {
+                invocation_id: "invoke-1".to_string(),
+                result: Some(json!({ "ok": true })),
+                error: None,
+            }),
+        ))
+        .expect("accept sidecar response");
+
+    assert_eq!(
+        tracker.accept_response(&SidecarResponseFrame::new(
+            -9,
+            OwnershipScope::vm("conn-1", "session-1", "vm-1"),
+            SidecarResponsePayload::ToolInvocationResult(ToolInvocationResultResponse {
+                invocation_id: "invoke-1".to_string(),
+                result: None,
+                error: Some("duplicate".to_string()),
+            }),
+        )),
+        Err(SidecarResponseTrackerError::DuplicateResponse { request_id: -9 }),
+    );
+}
+
+#[test]
+fn codec_rejects_request_id_direction_mismatches() {
+    let host_response = ProtocolFrame::Response(ResponseFrame::new(
+        -1,
+        OwnershipScope::connection("conn-1"),
+        ResponsePayload::Authenticated(AuthenticatedResponse {
+            sidecar_id: "sidecar-1".to_string(),
+            connection_id: "conn-1".to_string(),
+            max_frame_bytes: 1024,
+        }),
+    ));
+    assert_eq!(
+        validate_frame(&host_response),
+        Err(ProtocolCodecError::InvalidRequestDirection {
+            request_id: -1,
+            expected: agent_os_sidecar::protocol::RequestDirection::Host,
+        }),
+    );
+
+    let sidecar_request = ProtocolFrame::SidecarRequest(SidecarRequestFrame::new(
+        1,
+        OwnershipScope::vm("conn-1", "session-1", "vm-1"),
+        SidecarRequestPayload::ToolInvocation(ToolInvocationRequest {
+            invocation_id: "invoke-2".to_string(),
+            tool_key: "toolkit:tool".to_string(),
+            input: json!({}),
+            timeout_ms: 100,
+        }),
+    ));
+    assert_eq!(
+        validate_frame(&sidecar_request),
+        Err(ProtocolCodecError::InvalidRequestDirection {
+            request_id: 1,
+            expected: agent_os_sidecar::protocol::RequestDirection::Sidecar,
+        }),
+    );
+}
+
+#[test]
 fn schema_supports_configuration_and_structured_events() {
     let frame = ProtocolFrame::Request(RequestFrame::new(
         23,
@@ -297,16 +558,21 @@ fn schema_supports_configuration_and_structured_events() {
                 package_name: "@rivet-dev/agent-os".to_string(),
                 root: "/pkg".to_string(),
             }],
-            permissions: vec![PermissionDescriptor {
-                capability: "network".to_string(),
-                mode: PermissionMode::Ask,
-            }],
+            permissions: Some(PermissionsPolicy {
+                fs: None,
+                network: Some(PatternPermissionScope::Mode(PermissionMode::Ask)),
+                child_process: None,
+                env: None,
+            }),
+            module_access_cwd: None,
             instructions: vec!["keep timing mitigation enabled".to_string()],
             projected_modules: vec![ProjectedModuleDescriptor {
                 package_name: "workspace".to_string(),
                 entrypoint: "/workspace/index.ts".to_string(),
             }],
             command_permissions: BTreeMap::new(),
+            allowed_node_builtins: Vec::new(),
+            loopback_exempt_ports: Vec::new(),
         }),
     ));
 
@@ -320,4 +586,114 @@ fn schema_supports_configuration_and_structured_events() {
         }),
     );
     validate_frame(&ProtocolFrame::Event(event)).expect("structured event is valid");
+}
+
+#[test]
+fn checked_in_bare_schema_covers_all_top_level_frame_payload_types() {
+    for type_name in [
+        "type ProtocolFrame union {",
+        "type RequestPayload union {",
+        "type ResponsePayload union {",
+        "type EventPayload union {",
+        "type SidecarRequestPayload union {",
+        "type SidecarResponsePayload union {",
+        "AuthenticateRequest",
+        "OpenSessionRequest",
+        "CreateVmRequest",
+        "CreateSessionRequest",
+        "SessionRequest",
+        "GetSessionStateRequest",
+        "CloseAgentSessionRequest",
+        "DisposeVmRequest",
+        "BootstrapRootFilesystemRequest",
+        "ConfigureVmRequest",
+        "RegisterToolkitRequest",
+        "CreateLayerRequest",
+        "SealLayerRequest",
+        "ImportSnapshotRequest",
+        "ExportSnapshotRequest",
+        "CreateOverlayRequest",
+        "GuestFilesystemCallRequest",
+        "SnapshotRootFilesystemRequest",
+        "ExecuteRequest",
+        "WriteStdinRequest",
+        "CloseStdinRequest",
+        "KillProcessRequest",
+        "GetProcessSnapshotRequest",
+        "FindListenerRequest",
+        "FindBoundUdpRequest",
+        "GetSignalStateRequest",
+        "GetZombieTimerCountRequest",
+        "HostFilesystemCallRequest",
+        "PermissionRequest",
+        "PersistenceLoadRequest",
+        "PersistenceFlushRequest",
+        "AuthenticatedResponse",
+        "SessionOpenedResponse",
+        "VmCreatedResponse",
+        "SessionCreatedResponse",
+        "SessionRpcResponse",
+        "SessionStateResponse",
+        "AgentSessionClosedResponse",
+        "VmDisposedResponse",
+        "RootFilesystemBootstrappedResponse",
+        "VmConfiguredResponse",
+        "ToolkitRegisteredResponse",
+        "LayerCreatedResponse",
+        "LayerSealedResponse",
+        "SnapshotImportedResponse",
+        "SnapshotExportedResponse",
+        "OverlayCreatedResponse",
+        "GuestFilesystemResultResponse",
+        "RootFilesystemSnapshotResponse",
+        "ProcessStartedResponse",
+        "StdinWrittenResponse",
+        "StdinClosedResponse",
+        "ProcessKilledResponse",
+        "ProcessSnapshotResponse",
+        "ListenerSnapshotResponse",
+        "BoundUdpSnapshotResponse",
+        "SignalStateResponse",
+        "ZombieTimerCountResponse",
+        "FilesystemResultResponse",
+        "PermissionDecisionResponse",
+        "PersistenceStateResponse",
+        "PersistenceFlushedResponse",
+        "RejectedResponse",
+        "VmLifecycleEvent",
+        "ProcessOutputEvent",
+        "ProcessExitedEvent",
+        "StructuredEvent",
+        "ToolInvocationRequest",
+        "SidecarPermissionRequest",
+        "JsBridgeCallRequest",
+        "ToolInvocationResultResponse",
+        "SidecarPermissionResultResponse",
+        "JsBridgeResultResponse",
+    ] {
+        assert!(
+            BARE_SCHEMA_V1.contains(type_name),
+            "schema is missing `{type_name}`"
+        );
+    }
+}
+
+#[test]
+fn checked_in_bare_migration_plan_documents_dual_stack_constraints() {
+    for needle in [
+        "4-byte big-endian length prefix",
+        "ProtocolSchema.version",
+        "request_id",
+        "positive",
+        "negative",
+        "JsonUtf8",
+        "first successfully decoded frame",
+        "JSON frames begin with `{`",
+        "delete JSON encoding",
+    ] {
+        assert!(
+            BARE_MIGRATION_PLAN.contains(needle),
+            "migration plan is missing `{needle}`"
+        );
+    }
 }

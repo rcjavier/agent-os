@@ -4,13 +4,17 @@ use agent_os_sidecar::protocol::{
     BootstrapRootFilesystemRequest, CloseStdinRequest, ConfigureVmRequest, CreateVmRequest,
     EventPayload, ExecuteRequest, GuestFilesystemCallRequest, GuestFilesystemOperation,
     GuestRuntimeKind, KillProcessRequest, MountDescriptor, MountPluginDescriptor, OwnershipScope,
-    RequestPayload, ResponsePayload, RootFilesystemDescriptor, RootFilesystemEntry,
-    RootFilesystemEntryEncoding, RootFilesystemEntryKind, RootFilesystemMode, StreamChannel,
-    WriteStdinRequest,
+    PatternPermissionScope, PermissionMode, PermissionsPolicy, RequestId, RequestPayload,
+    ResponsePayload, RootFilesystemDescriptor, RootFilesystemEntry, RootFilesystemEntryEncoding,
+    RootFilesystemEntryKind, RootFilesystemMode, StreamChannel, WriteStdinRequest,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, Instant};
 use support::{
     assert_node_available, authenticate, collect_process_output,
@@ -25,9 +29,71 @@ struct ProcessResult {
     exit_code: Option<i32>,
 }
 
+fn pyodide_asset_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("sidecar crate parent")
+        .join("execution")
+        .join("assets")
+        .join("pyodide")
+}
+
+fn spawn_static_file_server(root: PathBuf) -> (u16, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind static file listener");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking listener");
+    let port = listener.local_addr().expect("listener address").port();
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut served_any = false;
+        let mut idle_since: Option<Instant> = None;
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    served_any = true;
+                    idle_since = None;
+                    let mut request = [0_u8; 4096];
+                    let read = stream.read(&mut request).unwrap_or(0);
+                    let request_text = String::from_utf8_lossy(&request[..read]);
+                    let path = request_text
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let relative = path.trim_start_matches('/');
+                    let file_path = root.join(relative);
+                    let (status_line, body) = match fs::read(&file_path) {
+                        Ok(body) => ("HTTP/1.1 200 OK", body),
+                        Err(_) => ("HTTP/1.1 404 Not Found", b"missing".to_vec()),
+                    };
+                    let response = format!(
+                        "{status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.write_all(&body);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if served_any {
+                        match idle_since {
+                            Some(start) if start.elapsed() >= Duration::from_secs(5) => break,
+                            Some(_) => {}
+                            None => idle_since = Some(Instant::now()),
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (port, handle)
+}
+
 fn execute_inline_python(
     sidecar: &mut agent_os_sidecar::NativeSidecar<support::RecordingBridge>,
-    request_id: u64,
+    request_id: RequestId,
     connection_id: &str,
     session_id: &str,
     vm_id: &str,
@@ -48,7 +114,7 @@ fn execute_inline_python(
 
 fn execute_inline_python_with_env(
     sidecar: &mut agent_os_sidecar::NativeSidecar<support::RecordingBridge>,
-    request_id: u64,
+    request_id: RequestId,
     connection_id: &str,
     session_id: &str,
     vm_id: &str,
@@ -70,7 +136,7 @@ fn execute_inline_python_with_env(
 
 fn execute_python_entrypoint(
     sidecar: &mut agent_os_sidecar::NativeSidecar<support::RecordingBridge>,
-    request_id: u64,
+    request_id: RequestId,
     connection_id: &str,
     session_id: &str,
     vm_id: &str,
@@ -91,7 +157,7 @@ fn execute_python_entrypoint(
 
 fn execute_python_entrypoint_with_env(
     sidecar: &mut agent_os_sidecar::NativeSidecar<support::RecordingBridge>,
-    request_id: u64,
+    request_id: RequestId,
     connection_id: &str,
     session_id: &str,
     vm_id: &str,
@@ -100,13 +166,14 @@ fn execute_python_entrypoint_with_env(
     env: BTreeMap<String, String>,
 ) {
     let result = sidecar
-        .dispatch(support::request(
+        .dispatch_blocking(support::request(
             request_id,
             OwnershipScope::vm(connection_id, session_id, vm_id),
             RequestPayload::Execute(ExecuteRequest {
                 process_id: process_id.to_owned(),
-                runtime: GuestRuntimeKind::Python,
-                entrypoint: entrypoint.to_owned(),
+                command: None,
+                runtime: Some(GuestRuntimeKind::Python),
+                entrypoint: Some(entrypoint.to_owned()),
                 args: Vec::new(),
                 env,
                 cwd: None,
@@ -125,7 +192,7 @@ fn execute_python_entrypoint_with_env(
 
 fn execute_javascript_with_env(
     sidecar: &mut agent_os_sidecar::NativeSidecar<support::RecordingBridge>,
-    request_id: u64,
+    request_id: RequestId,
     connection_id: &str,
     session_id: &str,
     vm_id: &str,
@@ -135,13 +202,14 @@ fn execute_javascript_with_env(
     env: BTreeMap<String, String>,
 ) {
     let result = sidecar
-        .dispatch(support::request(
+        .dispatch_blocking(support::request(
             request_id,
             OwnershipScope::vm(connection_id, session_id, vm_id),
             RequestPayload::Execute(ExecuteRequest {
                 process_id: process_id.to_owned(),
-                runtime: GuestRuntimeKind::JavaScript,
-                entrypoint: entrypoint.to_string_lossy().into_owned(),
+                command: None,
+                runtime: Some(GuestRuntimeKind::JavaScript),
+                entrypoint: Some(entrypoint.to_string_lossy().into_owned()),
                 args,
                 env,
                 cwd: None,
@@ -160,7 +228,7 @@ fn execute_javascript_with_env(
 
 fn create_vm_with_root_filesystem(
     sidecar: &mut agent_os_sidecar::NativeSidecar<support::RecordingBridge>,
-    request_id: u64,
+    request_id: RequestId,
     connection_id: &str,
     session_id: &str,
     runtime: GuestRuntimeKind,
@@ -168,7 +236,7 @@ fn create_vm_with_root_filesystem(
     root_filesystem: RootFilesystemDescriptor,
 ) -> String {
     let result = sidecar
-        .dispatch(support::request(
+        .dispatch_blocking(support::request(
             request_id,
             OwnershipScope::session(connection_id, session_id),
             RequestPayload::CreateVm(CreateVmRequest {
@@ -178,7 +246,40 @@ fn create_vm_with_root_filesystem(
                     cwd.to_string_lossy().into_owned(),
                 )]),
                 root_filesystem,
-                permissions: Vec::new(),
+                permissions: None,
+            }),
+        ))
+        .expect("create sidecar VM");
+
+    match result.response.payload {
+        ResponsePayload::VmCreated(response) => response.vm_id,
+        other => panic!("unexpected vm create response: {other:?}"),
+    }
+}
+
+fn create_vm_with_metadata_and_permissions(
+    sidecar: &mut agent_os_sidecar::NativeSidecar<support::RecordingBridge>,
+    request_id: RequestId,
+    connection_id: &str,
+    session_id: &str,
+    runtime: GuestRuntimeKind,
+    cwd: &Path,
+    mut metadata: BTreeMap<String, String>,
+    permissions: PermissionsPolicy,
+) -> String {
+    metadata
+        .entry(String::from("cwd"))
+        .or_insert_with(|| cwd.to_string_lossy().into_owned());
+
+    let result = sidecar
+        .dispatch_blocking(support::request(
+            request_id,
+            OwnershipScope::session(connection_id, session_id),
+            RequestPayload::CreateVm(CreateVmRequest {
+                runtime,
+                metadata,
+                root_filesystem: Default::default(),
+                permissions: Some(permissions),
             }),
         ))
         .expect("create sidecar VM");
@@ -191,14 +292,14 @@ fn create_vm_with_root_filesystem(
 
 fn bootstrap_root_filesystem(
     sidecar: &mut agent_os_sidecar::NativeSidecar<support::RecordingBridge>,
-    request_id: u64,
+    request_id: RequestId,
     connection_id: &str,
     session_id: &str,
     vm_id: &str,
     entries: Vec<RootFilesystemEntry>,
 ) {
     let result = sidecar
-        .dispatch(support::request(
+        .dispatch_blocking(support::request(
             request_id,
             OwnershipScope::vm(connection_id, session_id, vm_id),
             RequestPayload::BootstrapRootFilesystem(BootstrapRootFilesystemRequest { entries }),
@@ -215,14 +316,14 @@ fn bootstrap_root_filesystem(
 
 fn guest_filesystem_call(
     sidecar: &mut agent_os_sidecar::NativeSidecar<support::RecordingBridge>,
-    request_id: u64,
+    request_id: RequestId,
     connection_id: &str,
     session_id: &str,
     vm_id: &str,
     payload: GuestFilesystemCallRequest,
 ) -> agent_os_sidecar::protocol::GuestFilesystemResultResponse {
     let result = sidecar
-        .dispatch(support::request(
+        .dispatch_blocking(support::request(
             request_id,
             OwnershipScope::vm(connection_id, session_id, vm_id),
             RequestPayload::GuestFilesystemCall(payload),
@@ -237,7 +338,7 @@ fn guest_filesystem_call(
 
 fn guest_write_file_utf8(
     sidecar: &mut agent_os_sidecar::NativeSidecar<support::RecordingBridge>,
-    request_id: u64,
+    request_id: RequestId,
     connection_id: &str,
     session_id: &str,
     vm_id: &str,
@@ -273,7 +374,7 @@ fn guest_write_file_utf8(
 
 fn guest_read_file_utf8(
     sidecar: &mut agent_os_sidecar::NativeSidecar<support::RecordingBridge>,
-    request_id: u64,
+    request_id: RequestId,
     connection_id: &str,
     session_id: &str,
     vm_id: &str,
@@ -310,7 +411,7 @@ fn guest_read_file_utf8(
 
 fn write_process_stdin(
     sidecar: &mut agent_os_sidecar::NativeSidecar<support::RecordingBridge>,
-    request_id: u64,
+    request_id: RequestId,
     connection_id: &str,
     session_id: &str,
     vm_id: &str,
@@ -318,7 +419,7 @@ fn write_process_stdin(
     chunk: &str,
 ) {
     let result = sidecar
-        .dispatch(support::request(
+        .dispatch_blocking(support::request(
             request_id,
             OwnershipScope::vm(connection_id, session_id, vm_id),
             RequestPayload::WriteStdin(WriteStdinRequest {
@@ -339,14 +440,14 @@ fn write_process_stdin(
 
 fn close_process_stdin(
     sidecar: &mut agent_os_sidecar::NativeSidecar<support::RecordingBridge>,
-    request_id: u64,
+    request_id: RequestId,
     connection_id: &str,
     session_id: &str,
     vm_id: &str,
     process_id: &str,
 ) {
     let result = sidecar
-        .dispatch(support::request(
+        .dispatch_blocking(support::request(
             request_id,
             OwnershipScope::vm(connection_id, session_id, vm_id),
             RequestPayload::CloseStdin(CloseStdinRequest {
@@ -365,14 +466,14 @@ fn close_process_stdin(
 
 fn kill_process(
     sidecar: &mut agent_os_sidecar::NativeSidecar<support::RecordingBridge>,
-    request_id: u64,
+    request_id: RequestId,
     connection_id: &str,
     session_id: &str,
     vm_id: &str,
     process_id: &str,
 ) {
     let result = sidecar
-        .dispatch(support::request(
+        .dispatch_blocking(support::request(
             request_id,
             OwnershipScope::vm(connection_id, session_id, vm_id),
             RequestPayload::KillProcess(KillProcessRequest {
@@ -403,7 +504,7 @@ fn wait_for_stdout_chunk(
 
     loop {
         let event = sidecar
-            .poll_event(&ownership, Duration::from_millis(100))
+            .poll_event_blocking(&ownership, Duration::from_millis(100))
             .expect("poll python stdout");
         let Some(event) = event else {
             assert!(
@@ -650,7 +751,12 @@ print(json.dumps(result))
         "unexpected stderr from python security execution: {stderr}"
     );
 
-    let parsed: Value = serde_json::from_str(stdout.trim()).expect("parse python security JSON");
+    let json_line = stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .expect("python security stdout line");
+    let parsed: Value = serde_json::from_str(json_line).expect("parse python security JSON");
     for key in [
         "js_process_env",
         "js_require",
@@ -733,7 +839,7 @@ fn concurrent_python_processes_stay_isolated_across_vms() {
 
     while results.values().any(|result| result.exit_code.is_none()) {
         let event = sidecar
-            .poll_event(&ownership, Duration::from_millis(100))
+            .poll_event_blocking(&ownership, Duration::from_millis(100))
             .expect("poll python process event");
         let Some(event) = event else {
             assert!(
@@ -883,9 +989,9 @@ fn workspace_files_are_shared_between_javascript_and_python_runtimes() {
     assert_node_available();
 
     let mut sidecar = new_sidecar("cross-runtime-workspace");
-    let cwd = temp_dir("cross-runtime-workspace-cwd");
-    let js_entry = cwd.join("cross-runtime.mjs");
     let workspace_host_dir = temp_dir("cross-runtime-workspace-host");
+    let cwd = workspace_host_dir.clone();
+    let js_entry = workspace_host_dir.join("cross-runtime.cjs");
     let connection_id = authenticate(&mut sidecar, "conn-cross-runtime");
     let session_id = open_session(&mut sidecar, 2, &connection_id);
     let (vm_id, _) = create_vm(
@@ -900,20 +1006,22 @@ fn workspace_files_are_shared_between_javascript_and_python_runtimes() {
     write_fixture(
         &js_entry,
         r#"
-import * as fs from 'agent-os:builtin/fs-promises';
+const fs = require('node:fs');
 
 const mode = process.argv[2];
 
 if (mode === 'write') {
-  await fs.writeFile('/workspace/from-js.txt', 'from js', 'utf8');
-  console.log(JSON.stringify({
-    entries: (await fs.readdir('/workspace')).sort(),
-  }));
+  fs.writeFileSync('/workspace/from-js.txt', Buffer.from('from js'));
+  const result = JSON.stringify({
+    entries: fs.readdirSync('/workspace').sort(),
+  });
+  fs.writeFileSync('/workspace/js-write-result.json', Buffer.from(result));
 } else if (mode === 'read') {
-  console.log(JSON.stringify({
-    fromPython: await fs.readFile('/workspace/from-python.txt', 'utf8'),
-    entries: (await fs.readdir('/workspace')).sort(),
-  }));
+  const result = JSON.stringify({
+    fromPython: fs.readFileSync('/workspace/from-python.txt', 'utf8'),
+    entries: fs.readdirSync('/workspace').sort(),
+  });
+  fs.writeFileSync('/workspace/js-read-result.json', Buffer.from(result));
 } else {
   throw new Error(`unknown mode: ${mode}`);
 }
@@ -934,7 +1042,7 @@ if (mode === 'write') {
         }],
     );
     let configure = sidecar
-        .dispatch(support::request(
+        .dispatch_blocking(support::request(
             5,
             OwnershipScope::vm(&connection_id, &session_id, &vm_id),
             RequestPayload::ConfigureVm(ConfigureVmRequest {
@@ -950,10 +1058,13 @@ if (mode === 'write') {
                     },
                 }],
                 software: Vec::new(),
-                permissions: Vec::new(),
+                permissions: None,
+                module_access_cwd: None,
                 instructions: Vec::new(),
                 projected_modules: Vec::new(),
                 command_permissions: BTreeMap::new(),
+                allowed_node_builtins: Vec::new(),
+                loopback_exempt_ports: Vec::new(),
             }),
         ))
         .expect("configure host_dir workspace mount");
@@ -1010,9 +1121,15 @@ if (mode === 'write') {
         js_write_stderr.is_empty(),
         "unexpected stderr from JavaScript write execution: {js_write_stderr}"
     );
-    let js_write: Value =
-        serde_json::from_str(js_write_stdout.trim()).expect("parse JavaScript write JSON");
-    assert_eq!(js_write["entries"], serde_json::json!(["from-js.txt"]));
+    let js_write: Value = serde_json::from_str(
+        &std::fs::read_to_string(workspace_host_dir.join("js-write-result.json"))
+            .expect("read JavaScript write JSON"),
+    )
+    .expect("parse JavaScript write JSON");
+    assert_eq!(
+        js_write["entries"],
+        serde_json::json!(["cross-runtime.cjs", "from-js.txt"])
+    );
 
     execute_inline_python(
         &mut sidecar,
@@ -1058,7 +1175,12 @@ print(json.dumps({
     assert_eq!(python_result["fromJs"], "from js");
     assert_eq!(
         python_result["entries"],
-        serde_json::json!(["from-js.txt", "from-python.txt"])
+        serde_json::json!([
+            "cross-runtime.cjs",
+            "from-js.txt",
+            "from-python.txt",
+            "js-write-result.json"
+        ])
     );
 
     execute_javascript_with_env(
@@ -1088,12 +1210,20 @@ print(json.dumps({
         js_read_stderr.is_empty(),
         "unexpected stderr from JavaScript read execution: {js_read_stderr}"
     );
-    let js_read: Value =
-        serde_json::from_str(js_read_stdout.trim()).expect("parse JavaScript read JSON");
+    let js_read: Value = serde_json::from_str(
+        &std::fs::read_to_string(workspace_host_dir.join("js-read-result.json"))
+            .expect("read JavaScript read JSON"),
+    )
+    .expect("parse JavaScript read JSON");
     assert_eq!(js_read["fromPython"], "from python");
     assert_eq!(
         js_read["entries"],
-        serde_json::json!(["from-js.txt", "from-python.txt"])
+        serde_json::json!([
+            "cross-runtime.cjs",
+            "from-js.txt",
+            "from-python.txt",
+            "js-write-result.json"
+        ])
     );
 }
 
@@ -1224,7 +1354,7 @@ print(f"read:{sys.stdin.read()!r}")
     );
     assert!(
         sidecar
-            .poll_event(
+            .poll_event_blocking(
                 &OwnershipScope::vm(&connection_id, &session_id, &vm_id),
                 Duration::from_millis(200)
             )
@@ -1311,7 +1441,7 @@ print(f"tail:{sys.stdin.read()!r}")
 
     assert!(
         sidecar
-            .poll_event(
+            .poll_event_blocking(
                 &OwnershipScope::vm(&connection_id, &session_id, &vm_id),
                 Duration::from_millis(200)
             )
@@ -1341,7 +1471,7 @@ print(f"tail:{sys.stdin.read()!r}")
 
     assert!(
         sidecar
-            .poll_event(
+            .poll_event_blocking(
                 &OwnershipScope::vm(&connection_id, &session_id, &vm_id),
                 Duration::from_millis(200)
             )
@@ -1614,5 +1744,520 @@ fn python_runtime_imports_bundled_pandas_without_network() {
     assert!(
         stdout.lines().any(|line| line.trim() == "2.3.3"),
         "expected pandas version in stdout, got: {stdout}"
+    );
+}
+
+#[test]
+fn python_runtime_supports_micropip_package_installation() {
+    assert_node_available();
+
+    let (port, server) = spawn_static_file_server(pyodide_asset_dir());
+    let mut sidecar = new_sidecar("python-micropip-install");
+    let cwd = temp_dir("python-micropip-install-cwd");
+    let connection_id = authenticate(&mut sidecar, "conn-python");
+    let session_id = open_session(&mut sidecar, 2, &connection_id);
+    let vm_id = create_vm_with_metadata_and_permissions(
+        &mut sidecar,
+        3,
+        &connection_id,
+        &session_id,
+        GuestRuntimeKind::Python,
+        &cwd,
+        BTreeMap::from([(
+            String::from("env.AGENT_OS_LOOPBACK_EXEMPT_PORTS"),
+            serde_json::to_string(&vec![port.to_string()]).expect("serialize exempt ports"),
+        )]),
+        PermissionsPolicy::allow_all(),
+    );
+
+    execute_inline_python_with_env(
+        &mut sidecar,
+        4,
+        &connection_id,
+        &session_id,
+        &vm_id,
+        "proc-python-micropip-install",
+        &format!(
+            r#"
+import json
+import micropip
+
+await micropip.install("http://127.0.0.1:{port}/click-8.3.1-py3-none-any.whl")
+
+import click
+print(json.dumps({{
+    "version": click.__version__,
+    "command_name": click.Command("demo").name,
+}}))
+"#,
+        ),
+        BTreeMap::from([(
+            String::from("AGENT_OS_PYODIDE_PACKAGE_BASE_URL"),
+            format!("http://127.0.0.1:{port}/"),
+        )]),
+    );
+
+    let (stdout, stderr, exit_code) = collect_process_output_with_timeout(
+        &mut sidecar,
+        &connection_id,
+        &session_id,
+        &vm_id,
+        "proc-python-micropip-install",
+        Duration::from_secs(90),
+    );
+
+    let _ = server.join();
+    assert_eq!(exit_code, 0, "stderr: {stderr}");
+    let json_line = stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .expect("micropip stdout line");
+    let parsed: Value = serde_json::from_str(json_line).expect("parse micropip JSON");
+    assert_eq!(parsed["version"], Value::String(String::from("8.3.1")));
+    assert_eq!(parsed["command_name"], Value::String(String::from("demo")));
+}
+
+#[test]
+fn python_runtime_micropip_install_respects_network_permissions() {
+    assert_node_available();
+
+    let (port, server) = spawn_static_file_server(pyodide_asset_dir());
+    let mut sidecar = new_sidecar("python-micropip-network-denied");
+    let cwd = temp_dir("python-micropip-network-denied-cwd");
+    let connection_id = authenticate(&mut sidecar, "conn-python");
+    let session_id = open_session(&mut sidecar, 2, &connection_id);
+    let vm_id = create_vm_with_metadata_and_permissions(
+        &mut sidecar,
+        3,
+        &connection_id,
+        &session_id,
+        GuestRuntimeKind::Python,
+        &cwd,
+        BTreeMap::from([(
+            String::from("env.AGENT_OS_LOOPBACK_EXEMPT_PORTS"),
+            serde_json::to_string(&vec![port.to_string()]).expect("serialize exempt ports"),
+        )]),
+        PermissionsPolicy {
+            fs: PermissionsPolicy::allow_all().fs,
+            network: Some(PatternPermissionScope::Mode(PermissionMode::Deny)),
+            child_process: PermissionsPolicy::allow_all().child_process,
+            env: PermissionsPolicy::allow_all().env,
+        },
+    );
+
+    execute_inline_python_with_env(
+        &mut sidecar,
+        4,
+        &connection_id,
+        &session_id,
+        &vm_id,
+        "proc-python-micropip-network-denied",
+        &format!(
+            r#"
+import micropip
+await micropip.install("http://127.0.0.1:{port}/click-8.3.1-py3-none-any.whl")
+"#,
+        ),
+        BTreeMap::from([(
+            String::from("AGENT_OS_PYODIDE_PACKAGE_BASE_URL"),
+            format!("http://127.0.0.1:{port}/"),
+        )]),
+    );
+
+    let (_stdout, stderr, exit_code) = collect_process_output_with_timeout(
+        &mut sidecar,
+        &connection_id,
+        &session_id,
+        &vm_id,
+        "proc-python-micropip-network-denied",
+        Duration::from_secs(30),
+    );
+
+    let _ = server.join();
+    assert_ne!(exit_code, 0);
+    assert!(
+        stderr.contains("permission") || stderr.contains("denied") || stderr.contains("EACCES"),
+        "expected micropip permission error, got: {stderr}"
+    );
+}
+
+#[test]
+fn python_runtime_routes_dns_and_http_through_sidecar_bridge() {
+    assert_node_available();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind http listener");
+    let port = listener.local_addr().expect("listener address").port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept http client");
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).expect("read http request");
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nhello world",
+            )
+            .expect("write http response");
+    });
+
+    let mut sidecar = new_sidecar("python-network-bridge");
+    let cwd = temp_dir("python-network-bridge-cwd");
+    let connection_id = authenticate(&mut sidecar, "conn-python");
+    let session_id = open_session(&mut sidecar, 2, &connection_id);
+    let vm_id = create_vm_with_metadata_and_permissions(
+        &mut sidecar,
+        3,
+        &connection_id,
+        &session_id,
+        GuestRuntimeKind::Python,
+        &cwd,
+        BTreeMap::from([
+            (
+                String::from("env.AGENT_OS_LOOPBACK_EXEMPT_PORTS"),
+                serde_json::to_string(&vec![port.to_string()]).expect("serialize exempt ports"),
+            ),
+            (
+                String::from("network.dns.override.example.test"),
+                String::from("127.0.0.1"),
+            ),
+        ]),
+        PermissionsPolicy::allow_all(),
+    );
+
+    execute_inline_python(
+        &mut sidecar,
+        4,
+        &connection_id,
+        &session_id,
+        &vm_id,
+        "proc-python-network",
+        &format!(
+            r#"
+import json
+import socket
+import urllib.request
+
+lookup = socket.getaddrinfo("example.test", {port}, family=socket.AF_INET, type=socket.SOCK_STREAM)
+with urllib.request.urlopen("http://example.test:{port}/urllib") as response:
+    urllib_status = response.status
+    urllib_body = response.read().decode("utf-8")
+
+print(json.dumps({{
+    "lookup": [entry[4][0] for entry in lookup],
+    "urllib": {{"status": urllib_status, "body": urllib_body}},
+}}))
+"#,
+        ),
+    );
+
+    let (stdout, stderr, exit_code) = collect_process_output_with_timeout(
+        &mut sidecar,
+        &connection_id,
+        &session_id,
+        &vm_id,
+        "proc-python-network",
+        Duration::from_secs(30),
+    );
+
+    let _ = server;
+    assert_eq!(exit_code, 0, "stderr: {stderr}");
+    let parsed: Value = serde_json::from_str(stdout.trim()).expect("parse python network JSON");
+    assert_eq!(
+        parsed["lookup"][0],
+        Value::String(String::from("127.0.0.1"))
+    );
+    assert_eq!(parsed["urllib"]["status"], Value::from(200));
+    assert_eq!(
+        parsed["urllib"]["body"],
+        Value::String(String::from("hello world"))
+    );
+}
+
+#[test]
+fn python_runtime_routes_requests_through_sidecar_bridge() {
+    assert_node_available();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind requests listener");
+    let port = listener.local_addr().expect("listener address").port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept requests client");
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).expect("read requests payload");
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nhello world",
+            )
+            .expect("write requests response");
+    });
+
+    let mut sidecar = new_sidecar("python-requests-bridge");
+    let cwd = temp_dir("python-requests-bridge-cwd");
+    let connection_id = authenticate(&mut sidecar, "conn-python");
+    let session_id = open_session(&mut sidecar, 2, &connection_id);
+    let vm_id = create_vm_with_metadata_and_permissions(
+        &mut sidecar,
+        3,
+        &connection_id,
+        &session_id,
+        GuestRuntimeKind::Python,
+        &cwd,
+        BTreeMap::from([
+            (
+                String::from("env.AGENT_OS_LOOPBACK_EXEMPT_PORTS"),
+                serde_json::to_string(&vec![port.to_string()]).expect("serialize exempt ports"),
+            ),
+            (
+                String::from("network.dns.override.example.test"),
+                String::from("127.0.0.1"),
+            ),
+        ]),
+        PermissionsPolicy::allow_all(),
+    );
+
+    execute_inline_python(
+        &mut sidecar,
+        4,
+        &connection_id,
+        &session_id,
+        &vm_id,
+        "proc-python-requests",
+        &format!(
+            r#"
+import json
+import requests
+
+response = requests.get("http://example.test:{port}/requests")
+print(json.dumps({{
+    "status": response.status_code,
+    "body": response.text,
+}}))
+"#,
+        ),
+    );
+
+    let (stdout, stderr, exit_code) = collect_process_output_with_timeout(
+        &mut sidecar,
+        &connection_id,
+        &session_id,
+        &vm_id,
+        "proc-python-requests",
+        Duration::from_secs(30),
+    );
+
+    let _ = server;
+    assert_eq!(exit_code, 0, "stderr: {stderr}");
+    let parsed: Value = serde_json::from_str(stdout.trim()).expect("parse requests JSON");
+    assert_eq!(parsed["status"], Value::from(200));
+    assert_eq!(parsed["body"], Value::String(String::from("hello world")));
+}
+
+#[test]
+fn python_runtime_surfaces_network_permission_errors() {
+    assert_node_available();
+
+    let mut sidecar = new_sidecar("python-network-denied");
+    let cwd = temp_dir("python-network-denied-cwd");
+    let connection_id = authenticate(&mut sidecar, "conn-python");
+    let session_id = open_session(&mut sidecar, 2, &connection_id);
+    let vm_id = create_vm_with_metadata_and_permissions(
+        &mut sidecar,
+        3,
+        &connection_id,
+        &session_id,
+        GuestRuntimeKind::Python,
+        &cwd,
+        BTreeMap::from([(
+            String::from("network.dns.override.example.test"),
+            String::from("127.0.0.1"),
+        )]),
+        PermissionsPolicy {
+            fs: PermissionsPolicy::allow_all().fs,
+            network: Some(PatternPermissionScope::Mode(PermissionMode::Deny)),
+            child_process: PermissionsPolicy::allow_all().child_process,
+            env: PermissionsPolicy::allow_all().env,
+        },
+    );
+
+    execute_inline_python(
+        &mut sidecar,
+        4,
+        &connection_id,
+        &session_id,
+        &vm_id,
+        "proc-python-network-denied",
+        r#"
+import json
+import socket
+import urllib.request
+
+result = {}
+for name, operation in {
+    "dns": lambda: socket.getaddrinfo("example.test", 80),
+    "http": lambda: urllib.request.urlopen("http://example.test:80/"),
+}.items():
+    try:
+        operation()
+        result[name] = {"unexpected": True}
+    except Exception as error:
+        result[name] = {"type": type(error).__name__, "message": str(error)}
+
+print(json.dumps(result))
+"#,
+    );
+
+    let (stdout, stderr, exit_code) = collect_process_output(
+        &mut sidecar,
+        &connection_id,
+        &session_id,
+        &vm_id,
+        "proc-python-network-denied",
+    );
+
+    assert_eq!(exit_code, 0, "stderr: {stderr}");
+    let parsed: Value =
+        serde_json::from_str(stdout.trim()).expect("parse python network denied JSON");
+    assert_eq!(
+        parsed["dns"]["type"],
+        Value::String(String::from("PermissionError"))
+    );
+    assert!(
+        parsed["dns"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("permission denied")),
+        "stdout: {stdout}"
+    );
+    assert_eq!(
+        parsed["http"]["type"],
+        Value::String(String::from("PermissionError"))
+    );
+}
+
+#[test]
+fn python_runtime_runs_node_subprocesses_through_sidecar_bridge() {
+    assert_node_available();
+
+    let mut sidecar = new_sidecar("python-subprocess-bridge");
+    let cwd = temp_dir("python-subprocess-bridge-cwd");
+    write_fixture(&cwd.join("child.mjs"), "console.log('child-ready')\n");
+    let connection_id = authenticate(&mut sidecar, "conn-python");
+    let session_id = open_session(&mut sidecar, 2, &connection_id);
+    let (vm_id, _) = create_vm(
+        &mut sidecar,
+        3,
+        &connection_id,
+        &session_id,
+        GuestRuntimeKind::Python,
+        &cwd,
+    );
+
+    execute_inline_python(
+        &mut sidecar,
+        4,
+        &connection_id,
+        &session_id,
+        &vm_id,
+        "proc-python-subprocess",
+        r#"
+import json
+import subprocess
+
+result = subprocess.run(["node", "./child.mjs"], capture_output=True, text=True, check=True)
+print(json.dumps({
+    "code": result.returncode,
+    "stdout": result.stdout.strip(),
+    "stderr": result.stderr.strip(),
+}))
+"#,
+    );
+
+    let (stdout, stderr, exit_code) = collect_process_output_with_timeout(
+        &mut sidecar,
+        &connection_id,
+        &session_id,
+        &vm_id,
+        "proc-python-subprocess",
+        Duration::from_secs(30),
+    );
+
+    assert_eq!(exit_code, 0, "stderr: {stderr}");
+    let parsed: Value = serde_json::from_str(stdout.trim()).expect("parse python subprocess JSON");
+    assert_eq!(parsed["code"], Value::from(0));
+    assert_eq!(parsed["stdout"], Value::String(String::from("child-ready")));
+    assert_eq!(parsed["stderr"], Value::String(String::new()));
+}
+
+#[test]
+fn python_runtime_surfaces_subprocess_permission_errors() {
+    assert_node_available();
+
+    let mut sidecar = new_sidecar("python-subprocess-denied");
+    let cwd = temp_dir("python-subprocess-denied-cwd");
+    let connection_id = authenticate(&mut sidecar, "conn-python");
+    let session_id = open_session(&mut sidecar, 2, &connection_id);
+    let vm_id = create_vm_with_metadata_and_permissions(
+        &mut sidecar,
+        3,
+        &connection_id,
+        &session_id,
+        GuestRuntimeKind::Python,
+        &cwd,
+        BTreeMap::new(),
+        PermissionsPolicy {
+            fs: PermissionsPolicy::allow_all().fs,
+            network: PermissionsPolicy::allow_all().network,
+            child_process: Some(PatternPermissionScope::Rules(
+                agent_os_sidecar::protocol::PatternPermissionRuleSet {
+                    default: Some(PermissionMode::Allow),
+                    rules: vec![agent_os_sidecar::protocol::PatternPermissionRule {
+                        mode: PermissionMode::Deny,
+                        operations: Vec::new(),
+                        patterns: vec![String::from("node")],
+                    }],
+                },
+            )),
+            env: PermissionsPolicy::allow_all().env,
+        },
+    );
+
+    execute_inline_python(
+        &mut sidecar,
+        4,
+        &connection_id,
+        &session_id,
+        &vm_id,
+        "proc-python-subprocess-denied",
+        r#"
+import json
+import subprocess
+
+try:
+    subprocess.run(["node", "--version"], capture_output=True, text=True, check=True)
+    result = {"unexpected": True}
+except Exception as error:
+    result = {"type": type(error).__name__, "message": str(error)}
+
+print(json.dumps(result))
+"#,
+    );
+
+    let (stdout, stderr, exit_code) = collect_process_output(
+        &mut sidecar,
+        &connection_id,
+        &session_id,
+        &vm_id,
+        "proc-python-subprocess-denied",
+    );
+
+    assert_eq!(exit_code, 0, "stderr: {stderr}");
+    let parsed: Value =
+        serde_json::from_str(stdout.trim()).expect("parse python subprocess denied JSON");
+    assert_eq!(
+        parsed["type"],
+        Value::String(String::from("PermissionError"))
+    );
+    assert!(
+        parsed["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("permission denied")),
+        "stdout: {stdout}"
     );
 }

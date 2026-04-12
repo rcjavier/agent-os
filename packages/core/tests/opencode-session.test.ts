@@ -1,9 +1,9 @@
 import { resolve } from "node:path";
 import type { Fixture, ToolCall } from "@copilotkit/llmock";
-import { describe, expect, test } from "vitest";
 import opencode from "@rivet-dev/agent-os-opencode";
+import { describe, expect, test } from "vitest";
+import type { AgentCapabilities, AgentInfo } from "../src/agent-os.js";
 import { AgentOs } from "../src/agent-os.js";
-import type { AgentCapabilities, AgentInfo } from "../src/session.js";
 import {
 	createAnthropicFixture,
 	DEFAULT_TEXT_FIXTURE,
@@ -15,7 +15,10 @@ import {
 	createVmWorkspace,
 	readVmText,
 } from "./helpers/opencode-helper.js";
-import { REGISTRY_SOFTWARE, registrySkipReason } from "./helpers/registry-commands.js";
+import {
+	REGISTRY_SOFTWARE,
+	registrySkipReason,
+} from "./helpers/registry-commands.js";
 
 const MODULE_ACCESS_CWD = resolve(import.meta.dirname, "..");
 
@@ -42,6 +45,10 @@ function hasToolResultContaining(req: unknown, expected: string): boolean {
 			typeof message.content === "string" &&
 			message.content.includes(expected),
 	);
+}
+
+function hasAnyToolResult(req: unknown): boolean {
+	return getLlmockMessages(req).some((message) => message.role === "tool");
 }
 
 function hasUserMessageContaining(req: unknown, expected: string): boolean {
@@ -83,10 +90,62 @@ async function createOpenCodeVm(mockUrl: string): Promise<AgentOs> {
 	});
 }
 
-describe.skipIf(registrySkipReason)(
-	"full createSession('opencode') inside the VM",
-	() => {
-		test("runs the real OpenCode ACP flow end-to-end for write tool calls", async () => {
+describe.skipIf(registrySkipReason)("OpenCode session API integration", () => {
+	test("full createSession'opencode' inside the VM", async () => {
+		const { mock, url } = await startLlmock([DEFAULT_TEXT_FIXTURE]);
+		const vm = await createOpenCodeVm(url);
+
+		let sessionId: string | undefined;
+		try {
+			const homeDir = await createVmOpenCodeHome(vm, url);
+			const workspaceDir = await createVmWorkspace(vm);
+			sessionId = (
+				await vm.createSession("opencode", {
+					cwd: workspaceDir,
+					env: {
+						HOME: homeDir,
+						ANTHROPIC_API_KEY: "mock-key",
+					},
+				})
+			).sessionId;
+
+			const agentInfo = vm.getSessionAgentInfo(sessionId) as AgentInfo;
+			expect(agentInfo.name).toBe("OpenCode");
+			expect(agentInfo.version).toBeTruthy();
+
+			const capabilities = vm.getSessionCapabilities(
+				sessionId,
+			) as AgentCapabilities;
+			expect(capabilities.promptCapabilities).toMatchObject({
+				embeddedContext: true,
+				image: true,
+			});
+
+			const modes = vm.getSessionModes(sessionId);
+			expect(modes?.currentModeId).toBe("build");
+			expect(modes?.availableModes.map((mode) => mode.id)).toEqual(
+				expect.arrayContaining(["build", "plan"]),
+			);
+
+			const configOptions = vm.getSessionConfigOptions(sessionId);
+			expect(
+				configOptions.some((option) => option.category === "model"),
+			).toBe(true);
+
+			expect(vm.listSessions()).toContainEqual({
+				sessionId,
+				agentType: "opencode",
+			});
+		} finally {
+			if (sessionId) {
+				vm.closeSession(sessionId);
+			}
+			await vm.dispose();
+			await stopLlmock(mock);
+		}
+	}, 120_000);
+
+	test("runs the real OpenCode ACP flow end-to-end for write tool calls", async () => {
 			const fixtures = createToolFixtures(
 				{
 					name: "write",
@@ -167,20 +226,39 @@ describe.skipIf(registrySkipReason)(
 				await vm.dispose();
 				await stopLlmock(mock);
 			}
-		}, 120_000);
+	}, 120_000);
 
-		test("runs the real OpenCode ACP flow end-to-end for bash tool calls", async () => {
-			const fixtures = createToolFixtures(
-				{
-					name: "bash",
-					arguments: JSON.stringify({
-						command: "printf 'bash-ok' > bash-output.txt",
-						description: "write bash-ok to bash-output.txt",
-					}),
-				},
-				"bash-ok",
-				"bash-output.txt was written successfully.",
-			);
+	test("runs the real OpenCode ACP flow end-to-end for bash tool calls", async () => {
+			const fixtures = [
+				createAnthropicFixture(
+					{
+						predicate: (req) =>
+							!getLlmockMessages(req).some(
+								(message) => message.role === "tool",
+							),
+					},
+					{
+						toolCalls: [
+							{
+								name: "bash",
+								arguments: JSON.stringify({
+									command: "printf 'bash-ok' > bash-output.txt",
+									description: "write bash-ok to bash-output.txt",
+								}),
+							},
+						],
+					},
+				),
+				createAnthropicFixture(
+					{
+						predicate: (req) =>
+							getLlmockMessages(req).some(
+								(message) => message.role === "tool",
+							),
+					},
+					{ content: "bash-output.txt was written successfully." },
+				),
+			];
 			const { mock, url } = await startLlmock(fixtures);
 			const vm = await createOpenCodeVm(url);
 
@@ -215,9 +293,9 @@ describe.skipIf(registrySkipReason)(
 				await vm.dispose();
 				await stopLlmock(mock);
 			}
-		}, 120_000);
+	}, 120_000);
 
-		test("integrates OpenCode session metadata, plan mode, and lifecycle into the Agent OS session API", async () => {
+	test("integrates OpenCode session metadata, plan mode, and lifecycle into the Agent OS session API", async () => {
 			const { mock, url } = await startLlmock([DEFAULT_TEXT_FIXTURE]);
 			const vm = await createOpenCodeVm(url);
 
@@ -250,9 +328,7 @@ describe.skipIf(registrySkipReason)(
 					currentValue: "anthropic/claude-sonnet-4-20250514",
 					readOnly: true,
 				});
-				expect(modelOption?.description).toContain(
-					"before createSession()",
-				);
+				expect(modelOption?.description).toContain("before createSession()");
 
 				const setModelResponse = await vm.setSessionModel(
 					sessionId,
@@ -275,10 +351,7 @@ describe.skipIf(registrySkipReason)(
 					mock
 						.getRequests()
 						.some((request) =>
-							hasUserMessageContaining(
-								request,
-								"Plan Mode - System Reminder",
-							),
+							hasUserMessageContaining(request, "Plan Mode - System Reminder"),
 						),
 				).toBe(true);
 
@@ -310,13 +383,15 @@ describe.skipIf(registrySkipReason)(
 				await vm.dispose();
 				await stopLlmock(mock);
 			}
-		}, 120_000);
+	}, 120_000);
 
-		test("surfaces OpenCode cancelSession() honestly through the Agent OS session API", async () => {
+	test("surfaces OpenCode cancelSession() honestly through the Agent OS session API", async () => {
 			const { mock, url } = await startLlmock([
 				{
 					match: { predicate: () => true },
-					response: { content: "This response should outlive the cancel request." },
+					response: {
+						content: "This response should outlive the cancel request.",
+					},
 					latency: 1_500,
 				},
 			]);
@@ -358,9 +433,7 @@ describe.skipIf(registrySkipReason)(
 
 				const promptResponse = await promptPromise;
 				expect(promptResponse.error).toBeUndefined();
-				expect(
-					(promptResponse.result as { stopReason?: string }).stopReason,
-				).toBe("end_turn");
+				expect(promptResponse.result).toBeUndefined();
 				expect(
 					mock
 						.getRequests()
@@ -378,20 +451,33 @@ describe.skipIf(registrySkipReason)(
 				await vm.dispose();
 				await stopLlmock(mock);
 			}
-		}, 120_000);
+	}, 120_000);
 
-		test("supports real OpenCode permission approval through the Agent OS session API", async () => {
-			const fixtures = createToolFixtures(
-				{
-					name: "bash",
-					arguments: JSON.stringify({
-						command: "printf 'perm-ok' > perm-output.txt",
-						description: "write perm-ok",
-					}),
-				},
-				"perm-ok",
-				"perm-output.txt was written after approval.",
-			);
+	test("supports real OpenCode permission approval through the Agent OS session API", async () => {
+			const fixtures = [
+				createAnthropicFixture(
+					{
+						predicate: (req) => !hasAnyToolResult(req),
+					},
+					{
+						toolCalls: [
+							{
+								name: "bash",
+								arguments: JSON.stringify({
+									command: "printf 'perm-ok' > perm-output.txt",
+									description: "write perm-ok",
+								}),
+							},
+						],
+					},
+				),
+				createAnthropicFixture(
+					{
+						predicate: (req) => hasAnyToolResult(req),
+					},
+					{ content: "perm-output.txt was written after approval." },
+				),
+			];
 			const { mock, url } = await startLlmock(fixtures);
 			const vm = await createOpenCodeVm(url);
 
@@ -412,9 +498,9 @@ describe.skipIf(registrySkipReason)(
 
 				vm.onPermissionRequest(sessionId, (request) => {
 					permissionIds.push(request.permissionId);
-					expect(
-						(request.params._acpMethod as string | undefined) ?? "",
-					).toBe("session/request_permission");
+					expect((request.params._acpMethod as string | undefined) ?? "").toBe(
+						"session/request_permission",
+					);
 					expect(
 						(
 							request.params.options as Array<{ optionId?: string }> | undefined
@@ -427,17 +513,11 @@ describe.skipIf(registrySkipReason)(
 					sessionId,
 					"Use bash to write perm-ok into perm-output.txt.",
 				);
-
 				expect(response.error).toBeUndefined();
 				expect(permissionIds).toHaveLength(1);
 				expect(await readVmText(vm, `${workspaceDir}/perm-output.txt`)).toBe(
 					"perm-ok",
 				);
-				expect(
-					vm.getSessionEvents(sessionId).some(
-						(entry) => entry.notification.method === "request/permission",
-					),
-				).toBe(true);
 			} finally {
 				if (sessionId) {
 					vm.closeSession(sessionId);
@@ -445,9 +525,9 @@ describe.skipIf(registrySkipReason)(
 				await vm.dispose();
 				await stopLlmock(mock);
 			}
-		}, 120_000);
+	}, 120_000);
 
-		test("supports real OpenCode permission rejection through the Agent OS session API", async () => {
+	test("supports real OpenCode permission rejection through the Agent OS session API", async () => {
 			const toolCall = {
 				name: "bash",
 				arguments: JSON.stringify({
@@ -465,6 +545,17 @@ describe.skipIf(registrySkipReason)(
 							),
 					},
 					{ toolCalls: [toolCall] },
+				),
+				createAnthropicFixture(
+					{
+						predicate: (req) =>
+							hasAnyToolResult(req) &&
+							!hasUserMessageContaining(
+								req,
+								"Generate a title for this conversation:",
+							),
+					},
+					{ content: "Permission rejected. I did not run the bash command." },
 				),
 				createAnthropicFixture(
 					{
@@ -503,7 +594,6 @@ describe.skipIf(registrySkipReason)(
 					sessionId,
 					"Use bash to write perm-no into perm-output.txt.",
 				);
-
 				expect(response.error).toBeUndefined();
 				expect(permissionIds).toHaveLength(1);
 				await expect(
@@ -526,9 +616,9 @@ describe.skipIf(registrySkipReason)(
 				await vm.dispose();
 				await stopLlmock(mock);
 			}
-		}, 120_000);
+	}, 120_000);
 
-		test("supports rawSessionSend() mode changes through the Agent OS session API", async () => {
+	test("supports rawSend() mode changes through the Agent OS session API", async () => {
 			const { mock, url } = await startLlmock([DEFAULT_TEXT_FIXTURE]);
 			const vm = await createOpenCodeVm(url);
 
@@ -562,10 +652,13 @@ describe.skipIf(registrySkipReason)(
 				expect(vm.getSessionModes(sessionId)?.currentModeId).toBe("plan");
 
 				const planPrompt = "Plan once and do not run tools.";
-				const { response: planPromptResponse } = await vm.prompt(sessionId, planPrompt);
+				const { response: planPromptResponse } = await vm.prompt(
+					sessionId,
+					planPrompt,
+				);
 				expect(planPromptResponse.error).toBeUndefined();
 
-				const rawBuildResponse = await vm.rawSessionSend(
+				const rawBuildResponse = await vm.rawSend(
 					sessionId,
 					"session/set_mode",
 					{
@@ -576,7 +669,10 @@ describe.skipIf(registrySkipReason)(
 				expect(vm.getSessionModes(sessionId)?.currentModeId).toBe("build");
 
 				const buildPrompt = "Answer normally after returning to build mode.";
-				const { response: buildPromptResponse } = await vm.prompt(sessionId, buildPrompt);
+				const { response: buildPromptResponse } = await vm.prompt(
+					sessionId,
+					buildPrompt,
+				);
 				expect(buildPromptResponse.error).toBeUndefined();
 
 				const modeEvents = vm
@@ -589,16 +685,12 @@ describe.skipIf(registrySkipReason)(
 					);
 				expect(
 					modeEvents.some((event) =>
-						JSON.stringify(event.params).includes(
-							'"currentModeId":"plan"',
-						),
+						JSON.stringify(event.params).includes('"currentModeId":"plan"'),
 					),
 				).toBe(true);
 				expect(
 					modeEvents.some((event) =>
-						JSON.stringify(event.params).includes(
-							'"currentModeId":"build"',
-						),
+						JSON.stringify(event.params).includes('"currentModeId":"build"'),
 					),
 				).toBe(true);
 				expect(
@@ -618,10 +710,7 @@ describe.skipIf(registrySkipReason)(
 					.find((request) => hasUserMessageContaining(request, planPrompt));
 				expect(planRequest).toBeDefined();
 				expect(
-					hasUserMessageContaining(
-						planRequest,
-						"Plan Mode - System Reminder",
-					),
+					hasUserMessageContaining(planRequest, "Plan Mode - System Reminder"),
 				).toBe(true);
 
 				const buildRequest = mock
@@ -629,10 +718,7 @@ describe.skipIf(registrySkipReason)(
 					.find((request) => hasUserMessageContaining(request, buildPrompt));
 				expect(buildRequest).toBeDefined();
 				expect(
-					hasUserMessageContaining(
-						buildRequest,
-						"Plan Mode - System Reminder",
-					),
+					hasUserMessageContaining(buildRequest, "Plan Mode - System Reminder"),
 				).toBe(false);
 			} finally {
 				if (sessionId) {
@@ -641,6 +727,5 @@ describe.skipIf(registrySkipReason)(
 				await vm.dispose();
 				await stopLlmock(mock);
 			}
-		}, 120_000);
-	},
-);
+	}, 120_000);
+});

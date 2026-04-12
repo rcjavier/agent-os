@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
-import type { LLMock, Fixture, ToolCall } from "@copilotkit/llmock";
+import type { Fixture, LLMock, ToolCall } from "@copilotkit/llmock";
+import claude from "@rivet-dev/agent-os-claude";
 import {
 	afterAll,
 	afterEach,
@@ -9,9 +10,8 @@ import {
 	expect,
 	test,
 } from "vitest";
-import claude from "@rivet-dev/agent-os-claude";
+import type { AgentCapabilities, AgentInfo } from "../src/agent-os.js";
 import { AgentOs } from "../src/agent-os.js";
-import type { AgentCapabilities, AgentInfo } from "../src/session.js";
 import {
 	createAnthropicFixture,
 	startLlmock,
@@ -21,12 +21,14 @@ import {
 	REGISTRY_SOFTWARE,
 	registrySkipReason,
 } from "./helpers/registry-commands.js";
+import { AGENT_CONFIGS } from "../src/agents.js";
+import { processSoftware } from "../src/packages.js";
 
 const MODULE_ACCESS_CWD = resolve(import.meta.dirname, "..");
 const XU_COMMAND = "xu hello-agent-os";
 const XU_OUTPUT = "xu-ok:hello-agent-os";
 const NODE_EXECSYNC_COMMAND =
-	'node -e "console.log(require(\'child_process\').execSync(\'echo child-ok\').toString().trim())"';
+	"node -e \"console.log(require('child_process').execSync('echo child-ok').toString().trim())\"";
 const NODE_EXECSYNC_OUTPUT = "child-ok";
 const NODE_ASYNC_SPAWN_SCRIPT_PATH = "/tmp/async-spawn.cjs";
 const NODE_ASYNC_SPAWN_COMMAND = `node ${NODE_ASYNC_SPAWN_SCRIPT_PATH}`;
@@ -77,10 +79,7 @@ function hasToolResultContaining(req: unknown, expected: string): boolean {
 	);
 }
 
-function createToolFixtures(
-	toolCall: ToolCall,
-	finalText: string,
-): Fixture[] {
+function createToolFixtures(toolCall: ToolCall, finalText: string): Fixture[] {
 	return [
 		createAnthropicFixture(
 			{
@@ -96,6 +95,22 @@ function createToolFixtures(
 		),
 	];
 }
+
+test("Claude config defaults to /bin/sh and V8-safe shell env flags", () => {
+	const processed = processSoftware([claude]);
+	const processedConfig = processed.agentConfigs.get("claude");
+	const expectedEnv = {
+		CLAUDE_CODE_DISABLE_CWD_PERSIST: "1",
+		CLAUDE_CODE_DISABLE_DEV_NULL_REDIRECT: "1",
+		CLAUDE_CODE_SHELL: "/bin/sh",
+		CLAUDE_CODE_SIMPLE_SHELL_EXEC: "1",
+		CLAUDE_CODE_SWAP_STDIO: "0",
+		SHELL: "/bin/sh",
+	};
+
+	expect(AGENT_CONFIGS.claude.defaultEnv).toMatchObject(expectedEnv);
+	expect(processedConfig?.defaultEnv).toMatchObject(expectedEnv);
+});
 
 async function writeAsyncSpawnScript(vm: AgentOs): Promise<void> {
 	await vm.writeFile(NODE_ASYNC_SPAWN_SCRIPT_PATH, NODE_ASYNC_SPAWN_SCRIPT);
@@ -162,9 +177,9 @@ describe.skipIf(registrySkipReason)("full createSession('claude')", () => {
 			);
 
 			expect(response.error).toBeUndefined();
-			expect(
-				(response.result as { stopReason?: string }).stopReason,
-			).toBe("end_turn");
+			expect((response.result as { stopReason?: string }).stopReason).toBe(
+				"end_turn",
+			);
 			expect(
 				mock
 					.getRequests()
@@ -224,9 +239,9 @@ describe.skipIf(registrySkipReason)("full createSession('claude')", () => {
 			);
 
 			expect(response.error).toBeUndefined();
-			expect(
-				(response.result as { stopReason?: string }).stopReason,
-			).toBe("end_turn");
+			expect((response.result as { stopReason?: string }).stopReason).toBe(
+				"end_turn",
+			);
 			expect(promptMock.getRequests().length).toBeGreaterThanOrEqual(1);
 
 			const events = promptVm
@@ -265,7 +280,8 @@ describe.skipIf(registrySkipReason)("full createSession('claude')", () => {
 			},
 			`nested node execSync executed successfully inside Agent OS: ${NODE_EXECSYNC_OUTPUT}.`,
 		);
-		const { mock: promptMock, url: promptMockUrl } = await startLlmock(fixtures);
+		const { mock: promptMock, url: promptMockUrl } =
+			await startLlmock(fixtures);
 		const promptMockPort = Number(new URL(promptMockUrl).port);
 		const promptVm = await AgentOs.create({
 			loopbackExemptPorts: [promptMockPort],
@@ -296,9 +312,9 @@ describe.skipIf(registrySkipReason)("full createSession('claude')", () => {
 			);
 
 			expect(response.error).toBeUndefined();
-			expect(
-				(response.result as { stopReason?: string }).stopReason,
-			).toBe("end_turn");
+			expect((response.result as { stopReason?: string }).stopReason).toBe(
+				"end_turn",
+			);
 			expect(
 				promptMock
 					.getRequests()
@@ -341,7 +357,8 @@ describe.skipIf(registrySkipReason)("full createSession('claude')", () => {
 			},
 			`nested node async spawn executed successfully inside Agent OS: ${NODE_ASYNC_SPAWN_OUTPUT}.`,
 		);
-		const { mock: promptMock, url: promptMockUrl } = await startLlmock(fixtures);
+		const { mock: promptMock, url: promptMockUrl } =
+			await startLlmock(fixtures);
 		const promptMockPort = Number(new URL(promptMockUrl).port);
 		const promptVm = await AgentOs.create({
 			loopbackExemptPorts: [promptMockPort],
@@ -373,15 +390,13 @@ describe.skipIf(registrySkipReason)("full createSession('claude')", () => {
 			);
 
 			expect(response.error).toBeUndefined();
-			expect(
-				(response.result as { stopReason?: string }).stopReason,
-			).toBe("end_turn");
+			expect((response.result as { stopReason?: string }).stopReason).toBe(
+				"end_turn",
+			);
 			expect(
 				promptMock
 					.getRequests()
-					.some((req) =>
-						hasToolResultContaining(req, NODE_ASYNC_SPAWN_OUTPUT),
-					),
+					.some((req) => hasToolResultContaining(req, NODE_ASYNC_SPAWN_OUTPUT)),
 			).toBe(true);
 
 			const events = promptVm
@@ -531,7 +546,7 @@ describe.skipIf(registrySkipReason)("full createSession('claude')", () => {
 		}
 	}, 120_000);
 
-	test("createSession('claude') supports rawSessionSend() for supported ACP methods", async () => {
+	test("createSession('claude') supports rawSend() for supported ACP methods", async () => {
 		let sessionId: string | undefined;
 
 		try {
@@ -544,7 +559,7 @@ describe.skipIf(registrySkipReason)("full createSession('claude')", () => {
 			});
 			sessionId = session.sessionId;
 
-			const response = await vm.rawSessionSend(sessionId, "session/set_mode", {
+			const response = await vm.rawSend(sessionId, "session/set_mode", {
 				modeId: "plan",
 			});
 			expect(response.error).toBeUndefined();

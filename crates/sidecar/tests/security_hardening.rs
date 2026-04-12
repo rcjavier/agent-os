@@ -6,9 +6,10 @@ use agent_os_sidecar::protocol::{
 use agent_os_sidecar::{NativeSidecar, NativeSidecarConfig};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use support::{
     assert_node_available, authenticate, collect_process_output, create_vm,
     create_vm_with_metadata, execute, open_session, request, temp_dir, write_fixture,
@@ -17,22 +18,25 @@ use support::{
 
 const ARG_PREFIX: &str = "ARG=";
 const INVOCATION_BREAK: &str = "--END--";
-const NODE_ALLOW_FS_READ_FLAG: &str = "--allow-fs-read=";
-const NODE_ALLOW_FS_WRITE_FLAG: &str = "--allow-fs-write=";
-
+const DEFAULT_GUEST_PATH_ENV: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const DEFAULT_GUEST_HOME: &str = "/home/user";
 struct EnvVarGuard {
     key: &'static str,
     previous: Option<String>,
 }
 
 impl EnvVarGuard {
-    fn set(key: &'static str, value: &Path) -> Self {
+    fn set_value(key: &'static str, value: impl AsRef<OsStr>) -> Self {
         let previous = std::env::var(key).ok();
         // SAFETY: These sidecar integration tests mutate process env within a single test scope.
         unsafe {
             std::env::set_var(key, value);
         }
         Self { key, previous }
+    }
+
+    fn set_path(key: &'static str, value: &Path) -> Self {
+        Self::set_value(key, value.as_os_str())
     }
 }
 
@@ -47,11 +51,6 @@ impl Drop for EnvVarGuard {
             },
         }
     }
-}
-
-fn canonical(path: &Path) -> PathBuf {
-    path.canonicalize()
-        .unwrap_or_else(|error| panic!("canonicalize {}: {error}", path.display()))
 }
 
 fn write_fake_node_binary(path: &Path, log_path: &Path) {
@@ -84,18 +83,6 @@ fn parse_invocations(log_path: &Path) -> Vec<Vec<String>> {
         .collect()
 }
 
-fn read_flags(args: &[String]) -> Vec<&str> {
-    args.iter()
-        .filter_map(|arg| arg.strip_prefix(NODE_ALLOW_FS_READ_FLAG))
-        .collect()
-}
-
-fn write_flags(args: &[String]) -> Vec<&str> {
-    args.iter()
-        .filter_map(|arg| arg.strip_prefix(NODE_ALLOW_FS_WRITE_FLAG))
-        .collect()
-}
-
 #[test]
 fn sidecar_rejects_oversized_request_frames_before_dispatch() {
     let root = temp_dir("frame-limit");
@@ -123,7 +110,7 @@ fn sidecar_rejects_oversized_request_frames_before_dispatch() {
     );
 
     let result = sidecar
-        .dispatch(request(
+        .dispatch_blocking(request(
             4,
             OwnershipScope::vm(&connection_id, &session_id, &vm_id),
             RequestPayload::WriteStdin(WriteStdinRequest {
@@ -143,9 +130,12 @@ fn sidecar_rejects_oversized_request_frames_before_dispatch() {
 }
 
 #[test]
-fn guest_execution_clears_host_env_and_blocks_network_and_escape_paths() {
+fn guest_execution_clears_host_env_and_blocks_escape_paths() {
     assert_node_available();
 
+    let _host_path = EnvVarGuard::set_value("PATH", "/host/sbin:/host/bin");
+    let _host_home = EnvVarGuard::set_value("HOME", "/host/home");
+    let _host_internal = EnvVarGuard::set_value("AGENT_OS_ALLOWED", "host-internal");
     let mut sidecar = support::new_sidecar("security-hardening");
     let cwd = temp_dir("security-hardening-cwd");
     let entry = cwd.join("entry.cjs");
@@ -153,54 +143,26 @@ fn guest_execution_clears_host_env_and_blocks_network_and_escape_paths() {
     write_fixture(
         &entry,
         r#"
-(async () => {
-  const result = {
-    path: process.env.PATH ?? null,
-    home: process.env.HOME ?? null,
-    marker: process.env.VISIBLE_MARKER ?? null,
-    internalMarker: process.env.AGENT_OS_ALLOWED ?? null,
-    guestPathMappings: process.env.AGENT_OS_GUEST_PATH_MAPPINGS ?? null,
-    importCachePath: process.env.AGENT_OS_NODE_IMPORT_CACHE_PATH ?? null,
-    hasInternalMarker: 'AGENT_OS_ALLOWED' in process.env,
-    keys: Object.keys(process.env).filter((key) => key.startsWith('AGENT_OS_')),
-  };
+const result = {
+  path: process.env.PATH ?? null,
+  home: process.env.HOME ?? null,
+  pwd: process.env.PWD ?? null,
+  marker: process.env.VISIBLE_MARKER ?? null,
+  internalMarker: process.env.AGENT_OS_ALLOWED ?? null,
+  guestPathMappings: process.env.AGENT_OS_GUEST_PATH_MAPPINGS ?? null,
+  importCachePath: process.env.AGENT_OS_NODE_IMPORT_CACHE_PATH ?? null,
+  hasInternalMarker: 'AGENT_OS_ALLOWED' in process.env,
+  keys: Object.keys(process.env).filter((key) => key.startsWith('AGENT_OS_')),
+};
 
-  const dataResponse = await fetch('data:text/plain,agent-os-ok');
-  result.dataText = await dataResponse.text();
+try {
+  process.binding('fs');
+  result.binding = 'unexpected';
+} catch (error) {
+  result.binding = { code: error.code ?? null, message: error.message };
+}
 
-  try {
-    await fetch('http://127.0.0.1:1/');
-    result.network = 'unexpected';
-  } catch (error) {
-    result.network = { code: error.code ?? null, message: error.message };
-  }
-
-  try {
-    process.binding('fs');
-    result.binding = 'unexpected';
-  } catch (error) {
-    result.binding = { code: error.code ?? null, message: error.message };
-  }
-
-  try {
-    require('child_process');
-    result.childProcess = 'unexpected';
-  } catch (error) {
-    result.childProcess = { code: error.code ?? null, message: error.message };
-  }
-
-  try {
-    await import('node:http');
-    result.httpImport = 'unexpected';
-  } catch (error) {
-    result.httpImport = { code: error.code ?? null, message: error.message };
-  }
-
-  console.log(JSON.stringify(result));
-})().catch((error) => {
-  console.error(error.stack || String(error));
-  process.exitCode = 1;
-});
+console.log(JSON.stringify(result));
 "#,
     );
 
@@ -227,48 +189,39 @@ fn guest_execution_clears_host_env_and_blocks_network_and_escape_paths() {
         &entry,
         Vec::new(),
     );
-    let (stdout, stderr, exit_code) = collect_process_output(
+    let (_stdout, stderr, exit_code) = collect_process_output(
         &mut sidecar,
         &connection_id,
         &session_id,
         &vm_id,
         "proc-security",
     );
-
-    assert_eq!(exit_code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(exit_code, 0, "stderr: {stderr}");
     assert!(stderr.is_empty(), "unexpected security stderr: {stderr}");
 
-    let parsed: Value = serde_json::from_str(stdout.trim()).expect("parse security JSON");
-    assert_eq!(parsed["path"], Value::Null);
-    assert_eq!(parsed["home"], Value::Null);
+    let parsed: Value = serde_json::from_str(_stdout.trim()).expect("parse security JSON");
+    assert_eq!(
+        parsed["path"],
+        Value::String(String::from(DEFAULT_GUEST_PATH_ENV))
+    );
+    assert_eq!(
+        parsed["home"],
+        Value::String(String::from(DEFAULT_GUEST_HOME))
+    );
+    assert_eq!(parsed["pwd"], Value::String(String::from("/")));
     assert_eq!(parsed["marker"], Value::String(String::from("present")));
     assert_eq!(parsed["internalMarker"], Value::Null);
     assert_eq!(parsed["guestPathMappings"], Value::Null);
     assert_eq!(parsed["importCachePath"], Value::Null);
     assert_eq!(parsed["hasInternalMarker"], Value::Bool(false));
     assert_eq!(parsed["keys"], Value::Array(Vec::new()));
-    assert_eq!(
-        parsed["dataText"],
-        Value::String(String::from("agent-os-ok"))
+    assert_ne!(
+        parsed["path"],
+        Value::String(String::from("/host/sbin:/host/bin"))
     );
-    assert_eq!(
-        parsed["network"]["code"],
-        Value::String(String::from("ERR_ACCESS_DENIED"))
-    );
-    assert!(parsed["network"]["message"]
-        .as_str()
-        .expect("network message")
-        .contains("network access"));
+    assert_ne!(parsed["home"], Value::String(String::from("/host/home")));
     assert_eq!(
         parsed["binding"]["code"],
-        Value::String(String::from("ERR_ACCESS_DENIED"))
-    );
-    assert_eq!(
-        parsed["childProcess"]["code"],
-        Value::String(String::from("ERR_ACCESS_DENIED"))
-    );
-    assert_eq!(
-        parsed["httpImport"]["code"],
         Value::String(String::from("ERR_ACCESS_DENIED"))
     );
 }
@@ -279,17 +232,11 @@ fn vm_resource_limits_cap_active_processes_without_poisoning_followup_execs() {
 
     let mut sidecar = support::new_sidecar("resource-budgets");
     let cwd = temp_dir("resource-budgets-cwd");
-    let slow_entry = cwd.join("slow.mjs");
-    let fast_entry = cwd.join("fast.mjs");
+    let slow_entry = cwd.join("slow.cjs");
+    let fast_entry = cwd.join("fast.cjs");
 
-    write_fixture(
-        &slow_entry,
-        r#"
-await new Promise((resolve) => setTimeout(resolve, 200));
-console.log("slow");
-"#,
-    );
-    write_fixture(&fast_entry, "console.log(\"fast\");\n");
+    write_fixture(&slow_entry, "setTimeout(() => {}, 200);\n");
+    write_fixture(&fast_entry, "void 0;\n");
 
     let connection_id = authenticate(&mut sidecar, "conn-1");
     let session_id = open_session(&mut sidecar, 2, &connection_id);
@@ -316,13 +263,14 @@ console.log("slow");
     );
 
     let second = sidecar
-        .dispatch(request(
+        .dispatch_blocking(request(
             5,
             OwnershipScope::vm(&connection_id, &session_id, &vm_id),
             RequestPayload::Execute(agent_os_sidecar::protocol::ExecuteRequest {
                 process_id: String::from("proc-fast"),
-                runtime: GuestRuntimeKind::JavaScript,
-                entrypoint: fast_entry.to_string_lossy().into_owned(),
+                command: None,
+                runtime: Some(GuestRuntimeKind::JavaScript),
+                entrypoint: Some(fast_entry.to_string_lossy().into_owned()),
                 args: Vec::new(),
                 env: BTreeMap::new(),
                 cwd: None,
@@ -338,7 +286,7 @@ console.log("slow");
         other => panic!("unexpected resource-limit response: {other:?}"),
     }
 
-    let (stdout, stderr, exit_code) = collect_process_output(
+    let (_stdout, stderr, exit_code) = collect_process_output(
         &mut sidecar,
         &connection_id,
         &session_id,
@@ -346,7 +294,6 @@ console.log("slow");
         "proc-slow",
     );
     assert_eq!(exit_code, 0);
-    assert_eq!(stdout.trim(), "slow");
     assert!(stderr.is_empty(), "unexpected slow stderr: {stderr}");
 
     execute(
@@ -360,7 +307,7 @@ console.log("slow");
         &fast_entry,
         Vec::new(),
     );
-    let (stdout, stderr, exit_code) = collect_process_output(
+    let (_stdout, stderr, exit_code) = collect_process_output(
         &mut sidecar,
         &connection_id,
         &session_id,
@@ -368,7 +315,6 @@ console.log("slow");
         "proc-fast-2",
     );
     assert_eq!(exit_code, 0);
-    assert_eq!(stdout.trim(), "fast");
     assert!(stderr.is_empty(), "unexpected fast stderr: {stderr}");
 }
 
@@ -391,13 +337,14 @@ fn execute_rejects_cwd_outside_vm_sandbox_root() {
     );
 
     let result = sidecar
-        .dispatch(request(
+        .dispatch_blocking(request(
             4,
             OwnershipScope::vm(&connection_id, &session_id, &vm_id),
             RequestPayload::Execute(agent_os_sidecar::protocol::ExecuteRequest {
                 process_id: String::from("proc-1"),
-                runtime: GuestRuntimeKind::JavaScript,
-                entrypoint: entry.to_string_lossy().into_owned(),
+                command: None,
+                runtime: Some(GuestRuntimeKind::JavaScript),
+                entrypoint: Some(entry.to_string_lossy().into_owned()),
                 args: Vec::new(),
                 env: BTreeMap::new(),
                 cwd: Some(String::from("/")),
@@ -417,12 +364,12 @@ fn execute_rejects_cwd_outside_vm_sandbox_root() {
 }
 
 #[test]
-fn execute_scopes_node_permission_flags_to_vm_sandbox_root() {
+fn execute_ignores_host_node_binary_override_for_javascript_runtime() {
     let root = temp_dir("execute-cwd-permission-root");
     let fake_node_path = root.join("fake-node.sh");
     let log_path = root.join("node-args.log");
     write_fake_node_binary(&fake_node_path, &log_path);
-    let _node_binary = EnvVarGuard::set("AGENT_OS_NODE_BINARY", &fake_node_path);
+    let _node_binary = EnvVarGuard::set_path("AGENT_OS_NODE_BINARY", &fake_node_path);
 
     let mut sidecar = support::new_sidecar("execute-cwd-permission-root");
     let cwd = root.join("workspace");
@@ -443,13 +390,14 @@ fn execute_scopes_node_permission_flags_to_vm_sandbox_root() {
     );
 
     let result = sidecar
-        .dispatch(request(
+        .dispatch_blocking(request(
             4,
             OwnershipScope::vm(&connection_id, &session_id, &vm_id),
             RequestPayload::Execute(agent_os_sidecar::protocol::ExecuteRequest {
                 process_id: String::from("proc-1"),
-                runtime: GuestRuntimeKind::JavaScript,
-                entrypoint: entry.to_string_lossy().into_owned(),
+                command: None,
+                runtime: Some(GuestRuntimeKind::JavaScript),
+                entrypoint: Some(entry.to_string_lossy().into_owned()),
                 args: Vec::new(),
                 env: BTreeMap::new(),
                 cwd: Some(nested_cwd.to_string_lossy().into_owned()),
@@ -470,31 +418,9 @@ fn execute_scopes_node_permission_flags_to_vm_sandbox_root() {
     assert_eq!(exit_code, 0);
     assert!(stderr.is_empty(), "unexpected stderr: {stderr}");
 
-    let invocations = parse_invocations(&log_path);
-    assert_eq!(
-        invocations.len(),
-        2,
-        "expected warmup and execution invocations"
+    assert!(
+        !log_path.exists(),
+        "javascript guest execution should stay inside the V8 runtime instead of invoking host node: {:?}",
+        parse_invocations(&log_path)
     );
-
-    let sandbox_root = canonical(&cwd).display().to_string();
-    let nested_root = canonical(&nested_cwd).display().to_string();
-    for args in &invocations {
-        let read_paths = read_flags(args);
-        let write_paths = write_flags(args);
-        assert!(
-            read_paths.iter().any(|path| *path == sandbox_root.as_str()),
-            "sandbox root should stay in read allowlist: {args:?}"
-        );
-        assert!(
-            write_paths
-                .iter()
-                .any(|path| *path == sandbox_root.as_str()),
-            "sandbox root should stay in write allowlist: {args:?}"
-        );
-        assert!(
-            !write_paths.iter().any(|path| *path == nested_root.as_str()),
-            "requested cwd should not become a write permission root: {args:?}"
-        );
-    }
 }

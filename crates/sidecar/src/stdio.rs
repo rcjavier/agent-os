@@ -12,101 +12,182 @@ use agent_os_bridge::{
     WriteFileRequest,
 };
 use agent_os_sidecar::protocol::{
-    AuthenticatedResponse, NativeFrameCodec, ProtocolCodecError, ProtocolFrame, ResponsePayload,
-    SessionOpenedResponse,
+    AuthenticatedResponse, NativeFrameCodec, NativePayloadCodec, ProtocolCodecError, ProtocolFrame,
+    RequestId, ResponsePayload, SessionOpenedResponse, SidecarRequestFrame, SidecarResponseFrame,
 };
-use agent_os_sidecar::{NativeSidecar, NativeSidecarConfig};
-use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use agent_os_sidecar::{NativeSidecar, NativeSidecarConfig, SidecarError, SidecarRequestTransport};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufWriter, Read, Write};
-use std::os::fd::AsFd;
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{symlink as create_symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime};
+use tokio::sync::mpsc::unbounded_channel;
+use tokio::time;
 
-const IDLE_POLL_SLEEP: Duration = Duration::from_millis(5);
+const EVENT_PUMP_INTERVAL: Duration = Duration::from_millis(5);
 
 pub fn run() -> Result<(), Box<dyn Error>> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_async())
+}
+
+async fn run_async() -> Result<(), Box<dyn Error>> {
     let config = NativeSidecarConfig {
         compile_cache_root: Some(default_compile_cache_root()),
         ..NativeSidecarConfig::default()
     };
     let codec = NativeFrameCodec::new(config.max_frame_bytes);
     let mut sidecar = NativeSidecar::with_config(LocalBridge::default(), config)?;
-    let mut writer = SharedWriter::new(codec.clone(), BufWriter::new(io::stdout()));
     let mut active_sessions = BTreeSet::<SessionScope>::new();
     let mut active_connections = BTreeSet::<String>::new();
+    let (stdin_tx, mut stdin_rx) = unbounded_channel::<Result<Option<ProtocolFrame>, String>>();
+    let (event_ready_tx, mut event_ready_rx) = unbounded_channel::<()>();
+    let (write_tx, write_rx) = mpsc::channel::<ProtocolFrame>();
+    let (write_error_tx, mut write_error_rx) = unbounded_channel::<String>();
+    let callback_transport = Arc::new(FrameSidecarRequestTransport::new(write_tx.clone()));
+    sidecar.set_sidecar_request_transport(callback_transport.clone());
+    let mut event_pump = time::interval(EVENT_PUMP_INTERVAL);
+    let writer_codec = codec.clone();
+    let reader_codec = codec.clone();
+    let transport_codec = Arc::new(Mutex::new(None::<NativePayloadCodec>));
+    let writer_transport_codec = transport_codec.clone();
 
-    let stdin = io::stdin();
-    let mut stdin = stdin.lock();
-    let poll_timeout = PollTimeout::try_from(IDLE_POLL_SLEEP).unwrap_or(PollTimeout::NONE);
+    thread::spawn(move || {
+        let mut writer = io::BufWriter::new(io::stdout());
+        while let Ok(frame) = write_rx.recv() {
+            if let Err(error) =
+                write_frame(&writer_codec, &mut writer, &frame, &writer_transport_codec)
+            {
+                let _ = write_error_tx.send(error.to_string());
+                break;
+            }
+        }
+    });
 
-    loop {
-        let mut stdin_poll = [PollFd::new(
-            stdin.as_fd(),
-            PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
-        )];
-        let ready = poll(&mut stdin_poll, poll_timeout)?;
-        let mut handled_request = false;
-
-        if ready > 0 {
-            if let Some(revents) = stdin_poll[0].revents() {
-                if revents.intersects(PollFlags::POLLIN | PollFlags::POLLHUP) {
-                    let Some(frame) = read_frame(&codec, &mut stdin)? else {
-                        break;
-                    };
-                    let request = match frame {
-                        ProtocolFrame::Request(request) => request,
-                        other => {
-                            return Err(format!(
-                                "expected request frame on stdin, received {}",
-                                frame_kind(&other)
-                            )
-                            .into());
+    thread::spawn({
+        let callback_transport = callback_transport.clone();
+        let transport_codec = transport_codec.clone();
+        move || {
+            let mut stdin = io::stdin();
+            loop {
+                let frame = match read_frame(&reader_codec, &mut stdin, &transport_codec) {
+                    Ok(Some(ProtocolFrame::SidecarResponse(response))) => {
+                        if callback_transport.accept_response(response.clone()) {
+                            continue;
                         }
-                    };
-
-                    let dispatch = sidecar.dispatch(request.clone())?;
-                    track_session_state(
-                        &dispatch.response.payload,
-                        &mut active_sessions,
-                        &mut active_connections,
-                    );
-
-                    writer.write_frame(&ProtocolFrame::Response(dispatch.response))?;
-                    for event in dispatch.events {
-                        writer.write_frame(&ProtocolFrame::Event(event))?;
+                        Ok(Some(ProtocolFrame::SidecarResponse(response)))
                     }
-                    handled_request = true;
+                    Ok(Some(frame)) => Ok(Some(frame)),
+                    other => other,
+                }
+                .map_err(|error: Box<dyn Error>| error.to_string());
+                let should_stop = matches!(frame, Ok(None) | Err(_));
+                if stdin_tx.send(frame).is_err() || should_stop {
+                    break;
                 }
             }
         }
+    });
 
-        if handled_request {
-            continue;
-        }
+    flush_sidecar_requests(&mut sidecar, &write_tx)?;
 
-        for session in active_sessions.iter().cloned().collect::<Vec<_>>() {
-            if let Some(event) = sidecar.poll_event(&session.ownership_scope(), Duration::ZERO)? {
-                writer.write_frame(&ProtocolFrame::Event(event))?;
-                break;
+    loop {
+        tokio::select! {
+            maybe_frame = stdin_rx.recv() => {
+                let Some(frame) = maybe_frame else {
+                    break;
+                };
+                let Some(frame) = frame.map_err(io::Error::other)? else {
+                    break;
+                };
+                match frame {
+                    ProtocolFrame::Request(request) => {
+                        let dispatch = sidecar.dispatch(request.clone()).await?;
+                        track_session_state(
+                            &dispatch.response.payload,
+                            &mut active_sessions,
+                            &mut active_connections,
+                        );
+
+                        write_tx.send(ProtocolFrame::Response(dispatch.response)).map_err(|error| {
+                            io::Error::new(io::ErrorKind::BrokenPipe, error.to_string())
+                        })?;
+                        for event in dispatch.events {
+                            write_tx.send(ProtocolFrame::Event(event)).map_err(|error| {
+                                io::Error::new(io::ErrorKind::BrokenPipe, error.to_string())
+                            })?;
+                        }
+                        flush_sidecar_requests(&mut sidecar, &write_tx)?;
+                    }
+                    ProtocolFrame::SidecarResponse(response) => {
+                        sidecar.accept_sidecar_response(response)?;
+                        flush_sidecar_requests(&mut sidecar, &write_tx)?;
+                    }
+                    other => {
+                        return Err(format!(
+                            "expected request or sidecar_response frame on stdin, received {}",
+                            frame_kind(&other)
+                        ).into());
+                    }
+                }
+            }
+            maybe_ready = event_ready_rx.recv() => {
+                let Some(()) = maybe_ready else {
+                    break;
+                };
+                loop {
+                    let mut emitted_frame = false;
+                    for session in active_sessions.iter().cloned().collect::<Vec<_>>() {
+                        if let Some(frame) = sidecar
+                            .poll_event(&session.ownership_scope(), Duration::ZERO)
+                            .await?
+                        {
+                            write_tx.send(ProtocolFrame::Event(frame)).map_err(|error| {
+                                io::Error::new(io::ErrorKind::BrokenPipe, error.to_string())
+                            })?;
+                            emitted_frame = true;
+                        }
+                    }
+
+                    if !emitted_frame {
+                        break;
+                    }
+                }
+                flush_sidecar_requests(&mut sidecar, &write_tx)?;
+            }
+            _ = event_pump.tick() => {
+                for session in active_sessions.iter().cloned().collect::<Vec<_>>() {
+                    if sidecar.pump_process_events(&session.ownership_scope()).await? {
+                        let _ = event_ready_tx.send(());
+                    }
+                }
+                flush_sidecar_requests(&mut sidecar, &write_tx)?;
+            }
+            maybe_write_error = write_error_rx.recv() => {
+                if let Some(error) = maybe_write_error {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, error).into());
+                }
             }
         }
     }
 
-    cleanup_connections(&mut sidecar, &active_connections);
+    cleanup_connections(&mut sidecar, &active_connections).await;
     Ok(())
 }
 
-fn cleanup_connections(
+async fn cleanup_connections(
     sidecar: &mut NativeSidecar<LocalBridge>,
     active_connections: &BTreeSet<String>,
 ) {
     for connection_id in active_connections {
-        let _ = sidecar.remove_connection(connection_id);
+        let _ = sidecar.remove_connection(connection_id).await;
     }
 }
 
@@ -135,6 +216,7 @@ fn track_session_state(
 fn read_frame(
     codec: &NativeFrameCodec,
     reader: &mut impl Read,
+    transport_codec: &Arc<Mutex<Option<NativePayloadCodec>>>,
 ) -> Result<Option<ProtocolFrame>, Box<dyn Error>> {
     let mut prefix = [0u8; 4];
     match reader.read_exact(&mut prefix) {
@@ -158,7 +240,37 @@ fn read_frame(
     bytes.extend_from_slice(&prefix);
     bytes.resize(total_len, 0);
     reader.read_exact(&mut bytes[prefix.len()..])?;
-    Ok(Some(codec.decode(&bytes)?))
+
+    let locked_payload_codec = {
+        let guard = transport_codec.lock().expect("codec lock");
+        *guard
+    };
+
+    let frame = if let Some(payload_codec) = locked_payload_codec {
+        codec.decode_with_codec(&bytes, payload_codec)?
+    } else {
+        let (frame, payload_codec) = codec.decode_detected(&bytes)?;
+        *transport_codec.lock().expect("codec lock") = Some(payload_codec);
+        frame
+    };
+
+    Ok(Some(frame))
+}
+
+fn write_frame(
+    codec: &NativeFrameCodec,
+    writer: &mut impl Write,
+    frame: &ProtocolFrame,
+    transport_codec: &Arc<Mutex<Option<NativePayloadCodec>>>,
+) -> Result<(), Box<dyn Error>> {
+    let payload_codec = transport_codec
+        .lock()
+        .expect("codec lock")
+        .unwrap_or(codec.payload_codec());
+    let bytes = codec.encode_with_codec(frame, payload_codec)?;
+    writer.write_all(&bytes)?;
+    writer.flush()?;
+    Ok(())
 }
 
 fn frame_kind(frame: &ProtocolFrame) -> &'static str {
@@ -166,7 +278,21 @@ fn frame_kind(frame: &ProtocolFrame) -> &'static str {
         ProtocolFrame::Request(_) => "request",
         ProtocolFrame::Response(_) => "response",
         ProtocolFrame::Event(_) => "event",
+        ProtocolFrame::SidecarRequest(_) => "sidecar_request",
+        ProtocolFrame::SidecarResponse(_) => "sidecar_response",
     }
+}
+
+fn flush_sidecar_requests(
+    sidecar: &mut NativeSidecar<LocalBridge>,
+    writer: &mpsc::Sender<ProtocolFrame>,
+) -> Result<(), Box<dyn Error>> {
+    while let Some(request) = sidecar.pop_sidecar_request() {
+        writer
+            .send(ProtocolFrame::SidecarRequest(request))
+            .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error.to_string()))?;
+    }
+    Ok(())
 }
 
 fn default_compile_cache_root() -> PathBuf {
@@ -179,6 +305,9 @@ fn default_compile_cache_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_os_sidecar::protocol::{
+        AuthenticateRequest, OwnershipScope, RequestFrame, RequestPayload, DEFAULT_MAX_FRAME_BYTES,
+    };
     use std::io::Cursor;
 
     #[test]
@@ -186,7 +315,8 @@ mod tests {
         let codec = NativeFrameCodec::new(16);
         let mut reader = Cursor::new((32_u32).to_be_bytes().to_vec());
 
-        let error = read_frame(&codec, &mut reader).expect_err("oversized frame should fail");
+        let error = read_frame(&codec, &mut reader, &Arc::new(Mutex::new(None)))
+            .expect_err("oversized frame should fail");
         let error = error
             .downcast::<ProtocolCodecError>()
             .expect("protocol codec error");
@@ -194,6 +324,35 @@ mod tests {
             *error,
             ProtocolCodecError::FrameTooLarge { size: 32, max: 16 }
         ));
+    }
+
+    #[test]
+    fn read_frame_decodes_bare_authenticate_request() {
+        let codec = NativeFrameCodec::new(DEFAULT_MAX_FRAME_BYTES);
+        let frame = ProtocolFrame::Request(RequestFrame::new(
+            1,
+            OwnershipScope::connection("client-hint"),
+            RequestPayload::Authenticate(AuthenticateRequest {
+                client_name: "probe".to_string(),
+                auth_token: "probe-token".to_string(),
+            }),
+        ));
+        let encoded =
+            NativeFrameCodec::with_payload_codec(DEFAULT_MAX_FRAME_BYTES, NativePayloadCodec::Bare)
+                .encode(&frame)
+                .expect("encode bare frame");
+        let mut reader = Cursor::new(encoded);
+        let transport_codec = Arc::new(Mutex::new(None));
+
+        let decoded = read_frame(&codec, &mut reader, &transport_codec)
+            .expect("decode bare frame")
+            .expect("frame present");
+
+        assert_eq!(decoded, frame);
+        assert_eq!(
+            *transport_codec.lock().expect("codec lock"),
+            Some(NativePayloadCodec::Bare)
+        );
     }
 }
 
@@ -507,24 +666,76 @@ impl SessionScope {
     }
 }
 
-struct SharedWriter<W> {
-    codec: NativeFrameCodec,
-    writer: W,
+struct FrameSidecarRequestTransport {
+    writer: mpsc::Sender<ProtocolFrame>,
+    pending: Arc<Mutex<BTreeMap<RequestId, mpsc::SyncSender<SidecarResponseFrame>>>>,
 }
 
-impl<W> SharedWriter<W>
-where
-    W: Write,
-{
-    fn new(codec: NativeFrameCodec, writer: W) -> Self {
-        Self { codec, writer }
+impl FrameSidecarRequestTransport {
+    fn new(writer: mpsc::Sender<ProtocolFrame>) -> Self {
+        Self {
+            writer,
+            pending: Arc::new(Mutex::new(BTreeMap::new())),
+        }
     }
 
-    fn write_frame(&mut self, frame: &ProtocolFrame) -> Result<(), Box<dyn Error>> {
-        let bytes = self.codec.encode(frame)?;
-        self.writer.write_all(&bytes)?;
-        self.writer.flush()?;
-        Ok(())
+    fn accept_response(&self, response: SidecarResponseFrame) -> bool {
+        let sender = {
+            let mut pending = match self.pending.lock() {
+                Ok(pending) => pending,
+                Err(_) => return false,
+            };
+            pending.remove(&response.request_id)
+        };
+        let Some(sender) = sender else {
+            return false;
+        };
+        let _ = sender.send(response);
+        true
+    }
+}
+
+impl SidecarRequestTransport for FrameSidecarRequestTransport {
+    fn send_request(
+        &self,
+        request: SidecarRequestFrame,
+        timeout: Duration,
+    ) -> Result<SidecarResponseFrame, SidecarError> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        self.pending
+            .lock()
+            .map_err(|_| {
+                SidecarError::Bridge(String::from("sidecar callback waiter map lock poisoned"))
+            })?
+            .insert(request.request_id, sender);
+        if let Err(error) = self
+            .writer
+            .send(ProtocolFrame::SidecarRequest(request.clone()))
+        {
+            let _ = self
+                .pending
+                .lock()
+                .map(|mut pending| pending.remove(&request.request_id));
+            return Err(SidecarError::Io(format!(
+                "failed to write sidecar request frame: {error}"
+            )));
+        }
+        match receiver.recv_timeout(timeout) {
+            Ok(response) => Ok(response),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = self
+                    .pending
+                    .lock()
+                    .map(|mut pending| pending.remove(&request.request_id));
+                Err(SidecarError::Io(format!(
+                    "timed out waiting for sidecar response after {}s",
+                    timeout.as_secs()
+                )))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(SidecarError::Io(String::from(
+                "sidecar response waiter disconnected",
+            ))),
+        }
     }
 }
 

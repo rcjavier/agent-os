@@ -2,14 +2,20 @@
 
 //! Native sidecar scaffold that composes the kernel and execution crates.
 
-mod google_drive_plugin;
-mod host_dir_plugin;
+pub mod acp;
+pub(crate) mod bootstrap;
+pub(crate) mod bridge;
+pub(crate) mod execution;
+pub(crate) mod filesystem;
+pub(crate) mod plugins;
 pub mod protocol;
-mod s3_plugin;
-mod sandbox_agent_plugin;
 pub mod service;
+pub(crate) mod state;
+pub(crate) mod tools;
+pub(crate) mod vm;
 
 pub use service::{DispatchResult, NativeSidecar, NativeSidecarConfig, SidecarError};
+pub use state::SidecarRequestTransport;
 
 use protocol::{DEFAULT_MAX_FRAME_BYTES, PROTOCOL_NAME, PROTOCOL_VERSION};
 

@@ -5,15 +5,64 @@ use agent_os_execution::{
     CreateWasmContextRequest, StartWasmExecutionRequest, WasmExecutionEngine, WasmExecutionEvent,
     WasmPermissionTier,
 };
+use base64::Engine;
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use tempfile::tempdir;
 
 const WASM_WARMUP_METRICS_PREFIX: &str = "__AGENT_OS_WASM_WARMUP_METRICS__:";
+
+fn node_binary_env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn lock_node_binary_env() -> MutexGuard<'static, ()> {
+    node_binary_env_lock()
+        .lock()
+        .expect("lock AGENT_OS_NODE_BINARY test guard")
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &Path) -> Self {
+        let previous = std::env::var(key).ok();
+        // SAFETY: These tests mutate process env only within this scoped guard.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => {
+                // SAFETY: Restores the env key owned by this scoped guard.
+                unsafe {
+                    std::env::set_var(self.key, value);
+                }
+            }
+            None => {
+                // SAFETY: Restores the env key owned by this scoped guard.
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WasmWarmupMetrics {
@@ -24,6 +73,7 @@ struct WasmWarmupMetrics {
 }
 
 fn assert_node_available() {
+    let _guard = lock_node_binary_env();
     let binary = std::env::var("AGENT_OS_NODE_BINARY").unwrap_or_else(|_| String::from("node"));
     let output = Command::new(binary)
         .arg("--version")
@@ -34,6 +84,33 @@ fn assert_node_available() {
 
 fn write_fixture(path: &Path, contents: &[u8]) {
     fs::write(path, contents).expect("write fixture");
+}
+
+fn decode_sync_rpc_bytes(value: &serde_json::Value) -> Vec<u8> {
+    let base64 = value
+        .get("__agentOsType")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind == "bytes")
+        .then(|| value.get("base64").and_then(serde_json::Value::as_str))
+        .flatten()
+        .expect("sync rpc bytes payload");
+    base64::engine::general_purpose::STANDARD
+        .decode(base64)
+        .expect("decode sync rpc bytes")
+}
+
+fn write_fake_node_binary(path: &Path, log_path: &Path) {
+    let script = format!(
+        "#!/bin/sh\nset -eu\nprintf 'host-node-invoked\\n' >> \"{}\"\nexit 1\n",
+        log_path.display(),
+    );
+    fs::write(path, script).expect("write fake node binary");
+    let mut permissions = fs::metadata(path)
+        .expect("fake node metadata")
+        .permissions();
+    use std::os::unix::fs::PermissionsExt;
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("chmod fake node binary");
 }
 
 fn parse_warmup_metrics(stderr: &str) -> WasmWarmupMetrics {
@@ -325,6 +402,59 @@ fn wasm_write_file_module() -> Vec<u8> {
     .expect("compile write-file wasm fixture")
 }
 
+fn wasm_poll_oneoff_module() -> Vec<u8> {
+    wat::parse_str(
+        r#"
+(module
+  (type $poll_oneoff_t (func (param i32 i32 i32 i32) (result i32)))
+  (type $fd_write_t (func (param i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "poll_oneoff" (func $poll_oneoff (type $poll_oneoff_t)))
+  (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (type $fd_write_t)))
+  (memory (export "memory") 1)
+  (data (i32.const 176) "poll-ready\n")
+  (func $_start (export "_start")
+    (i64.store (i32.const 0) (i64.const 1))
+    (i32.store8 (i32.const 8) (i32.const 1))
+    (i32.store (i32.const 16) (i32.const 0))
+
+    (i64.store (i32.const 48) (i64.const 2))
+    (i32.store8 (i32.const 56) (i32.const 1))
+    (i32.store (i32.const 64) (i32.const 1))
+
+    (if
+      (i32.ne
+        (call $poll_oneoff
+          (i32.const 0)
+          (i32.const 96)
+          (i32.const 2)
+          (i32.const 160)
+        )
+        (i32.const 0)
+      )
+      (then unreachable)
+    )
+
+    (if (i32.ne (i32.load (i32.const 160)) (i32.const 1)) (then unreachable))
+    (if (i64.ne (i64.load (i32.const 96)) (i64.const 1)) (then unreachable))
+    (if (i32.ne (i32.load8_u (i32.const 106)) (i32.const 1)) (then unreachable))
+
+    (i32.store (i32.const 168) (i32.const 176))
+    (i32.store (i32.const 172) (i32.const 11))
+    (drop
+      (call $fd_write
+        (i32.const 1)
+        (i32.const 168)
+        (i32.const 1)
+        (i32.const 164)
+      )
+    )
+  )
+)
+"#,
+    )
+    .expect("compile poll_oneoff wasm fixture")
+}
+
 fn wasm_infinite_loop_module() -> Vec<u8> {
     wat::parse_str(
         r#"
@@ -428,6 +558,46 @@ fn wasm_contexts_preserve_vm_and_module_configuration() {
     assert_eq!(context.context_id, "wasm-ctx-1");
     assert_eq!(context.vm_id, "vm-wasm");
     assert_eq!(context.module_path.as_deref(), Some("./guest.wasm"));
+}
+
+#[test]
+fn wasm_execution_stays_inside_v8_runtime_without_host_node_launches() {
+    let _guard = lock_node_binary_env();
+    let temp = tempdir().expect("create temp dir");
+    let fake_node_path = temp.path().join("fake-node.sh");
+    let log_path = temp.path().join("node-invocations.log");
+    write_fake_node_binary(&fake_node_path, &log_path);
+    let _node_binary = EnvVarGuard::set("AGENT_OS_NODE_BINARY", &fake_node_path);
+
+    write_fixture(&temp.path().join("guest.wasm"), &wasm_stdout_module());
+
+    let mut engine = WasmExecutionEngine::default();
+    let context = engine.create_context(CreateWasmContextRequest {
+        vm_id: String::from("vm-wasm"),
+        module_path: Some(String::from("./guest.wasm")),
+    });
+
+    let (stdout, stderr, exit_code) = run_wasm_execution(
+        &mut engine,
+        context.context_id,
+        temp.path(),
+        Vec::new(),
+        BTreeMap::from([
+            (String::from(WASM_MAX_FUEL_ENV), String::from("250")),
+            (
+                String::from(WASM_MAX_MEMORY_BYTES_ENV),
+                String::from((2 * 65_536).to_string()),
+            ),
+        ]),
+        WasmPermissionTier::Full,
+    );
+
+    assert_eq!(exit_code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("stdout:wasm-smoke"), "stdout={stdout}");
+    assert!(
+        !log_path.exists(),
+        "WASM prewarm/execution should stay inside the shared V8 runtime, not launch AGENT_OS_NODE_BINARY",
+    );
 }
 
 #[test]
@@ -570,7 +740,7 @@ fn wasm_execution_streams_exit_event() {
         module_path: Some(String::from("./guest.wasm")),
     });
 
-    let execution = engine
+    let mut execution = engine
         .start_execution(StartWasmExecutionRequest {
             vm_id: String::from("vm-wasm"),
             context_id: context.context_id,
@@ -586,7 +756,7 @@ fn wasm_execution_streams_exit_event() {
 
     while !saw_exit {
         match execution
-            .poll_event(Duration::from_secs(5))
+            .poll_event_blocking(Duration::from_secs(5))
             .expect("poll wasm event")
         {
             Some(WasmExecutionEvent::Stdout(chunk)) => {
@@ -601,12 +771,134 @@ fn wasm_execution_streams_exit_event() {
             Some(WasmExecutionEvent::Stderr(chunk)) => {
                 panic!("unexpected stderr: {}", String::from_utf8_lossy(&chunk));
             }
+            Some(WasmExecutionEvent::SyncRpcRequest(_)) => {}
             Some(WasmExecutionEvent::SignalState { .. }) => {}
             None => panic!("timed out waiting for wasm execution event"),
         }
     }
 
     assert!(saw_stdout, "expected stdout event before exit");
+}
+
+#[test]
+fn wasm_execution_can_route_stdio_through_kernel_sync_rpc() {
+    assert_node_available();
+
+    let temp = tempdir().expect("create temp dir");
+    write_fixture(&temp.path().join("guest.wasm"), &wasm_stdout_module());
+
+    let mut engine = WasmExecutionEngine::default();
+    let context = engine.create_context(CreateWasmContextRequest {
+        vm_id: String::from("vm-wasm"),
+        module_path: Some(String::from("./guest.wasm")),
+    });
+
+    let mut execution = engine
+        .start_execution(StartWasmExecutionRequest {
+            vm_id: String::from("vm-wasm"),
+            context_id: context.context_id,
+            argv: Vec::new(),
+            env: BTreeMap::from([(
+                String::from("AGENT_OS_WASI_STDIO_SYNC_RPC"),
+                String::from("1"),
+            )]),
+            cwd: temp.path().to_path_buf(),
+            permission_tier: WasmPermissionTier::Full,
+        })
+        .expect("start wasm execution");
+
+    let request = match execution
+        .poll_event_blocking(Duration::from_secs(5))
+        .expect("poll wasm event")
+    {
+        Some(WasmExecutionEvent::SyncRpcRequest(request)) => request,
+        other => panic!("expected kernel stdio sync RPC request, got {other:?}"),
+    };
+
+    assert_eq!(request.method, "__kernel_stdio_write");
+    assert_eq!(request.args.first(), Some(&json!(1)));
+    assert_eq!(
+        String::from_utf8(decode_sync_rpc_bytes(&request.args[1])).expect("stdout utf8"),
+        "stdout:wasm-smoke\n"
+    );
+
+    execution
+        .respond_sync_rpc_success(request.id, json!(18))
+        .expect("respond to __kernel_stdio_write");
+
+    let result = execution.wait().expect("wait for wasm execution");
+    let stderr = String::from_utf8(result.stderr).expect("stderr utf8");
+    assert_eq!(result.exit_code, 0, "stderr={stderr}");
+    assert!(
+        result.stdout.is_empty(),
+        "stdout should be kernel-routed in this mode"
+    );
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr}");
+}
+
+#[test]
+fn wasm_execution_poll_oneoff_uses_kernel_poll_for_multiple_fds() {
+    assert_node_available();
+
+    let temp = tempdir().expect("create temp dir");
+    write_fixture(&temp.path().join("guest.wasm"), &wasm_poll_oneoff_module());
+
+    let mut engine = WasmExecutionEngine::default();
+    let context = engine.create_context(CreateWasmContextRequest {
+        vm_id: String::from("vm-wasm"),
+        module_path: Some(String::from("./guest.wasm")),
+    });
+
+    let mut execution = engine
+        .start_execution(StartWasmExecutionRequest {
+            vm_id: String::from("vm-wasm"),
+            context_id: context.context_id,
+            argv: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: temp.path().to_path_buf(),
+            permission_tier: WasmPermissionTier::Full,
+        })
+        .expect("start wasm execution");
+
+    let request = match execution
+        .poll_event_blocking(Duration::from_secs(5))
+        .expect("poll wasm event")
+    {
+        Some(WasmExecutionEvent::SyncRpcRequest(request)) => request,
+        other => panic!("expected sync RPC request, got {other:?}"),
+    };
+
+    assert_eq!(request.method, "__kernel_poll");
+    assert_eq!(
+        request.args,
+        vec![
+            json!([
+                { "fd": 0, "events": 1 },
+                { "fd": 1, "events": 1 }
+            ]),
+            json!(10),
+        ]
+    );
+
+    execution
+        .respond_sync_rpc_success(
+            request.id,
+            json!({
+                "readyCount": 1,
+                "fds": [
+                    { "fd": 0, "events": 1, "revents": 1 },
+                    { "fd": 1, "events": 1, "revents": 0 }
+                ]
+            }),
+        )
+        .expect("respond to __kernel_poll");
+
+    let result = execution.wait().expect("wait for wasm execution");
+    let stdout = String::from_utf8(result.stdout).expect("stdout utf8");
+    let stderr = String::from_utf8(result.stderr).expect("stderr utf8");
+    assert_eq!(result.exit_code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr}");
+    assert_eq!(stdout, "poll-ready\n");
 }
 
 #[test]
@@ -622,7 +914,7 @@ fn wasm_execution_emits_signal_state_from_control_channel() {
         module_path: Some(String::from("./guest.wasm")),
     });
 
-    let execution = engine
+    let mut execution = engine
         .start_execution(StartWasmExecutionRequest {
             vm_id: String::from("vm-wasm"),
             context_id: context.context_id,
@@ -639,7 +931,7 @@ fn wasm_execution_emits_signal_state_from_control_channel() {
 
     while !saw_exit {
         match execution
-            .poll_event(Duration::from_secs(5))
+            .poll_event_blocking(Duration::from_secs(5))
             .expect("poll wasm event")
         {
             Some(WasmExecutionEvent::Stdout(chunk)) => {
@@ -667,6 +959,7 @@ fn wasm_execution_emits_signal_state_from_control_channel() {
             Some(WasmExecutionEvent::Stderr(chunk)) => {
                 panic!("unexpected stderr: {}", String::from_utf8_lossy(&chunk));
             }
+            Some(WasmExecutionEvent::SyncRpcRequest(_)) => {}
             None => panic!("timed out waiting for wasm execution event"),
         }
     }

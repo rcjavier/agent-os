@@ -1,3 +1,4 @@
+use crate::socket_table::SocketId;
 use std::ops::{BitOr, BitOrAssign};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -8,6 +9,10 @@ pub struct PollEvents(u16);
 impl PollEvents {
     pub const fn empty() -> Self {
         Self(0)
+    }
+
+    pub const fn from_bits(bits: u16) -> Self {
+        Self(bits)
     }
 
     pub const fn bits(self) -> u16 {
@@ -68,6 +73,43 @@ impl PollFd {
 pub struct PollResult {
     pub ready_count: usize,
     pub fds: Vec<PollFd>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollTarget {
+    Fd(u32),
+    Socket(SocketId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PollTargetEntry {
+    pub target: PollTarget,
+    pub events: PollEvents,
+    pub revents: PollEvents,
+}
+
+impl PollTargetEntry {
+    pub const fn new(target: PollTarget, events: PollEvents) -> Self {
+        Self {
+            target,
+            events,
+            revents: PollEvents::empty(),
+        }
+    }
+
+    pub const fn fd(fd: u32, events: PollEvents) -> Self {
+        Self::new(PollTarget::Fd(fd), events)
+    }
+
+    pub const fn socket(socket_id: SocketId, events: PollEvents) -> Self {
+        Self::new(PollTarget::Socket(socket_id), events)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PollTargetResult {
+    pub ready_count: usize,
+    pub targets: Vec<PollTargetEntry>,
 }
 
 #[derive(Debug, Clone, Default)]

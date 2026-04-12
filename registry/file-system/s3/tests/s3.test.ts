@@ -1,13 +1,14 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { AgentOs } from "@rivet-dev/agent-os";
-import type { MinioContainerHandle } from "@rivet-dev/agent-os/test/docker";
-import { startMinioContainer } from "@rivet-dev/agent-os/test/docker";
+import { AgentOs } from "@rivet-dev/agent-os-core";
+import type { MinioContainerHandle } from "@rivet-dev/agent-os-core/test/docker";
+import { startMinioContainer } from "@rivet-dev/agent-os-core/test/docker";
 import { createS3Backend } from "../src/index.js";
 
 let minio: MinioContainerHandle;
 let vm: AgentOs | null = null;
 
 beforeAll(async () => {
+	process.env.AGENT_OS_ALLOW_LOCAL_S3_ENDPOINTS = "1";
 	minio = await startMinioContainer({ healthTimeout: 60_000 });
 }, 90_000);
 
@@ -15,6 +16,7 @@ afterAll(async () => {
 	if (minio) {
 		await minio.stop();
 	}
+	delete process.env.AGENT_OS_ALLOW_LOCAL_S3_ENDPOINTS;
 });
 
 afterEach(async () => {

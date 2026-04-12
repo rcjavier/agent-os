@@ -1,6 +1,6 @@
 // Execute commands and manage processes inside the VM.
 
-import { AgentOs } from "@rivet-dev/agent-os";
+import { AgentOs } from "@rivet-dev/agent-os-core";
 import common from "@rivet-dev/agent-os-common";
 
 const vm = await AgentOs.create({ software: [common] });
@@ -37,7 +37,9 @@ const interval = setInterval(() => {
 
 const proc = vm.spawn("node", ["/tmp/counter.mjs"], {
 	onStdout: (data: Uint8Array) => {
-		process.stdout.write(`[process ${proc.pid}] ${new TextDecoder().decode(data)}`);
+		process.stdout.write(
+			`[process ${proc.pid}] ${new TextDecoder().decode(data)}`,
+		);
 	},
 });
 console.log("Spawned process:", proc.pid);

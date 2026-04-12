@@ -12,13 +12,12 @@
  */
 
 import { describe, it, expect, afterEach, beforeAll, afterAll } from 'vitest';
-import { createWasmVmRuntime } from '@rivet-dev/agent-os/test/runtime';
+import { createWasmVmRuntime } from '@rivet-dev/agent-os-core/test/runtime';
 import {
   allowAll,
   COMMANDS_DIR,
   createInMemoryFileSystem,
   createKernel,
-  createNodeHostNetworkAdapter,
   hasWasmBinaries,
 } from '../helpers.js';
 import type { Kernel } from '../helpers.js';
@@ -417,7 +416,7 @@ describe.skipIf(!hasCurl && !hasHttpGetTest)('curl and socket layer', () => {
     kernel = createKernel({
       filesystem,
       permissions: allowAll,
-      hostNetworkAdapter: createNodeHostNetworkAdapter(),
+      loopbackExemptPorts: [httpPort, httpsPort, keepAlivePort],
     });
     const commandDirs = hasPackagedCurl ? [CURL_PACKAGE_DIR, COMMANDS_DIR] : [COMMANDS_DIR];
     await kernel.mount(createWasmVmRuntime({ commandDirs }));

@@ -1,12 +1,10 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import { resolve } from "node:path";
-import type { KernelSpawnOptions, ManagedProcess } from "../src/runtime-compat.js";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { AgentOs } from "../src/agent-os.js";
 import { AGENT_CONFIGS } from "../src/agents.js";
 import { createHostDirBackend } from "../src/host-dir-mount.js";
-import { getOsInstructions } from "../src/os-instructions.js";
 import { getAgentOsKernel } from "../src/test/runtime.js";
 import {
 	REGISTRY_SOFTWARE,
@@ -17,21 +15,33 @@ import {
  * Workspace root has shamefully-hoisted node_modules with pi-acp available.
  */
 const MODULE_ACCESS_CWD = resolve(import.meta.dirname, "..");
+const OS_INSTRUCTIONS_FIXTURE = resolve(
+	import.meta.dirname,
+	"../fixtures/AGENTOS_SYSTEM_PROMPT.md",
+);
+
+function readOsInstructions(additional?: string): string {
+	const base = fs.readFileSync(OS_INSTRUCTIONS_FIXTURE, "utf-8");
+	if (!additional) {
+		return base;
+	}
+	return `${base}\n${additional}`;
+}
 
 // ── getOsInstructions unit tests ───────────────────────────────────────
 
 describe("getOsInstructions", () => {
 	test("returns non-empty string from fixture", () => {
-		const result = getOsInstructions();
+		const result = readOsInstructions();
 		expect(result).toBeTruthy();
 		expect(typeof result).toBe("string");
 		expect(result.length).toBeGreaterThan(0);
 	});
 
 	test("appends additional text", () => {
-		const base = getOsInstructions();
+		const base = readOsInstructions();
 		const additional = "Custom agent-specific instructions here.";
-		const result = getOsInstructions(additional);
+		const result = readOsInstructions(additional);
 		expect(result).toContain(base);
 		expect(result).toContain(additional);
 		// Additional text comes after base, separated by newline
@@ -60,7 +70,7 @@ describe("/etc/agentos/ setup at boot", () => {
 	test("content matches getOsInstructions() output", async () => {
 		const data = await vm.readFile("/etc/agentos/instructions.md");
 		const content = new TextDecoder().decode(data);
-		const expected = getOsInstructions();
+		const expected = readOsInstructions();
 		expect(content).toBe(expected);
 	});
 
@@ -71,7 +81,7 @@ describe("/etc/agentos/ setup at boot", () => {
 
 		const data = await vm.readFile("/etc/agentos/instructions.md");
 		const content = new TextDecoder().decode(data);
-		const expected = getOsInstructions(additional);
+		const expected = readOsInstructions(additional);
 		expect(content).toBe(expected);
 		expect(content).toContain(additional);
 	});
@@ -124,7 +134,7 @@ describe.skipIf(registrySkipReason)("/etc/agentos/ exec from inside VM", () => {
 	test("exec('cat /etc/agentos/instructions.md') returns the instructions content", async () => {
 		const result = await vm.exec("cat /etc/agentos/instructions.md");
 		expect(result.exitCode).toBe(0);
-		const expected = getOsInstructions();
+		const expected = readOsInstructions();
 		// WasmVM stdout can duplicate lines; use toContain
 		expect(result.stdout).toContain(expected);
 	});
@@ -153,9 +163,7 @@ describe("PI prepareInstructions", () => {
 		expect(result.args).toBeDefined();
 		expect(result.args).toContain("--append-system-prompt");
 		// The instruction text is the file content from /etc/agentos/instructions.md
-		const argIdx = (result.args as string[]).indexOf(
-			"--append-system-prompt",
-		);
+		const argIdx = (result.args as string[]).indexOf("--append-system-prompt");
 		const instructionsArg = (result.args as string[])[argIdx + 1];
 		expect(instructionsArg).toBeTruthy();
 		expect(instructionsArg.length).toBeGreaterThan(0);
@@ -169,11 +177,13 @@ describe("PI prepareInstructions", () => {
 			typeof config.prepareInstructions
 		>;
 		const additional = "CUSTOM_MARKER: extra instructions";
-		const result = await prepare(getAgentOsKernel(vm), "/home/user", additional);
-
-		const argIdx = (result.args as string[]).indexOf(
-			"--append-system-prompt",
+		const result = await prepare(
+			getAgentOsKernel(vm),
+			"/home/user",
+			additional,
 		);
+
+		const argIdx = (result.args as string[]).indexOf("--append-system-prompt");
 		const instructionsArg = (result.args as string[])[argIdx + 1];
 		expect(instructionsArg).toContain(additional);
 	});
@@ -242,9 +252,7 @@ describe("OpenCode prepareInstructions", () => {
 		const result = await prepare(getAgentOsKernel(vm), cwd, additional);
 
 		// Verify additional instructions written to /tmp/
-		const data = await vm.readFile(
-			"/tmp/agentos-additional-instructions.md",
-		);
+		const data = await vm.readFile("/tmp/agentos-additional-instructions.md");
 		const content = new TextDecoder().decode(data);
 		expect(content).toBe(additional);
 
@@ -252,9 +260,7 @@ describe("OpenCode prepareInstructions", () => {
 		const contextPaths = JSON.parse(
 			result.env?.OPENCODE_CONTEXTPATHS as string,
 		);
-		expect(contextPaths).toContain(
-			"/tmp/agentos-additional-instructions.md",
-		);
+		expect(contextPaths).toContain("/tmp/agentos-additional-instructions.md");
 		// Base instructions path is still included
 		expect(contextPaths).toContain("/etc/agentos/instructions.md");
 
@@ -324,16 +330,8 @@ process.stdin.on('data', (chunk) => {
 });
 `;
 
-/** Captured spawn call info for kernel.spawn spy. */
-interface SpawnCapture {
-	command: string;
-	args: string[];
-	options: KernelSpawnOptions | undefined;
-}
-
 describe("createSession OS instructions integration", () => {
 	let vm: AgentOs;
-	let spawnCaptures: SpawnCapture[];
 	let hostWorkspaceDir: string;
 
 	beforeEach(async () => {
@@ -352,19 +350,6 @@ describe("createSession OS instructions integration", () => {
 				},
 			],
 		});
-		spawnCaptures = [];
-
-		// Spy on kernel.spawn to capture args while delegating to the real impl
-		const kernel = getAgentOsKernel(vm);
-		const origSpawn = kernel.spawn.bind(kernel);
-		kernel.spawn = (
-			command: string,
-			args: string[],
-			options?: KernelSpawnOptions,
-		): ManagedProcess => {
-			spawnCaptures.push({ command, args, options });
-			return origSpawn(command, args, options);
-		};
 	});
 
 	afterEach(async () => {
@@ -398,14 +383,14 @@ describe("createSession OS instructions integration", () => {
 
 		try {
 			const { sessionId } = await vm.createSession("pi");
+			const agentInfo = vm.getSessionAgentInfo(sessionId) as {
+				argv?: string[];
+			};
+			const argv = agentInfo.argv ?? [];
 
-			// Verify kernel.spawn was called with --append-system-prompt in args
-			expect(spawnCaptures.length).toBeGreaterThan(0);
-			const spawnCall = spawnCaptures[0];
-			expect(spawnCall.args).toContain("--append-system-prompt");
-			// The instruction text follows --append-system-prompt
-			const argIdx = spawnCall.args.indexOf("--append-system-prompt");
-			const instructionsArg = spawnCall.args[argIdx + 1];
+			expect(argv).toContain("--append-system-prompt");
+			const argIdx = argv.indexOf("--append-system-prompt");
+			const instructionsArg = argv[argIdx + 1];
 			expect(instructionsArg).toBeTruthy();
 			expect(instructionsArg.length).toBeGreaterThan(0);
 
@@ -458,11 +443,12 @@ describe("createSession OS instructions integration", () => {
 			const { sessionId } = await vm.createSession("pi", {
 				skipOsInstructions: true,
 			});
+			const agentInfo = vm.getSessionAgentInfo(sessionId) as {
+				argv?: string[];
+			};
+			const argv = agentInfo.argv ?? [];
 
-			// Verify kernel.spawn was NOT called with --append-system-prompt
-			expect(spawnCaptures.length).toBeGreaterThan(0);
-			const spawnCall = spawnCaptures[0];
-			expect(spawnCall.args).not.toContain("--append-system-prompt");
+			expect(argv).not.toContain("--append-system-prompt");
 
 			vm.closeSession(sessionId);
 		} finally {
@@ -497,20 +483,20 @@ describe("createSession OS instructions integration", () => {
 		await vm.writeFile(scriptPath, MOCK_ACP_ADAPTER);
 		const restore = useMockAdapterBin(scriptPath);
 
-		const additionalText =
-			"CUSTOM_MARKER: Always use pnpm for this project.";
+		const additionalText = "CUSTOM_MARKER: Always use pnpm for this project.";
 
 		try {
 			const { sessionId } = await vm.createSession("pi", {
 				additionalInstructions: additionalText,
 			});
+			const agentInfo = vm.getSessionAgentInfo(sessionId) as {
+				argv?: string[];
+			};
+			const argv = agentInfo.argv ?? [];
 
-			// Verify the --append-system-prompt value contains additional text
-			expect(spawnCaptures.length).toBeGreaterThan(0);
-			const spawnCall = spawnCaptures[0];
-			const argIdx = spawnCall.args.indexOf("--append-system-prompt");
+			const argIdx = argv.indexOf("--append-system-prompt");
 			expect(argIdx).toBeGreaterThan(-1);
-			const instructionsArg = spawnCall.args[argIdx + 1];
+			const instructionsArg = argv[argIdx + 1];
 			expect(instructionsArg).toContain(additionalText);
 
 			vm.closeSession(sessionId);

@@ -1,12 +1,15 @@
-import { readFileSync, realpathSync, existsSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { dirname, join, sep } from "node:path";
 import type { PermissionTier } from "./runtime.js";
 
 /**
  * Resolve a package directory by walking up the directory tree.
  * Supports both nested (pnpm) and flat (npm) node_modules layouts.
  */
-function resolvePackageDir(startDir: string, packageName: string): string {
+export function resolvePackageDir(
+	startDir: string,
+	packageName: string,
+): string {
 	const localPkgJson = join(startDir, "package.json");
 	if (existsSync(localPkgJson)) {
 		try {
@@ -36,8 +39,9 @@ function resolvePackageDir(startDir: string, packageName: string): string {
 			`Ensure it is installed.`,
 	);
 }
-import type { Kernel } from "./runtime-compat.js";
+
 import type { AgentConfig } from "./agents.js";
+import type { Kernel } from "./runtime-compat.js";
 
 // ── Software Descriptor Types ────────────────────────────────────────
 
@@ -156,6 +160,64 @@ export interface CommandPackageMetadata {
 	aliases: Record<string, string>;
 }
 
+function readPackageName(packageDir: string): string {
+	const pkg = JSON.parse(
+		readFileSync(join(packageDir, "package.json"), "utf-8"),
+	) as {
+		name?: unknown;
+	};
+	if (typeof pkg.name !== "string" || pkg.name.length === 0) {
+		throw new Error(`Package at ${packageDir} is missing a valid name`);
+	}
+	return pkg.name;
+}
+
+function pushSoftwareRoot(
+	softwareRoots: SoftwareRoot[],
+	seenVmPaths: Set<string>,
+	hostPath: string,
+	vmPath: string,
+): void {
+	if (seenVmPaths.has(vmPath)) {
+		return;
+	}
+	seenVmPaths.add(vmPath);
+	softwareRoots.push({ hostPath, vmPath });
+}
+
+function findPnpmStoreRoot(hostPath: string): string | null {
+	const marker = `${sep}node_modules${sep}.pnpm${sep}`;
+	const markerIndex = hostPath.indexOf(marker);
+	if (markerIndex === -1) {
+		return null;
+	}
+
+	const nodeModulesRoot = `${hostPath.slice(0, markerIndex)}${sep}node_modules`;
+	const pnpmStoreRoot = join(nodeModulesRoot, ".pnpm");
+	return existsSync(pnpmStoreRoot) ? pnpmStoreRoot : null;
+}
+
+function pushPackageSoftwareRoot(
+	softwareRoots: SoftwareRoot[],
+	seenVmPaths: Set<string>,
+	hostPath: string,
+	vmPath: string,
+): void {
+	pushSoftwareRoot(softwareRoots, seenVmPaths, hostPath, vmPath);
+
+	const pnpmStoreRoot = findPnpmStoreRoot(hostPath);
+	if (!pnpmStoreRoot) {
+		return;
+	}
+
+	pushSoftwareRoot(
+		softwareRoots,
+		seenVmPaths,
+		pnpmStoreRoot,
+		"/root/node_modules/.pnpm",
+	);
+}
+
 /**
  * Create a SoftwareContext for a software descriptor.
  * Resolves npm package paths relative to the descriptor's packageDir.
@@ -172,7 +234,9 @@ function createSoftwareContext(
 
 	for (const reqPkg of requires) {
 		const hostDir = resolvePackageDir(packageDir, reqPkg);
-		const pkg = JSON.parse(readFileSync(join(hostDir, "package.json"), "utf-8"));
+		const pkg = JSON.parse(
+			readFileSync(join(hostDir, "package.json"), "utf-8"),
+		);
 		const vmDir = `/root/node_modules/${reqPkg}`;
 		resolvedPackages.set(reqPkg, { hostDir, vmDir, pkg });
 	}
@@ -247,8 +311,15 @@ export interface ProcessedSoftware {
 }
 
 /** Check if a descriptor is a typed software descriptor (has a `type` field). */
-function isTypedDescriptor(desc: AnySoftwareDescriptor): desc is AgentSoftwareDescriptor | ToolSoftwareDescriptor | WasmCommandSoftwareDescriptor {
-	return "type" in desc && typeof (desc as SoftwareDescriptor).type === "string";
+function isTypedDescriptor(
+	desc: AnySoftwareDescriptor,
+): desc is
+	| AgentSoftwareDescriptor
+	| ToolSoftwareDescriptor
+	| WasmCommandSoftwareDescriptor {
+	return (
+		"type" in desc && typeof (desc as SoftwareDescriptor).type === "string"
+	);
 }
 
 const VALID_PERMISSION_TIERS = new Set<PermissionTier>([
@@ -259,7 +330,10 @@ const VALID_PERMISSION_TIERS = new Set<PermissionTier>([
 ]);
 
 function isPermissionTier(value: unknown): value is PermissionTier {
-	return typeof value === "string" && VALID_PERMISSION_TIERS.has(value as PermissionTier);
+	return (
+		typeof value === "string" &&
+		VALID_PERMISSION_TIERS.has(value as PermissionTier)
+	);
 }
 
 function registerPermission(
@@ -320,9 +394,11 @@ function collectCommandMetadata(
 		}
 	}
 
-	const permissions = (pkg as {
-		permissions?: WasmCommandSoftwareDescriptor["permissions"];
-	}).permissions;
+	const permissions = (
+		pkg as {
+			permissions?: WasmCommandSoftwareDescriptor["permissions"];
+		}
+	).permissions;
 	if (permissions) {
 		for (const commandName of permissions.full ?? []) {
 			appendDeclaredCommand(declaredCommands, seen, commandName);
@@ -365,7 +441,8 @@ function collectRegistryPackagePermissions(
 		}
 
 		const name = (rawCommand as { name: unknown }).name;
-		const permissionTier = (rawCommand as { permissionTier: unknown }).permissionTier;
+		const permissionTier = (rawCommand as { permissionTier: unknown })
+			.permissionTier;
 		if (typeof name !== "string" || !isPermissionTier(permissionTier)) continue;
 		registerPermission(commandPermissions, name, permissionTier);
 	}
@@ -402,13 +479,12 @@ function collectTypedDescriptorPermissions(
  * as a WASM command source. Typed descriptors with `type: "agent"` or `type: "tool"`
  * are processed for module mounting and agent registration.
  */
-export function processSoftware(
-	software: SoftwareInput[],
-): ProcessedSoftware {
+export function processSoftware(software: SoftwareInput[]): ProcessedSoftware {
 	const commandDirs: string[] = [];
 	const commandPackages: CommandPackageMetadata[] = [];
 	const commandPermissions: Record<string, PermissionTier> = {};
 	const softwareRoots: SoftwareRoot[] = [];
+	const seenSoftwareVmPaths = new Set<string>();
 	const agentConfigs = new Map<string, AgentConfig>();
 
 	// Flatten nested arrays (meta-packages export arrays of sub-packages).
@@ -435,10 +511,22 @@ export function processSoftware(
 				// Collect module roots for all required npm packages.
 				// Walks up directory tree to support flat (npm) and nested (pnpm) layouts.
 				const ctx = createSoftwareContext(pkg.packageDir, pkg.requires);
+				const declaringPackageName = readPackageName(pkg.packageDir);
+				pushPackageSoftwareRoot(
+					softwareRoots,
+					seenSoftwareVmPaths,
+					pkg.packageDir,
+					`/root/node_modules/${declaringPackageName}`,
+				);
 				for (const reqPkg of pkg.requires) {
 					const hostDir = resolvePackageDir(pkg.packageDir, reqPkg);
 					const vmDir = `/root/node_modules/${reqPkg}`;
-					softwareRoots.push({ hostPath: hostDir, vmPath: vmDir });
+					pushPackageSoftwareRoot(
+						softwareRoots,
+						seenSoftwareVmPaths,
+						hostDir,
+						vmDir,
+					);
 				}
 
 				// Compute static + dynamic env vars.
@@ -452,7 +540,8 @@ export function processSoftware(
 					agentPackage: pkg.agent.agentPackage,
 					declaringPackageDir: pkg.packageDir,
 					launchArgs: pkg.agent.launchArgs,
-					defaultEnv: Object.keys(combinedEnv).length > 0 ? combinedEnv : undefined,
+					defaultEnv:
+						Object.keys(combinedEnv).length > 0 ? combinedEnv : undefined,
 					prepareInstructions: pkg.agent.prepareInstructions,
 				};
 
@@ -463,10 +552,22 @@ export function processSoftware(
 			case "tool": {
 				// Collect module roots for all required npm packages.
 				// Walks up directory tree to support flat (npm) and nested (pnpm) layouts.
+				const declaringPackageName = readPackageName(pkg.packageDir);
+				pushPackageSoftwareRoot(
+					softwareRoots,
+					seenSoftwareVmPaths,
+					pkg.packageDir,
+					`/root/node_modules/${declaringPackageName}`,
+				);
 				for (const reqPkg of pkg.requires) {
 					const hostDir = resolvePackageDir(pkg.packageDir, reqPkg);
 					const vmDir = `/root/node_modules/${reqPkg}`;
-					softwareRoots.push({ hostPath: hostDir, vmPath: vmDir });
+					pushPackageSoftwareRoot(
+						softwareRoots,
+						seenSoftwareVmPaths,
+						hostDir,
+						vmDir,
+					);
 				}
 				// Tool bin registration is handled by the caller (AgentOs.create)
 				// since it requires kernel access.

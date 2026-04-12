@@ -1,4 +1,5 @@
 import { execFileSync, spawn as spawnChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
 	existsSync,
 	mkdtempSync,
@@ -10,27 +11,29 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import {
-	sep as hostPathSeparator,
 	join,
 	posix as posixPath,
-	relative as relativeHostPath,
 	resolve as resolveHostPath,
 } from "node:path";
 import { fileURLToPath } from "node:url";
-import { type ToolKit, validateToolkits } from "./host-tools.js";
-import { generateToolReference } from "./host-tools-prompt.js";
-import {
-	type HostToolsServer,
-	startHostToolsServer,
-} from "./host-tools-server.js";
-import {
-	createShimFilesystem,
-	generateMasterShim,
-	generateToolkitShim,
-} from "./host-tools-shims.js";
+import type {
+	AgentCapabilities,
+	AgentInfo,
+	GetEventsOptions,
+	PermissionReply,
+	PermissionRequest,
+	PermissionRequestHandler,
+	SequencedEvent,
+	SessionConfigOption,
+	SessionEventHandler,
+	SessionInitData,
+	SessionModeState,
+} from "./agent-session-types.js";
+import { type HostTool, type ToolKit, validateToolkits } from "./host-tools.js";
+import { zodToJsonSchema } from "./host-tools-zod.js";
+import type { JsonRpcNotification, JsonRpcResponse } from "./json-rpc.js";
 import {
 	type ConnectTerminalOptions,
-	createInMemoryFileSystem,
 	type Kernel,
 	type KernelExecOptions,
 	type KernelExecResult,
@@ -44,6 +47,29 @@ import {
 	type VirtualStat,
 } from "./runtime-compat.js";
 
+export type {
+	AgentCapabilities,
+	AgentInfo,
+	GetEventsOptions,
+	PermissionReply,
+	PermissionRequest,
+	PermissionRequestHandler,
+	SequencedEvent,
+	SessionConfigOption,
+	SessionEventHandler,
+	SessionInitData,
+	SessionMode,
+	SessionModeState,
+} from "./agent-session-types.js";
+export type {
+	AcpTimeoutErrorData,
+	JsonRpcError,
+	JsonRpcErrorData,
+	JsonRpcNotification,
+	JsonRpcRequest,
+	JsonRpcResponse,
+} from "./json-rpc.js";
+export { isAcpTimeoutErrorData } from "./json-rpc.js";
 export type { ConnectTerminalOptions } from "./runtime-compat.js";
 
 /** Process tree node: extends kernel ProcessInfo with child references. */
@@ -89,13 +115,12 @@ export interface BatchReadResult {
 
 /** Entry in the agent registry, describing an available agent type. */
 export interface AgentRegistryEntry {
-	id: AgentType;
+	id: string;
 	acpAdapter: string;
 	agentPackage: string;
 	installed: boolean;
 }
 
-import { AcpClient } from "./acp-client.js";
 import { AGENT_CONFIGS, type AgentConfig, type AgentType } from "./agents.js";
 import {
 	getBaseEnvironment,
@@ -113,9 +138,14 @@ import type {
 } from "./cron/types.js";
 import {
 	type FilesystemEntry,
+	sortFilesystemEntries,
 	snapshotVirtualFilesystem,
 } from "./filesystem-snapshot.js";
 import { createHostDirBackend } from "./host-dir-mount.js";
+import {
+	type LocalCompatMount,
+	serializeMountConfigForSidecar,
+} from "./js-bridge.js";
 import {
 	createSnapshotExport,
 	type LayerStore,
@@ -123,55 +153,78 @@ import {
 	type RootSnapshotExport,
 	type SnapshotLayerHandle,
 } from "./layers.js";
-import { getOsInstructions } from "./os-instructions.js";
 import {
 	type CommandPackageMetadata,
 	processSoftware,
+	resolvePackageDir,
 	type SoftwareInput,
 	type SoftwareRoot,
 } from "./packages.js";
-import type { JsonRpcRequest, JsonRpcResponse } from "./protocol.js";
 import { createNodeHostNetworkAdapter } from "./runtime-compat.js";
+import { serializePermissionsForSidecar } from "./sidecar/permissions.js";
 import {
-	type AgentCapabilities,
-	type AgentInfo,
-	type GetEventsOptions,
-	type PermissionReply,
-	type PermissionRequestHandler,
-	type SequencedEvent,
-	Session,
-	type SessionConfigOption,
-	type SessionEventHandler,
-	type SessionInitData,
-	type SessionModeState,
-} from "./session.js";
-import {
-	type AgentOsCreateSidecarOptions,
-	type AgentOsSharedSidecarOptions,
-	type AgentOsSidecar,
-	type AgentOsSidecarConfig,
-	type AgentOsSidecarVmLease,
-	createAgentOsSidecar,
-	getSharedAgentOsSidecar,
-	leaseAgentOsSidecarVm,
-} from "./sidecar/handle.js";
-import type { InProcessSidecarVmAdmin } from "./sidecar/in-process-transport.js";
-import { serializeMountConfigForSidecar } from "./sidecar/mount-descriptors.js";
-import {
-	type LocalCompatMount,
+	type AgentOsSidecarClient,
+	type AgentOsSidecarPlacement,
+	type AgentOsSidecarSessionBootstrap,
+	type AgentOsSidecarSessionHandle,
+	type AgentOsSidecarTransport,
+	type AgentOsSidecarVmBootstrap,
+	type AgentOsSidecarVmHandle,
+	type AuthenticatedSession,
+	type CreatedVm,
+	createAgentOsSidecarClient,
 	NativeSidecarKernelProxy,
-} from "./sidecar/native-kernel-proxy.js";
-import { serializePermissionsForSidecar } from "./sidecar/permission-descriptors.js";
-import type { RootFilesystemEntry } from "./sidecar/native-process-client.js";
-import { NativeSidecarProcessClient } from "./sidecar/native-process-client.js";
-import { serializeRootFilesystemForSidecar } from "./sidecar/root-filesystem-descriptors.js";
-import { createStdoutLineIterable } from "./stdout-lines.js";
+	NativeSidecarProcessClient,
+	type RootFilesystemEntry,
+	type SidecarRegisteredToolDefinition,
+	type SidecarRequestFrame,
+	type SidecarResponsePayload,
+	type SidecarSessionState,
+	serializeRootFilesystemForSidecar,
+} from "./sidecar/rpc-client.js";
 
-export type {
-	AgentOsCreateSidecarOptions,
-	AgentOsSharedSidecarOptions,
-	AgentOsSidecarConfig,
-} from "./sidecar/handle.js";
+const OS_INSTRUCTIONS_FIXTURE = fileURLToPath(
+	new URL("../fixtures/AGENTOS_SYSTEM_PROMPT.md", import.meta.url),
+);
+
+function buildOsInstructions(additional?: string): string {
+	const base = readFileSync(OS_INSTRUCTIONS_FIXTURE, "utf-8");
+	if (!additional) {
+		return base;
+	}
+	return `${base}\n${additional}`;
+}
+
+export interface AgentOsSharedSidecarOptions {
+	pool?: string;
+}
+
+export interface AgentOsCreateSidecarOptions {
+	sidecarId?: string;
+}
+
+export type AgentOsSidecarConfig =
+	| { kind: "shared"; pool?: string }
+	| { kind: "explicit"; handle: AgentOsSidecar };
+
+export interface AgentOsSidecarDescription {
+	sidecarId: string;
+	placement: AgentOsSidecarPlacement;
+	state: "ready" | "disposing" | "disposed";
+	activeVmCount: number;
+}
+
+interface InProcessSidecarVmAdmin {
+	dispose(): Promise<void>;
+}
+
+interface AgentOsSidecarVmLease<TVmAdmin extends InProcessSidecarVmAdmin> {
+	sidecar: AgentOsSidecar;
+	session: AgentOsSidecarSessionHandle;
+	vm: AgentOsSidecarVmHandle;
+	admin: TVmAdmin;
+	dispose(): Promise<void>;
+}
 
 interface HostMountInfo {
 	vmPath: string;
@@ -184,18 +237,36 @@ interface AgentOsVmAdmin extends InProcessSidecarVmAdmin {
 	rootView: VirtualFileSystem;
 	hostMounts: HostMountInfo[];
 	env: Record<string, string>;
+	sidecarClient: NativeSidecarProcessClient;
+	sidecarSession: AuthenticatedSession;
+	sidecarVm: CreatedVm;
 	snapshotRootFilesystem?: () => Promise<RootSnapshotExport>;
 	toolKits: ToolKit[];
-	toolsServer: HostToolsServer | null;
-	shimFs: ReturnType<typeof createInMemoryFileSystem> | null;
+	toolReference: string;
 }
 
-interface AcpTerminalState {
+interface AgentSessionEntry {
 	sessionId: string;
-	pid: number;
-	output: string;
-	truncated: boolean;
-	outputByteLimit: number;
+	agentType: string;
+	processId: string;
+	pid: number | null;
+	closed: boolean;
+	modes: SessionModeState | null;
+	configOptions: SessionConfigOption[];
+	capabilities: AgentCapabilities;
+	agentInfo: AgentInfo | null;
+	events: SequencedEvent[];
+	eventHandlers: Set<SessionEventHandler>;
+	permissionHandlers: Set<PermissionRequestHandler>;
+	configOverrides: Map<string, string>;
+	pendingPermissionReplies: Map<
+		string,
+		{
+			resolve: (reply: PermissionReply) => void;
+			reject: (error: Error) => void;
+			timer: ReturnType<typeof setTimeout>;
+		}
+	>;
 }
 
 export type RootLowerInput =
@@ -367,6 +438,102 @@ export interface SpawnedProcessInfo {
 	args: string[];
 	running: boolean;
 	exitCode: number | null;
+}
+
+const LEGACY_PERMISSION_METHOD = "request/permission";
+const ACP_PERMISSION_METHOD = "session/request_permission";
+
+function toJsonRpcNotification(value: unknown): JsonRpcNotification {
+	if (
+		!value ||
+		typeof value !== "object" ||
+		Array.isArray(value) ||
+		(value as { jsonrpc?: unknown }).jsonrpc !== "2.0" ||
+		typeof (value as { method?: unknown }).method !== "string"
+	) {
+		throw new Error("Invalid JSON-RPC notification from sidecar");
+	}
+	return value as JsonRpcNotification;
+}
+
+function toRecord(value: unknown): Record<string, unknown> {
+	return value && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: {};
+}
+
+function cloneSequencedEvents(events: SequencedEvent[]): SequencedEvent[] {
+	return events.map((event) => ({
+		sequenceNumber: event.sequenceNumber,
+		notification: event.notification,
+	}));
+}
+
+function mergeSequencedEvents(
+	current: SequencedEvent[],
+	incoming: SequencedEvent[],
+): SequencedEvent[] {
+	const bySequence = new Map<number, SequencedEvent>();
+	for (const event of current) {
+		bySequence.set(event.sequenceNumber, event);
+	}
+	for (const event of incoming) {
+		bySequence.set(event.sequenceNumber, event);
+	}
+	return [...bySequence.values()].sort(
+		(left, right) => left.sequenceNumber - right.sequenceNumber,
+	);
+}
+
+function toSessionModes(value: unknown): SessionModeState | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		return null;
+	}
+	return value as SessionModeState;
+}
+
+function toSessionConfigOptions(value: unknown): SessionConfigOption[] {
+	return Array.isArray(value) ? (value as SessionConfigOption[]) : [];
+}
+
+function toAgentCapabilities(value: unknown): AgentCapabilities {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		return {};
+	}
+	return value as AgentCapabilities;
+}
+
+function toAgentInfo(value: unknown): AgentInfo | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		return null;
+	}
+	if (typeof (value as { name?: unknown }).name !== "string") {
+		return null;
+	}
+	return value as AgentInfo;
+}
+
+function sessionEntryFromInit(
+	sessionId: string,
+	agentType: string,
+	initData: SessionInitData,
+): AgentSessionEntry {
+	return {
+		sessionId,
+		agentType,
+		processId: "",
+		pid: null,
+		closed: false,
+		modes: initData.modes ?? null,
+		configOptions: initData.configOptions ?? [],
+		capabilities: initData.capabilities ?? {},
+		agentInfo: initData.agentInfo ?? null,
+		events: [],
+		eventHandlers: new Set(),
+		permissionHandlers: new Set(),
+		configOverrides: new Map(),
+		pendingPermissionReplies: new Map(),
+	};
 }
 
 function isOverlayMountConfig(
@@ -792,6 +959,7 @@ function collectConfiguredLowerPaths(
 function createKernelBootstrapLower(
 	config: RootFilesystemConfig | undefined,
 	commandNames: string[],
+	extraEntries: FilesystemEntry[] = [],
 ): RootSnapshotExport | null {
 	const existingPaths = collectConfiguredLowerPaths(config);
 	const entries: FilesystemEntry[] = [
@@ -848,7 +1016,30 @@ function createKernelBootstrapLower(
 		});
 	}
 
+	for (const entry of sortFilesystemEntries(extraEntries)) {
+		if (existingPaths.has(entry.path)) {
+			continue;
+		}
+		entries.push(entry);
+	}
+
 	return entries.length > 1 ? createSnapshotExport(entries) : null;
+}
+
+function buildOsInstructionsBootstrapEntries(
+	additionalInstructions?: string,
+): FilesystemEntry[] {
+	return [
+		{
+			path: "/etc/agentos/instructions.md",
+			type: "file",
+			mode: "0644",
+			uid: 0,
+			gid: 0,
+			content: buildOsInstructions(additionalInstructions),
+			encoding: "utf8",
+		},
+	];
 }
 
 function toSnapshotModeString(
@@ -1070,12 +1261,9 @@ function collectSidecarMountPlan(options: {
 		join(options.moduleAccessCwd, "node_modules"),
 	);
 	if (existsSync(moduleNodeModules)) {
-		pushMount({
-			path: "/root/node_modules",
-			plugin: createHostDirBackend({
-				hostPath: moduleNodeModules,
-				readOnly: true,
-			}),
+		hostPathMappings.push({
+			vmPath: "/root/node_modules",
+			hostPath: moduleNodeModules,
 			readOnly: true,
 		});
 	}
@@ -1122,24 +1310,193 @@ function collectSidecarMountPlan(options: {
 
 function materializeToolShimDir(toolKits: ToolKit[]): string {
 	const shimDir = mkdtempSync(join(tmpdir(), "agent-os-host-tools-shims-"));
-	writeFileSync(join(shimDir, "agentos"), generateMasterShim(), {
-		mode: 0o755,
-	});
+	writeFileSync(
+		join(shimDir, "agentos"),
+		'#!/bin/sh\nexec /bin/agentos "$@"\n',
+		{ mode: 0o755 },
+	);
 
 	for (const toolKit of toolKits) {
-		const filename = `agentos-${toolKit.name}`;
-		writeFileSync(join(shimDir, filename), generateToolkitShim(toolKit.name), {
-			mode: 0o755,
-		});
+		writeFileSync(
+			join(shimDir, `agentos-${toolKit.name}`),
+			`#!/bin/sh\nexec /bin/agentos-${toolKit.name} "$@"\n`,
+			{ mode: 0o755 },
+		);
 	}
 
 	return shimDir;
 }
 
+function collectToolkitBootstrapCommands(toolKits: ToolKit[]): string[] {
+	if (toolKits.length === 0) {
+		return [];
+	}
+
+	return ["agentos", ...toolKits.map((toolKit) => `agentos-${toolKit.name}`)];
+}
+
+function materializeOsInstructionsDir(additionalInstructions?: string): string {
+	const instructionsDir = mkdtempSync(
+		join(tmpdir(), "agent-os-os-instructions-"),
+	);
+	writeFileSync(
+		join(instructionsDir, "instructions.md"),
+		buildOsInstructions(additionalInstructions),
+	);
+	return instructionsDir;
+}
+
+function validationMessage(error: unknown): string {
+	if (
+		typeof error === "object" &&
+		error !== null &&
+		"issues" in error &&
+		Array.isArray((error as { issues?: unknown[] }).issues)
+	) {
+		return (
+			error as { issues: Array<{ message: string; path?: unknown[] }> }
+		).issues
+			.map((issue) => {
+				const path =
+					Array.isArray(issue.path) && issue.path.length > 0
+						? ` at "${issue.path.join(".")}"`
+						: "";
+				return `${issue.message}${path}`;
+			})
+			.join("; ");
+	}
+	return error instanceof Error ? error.message : String(error);
+}
+
+function toolToSidecarDefinition(
+	tool: HostTool,
+): SidecarRegisteredToolDefinition {
+	return {
+		description: tool.description,
+		inputSchema: zodToJsonSchema(tool.inputSchema),
+		...(tool.timeout !== undefined ? { timeoutMs: tool.timeout } : {}),
+		...(tool.examples && tool.examples.length > 0
+			? {
+					examples: tool.examples.map((example) => ({
+						description: example.description,
+						input: example.input,
+					})),
+				}
+			: {}),
+	};
+}
+
+async function handleToolInvocation(
+	request: SidecarRequestFrame,
+	toolMap: ReadonlyMap<string, HostTool>,
+): Promise<SidecarResponsePayload> {
+	const payload = request.payload;
+	if (payload.type !== "tool_invocation") {
+		return {
+			type: "tool_invocation_result",
+			invocation_id: "unknown",
+			error: `unsupported sidecar request type: ${payload.type}`,
+		};
+	}
+
+	const tool = toolMap.get(payload.tool_key);
+	if (!tool) {
+		return {
+			type: "tool_invocation_result",
+			invocation_id: payload.invocation_id,
+			error: `Unknown tool "${payload.tool_key}"`,
+		};
+	}
+
+	const parsed = tool.inputSchema.safeParse(payload.input);
+	if (!parsed.success) {
+		return {
+			type: "tool_invocation_result",
+			invocation_id: payload.invocation_id,
+			error: validationMessage(parsed.error),
+		};
+	}
+
+	try {
+		const result = await Promise.race([
+			Promise.resolve(tool.execute(parsed.data)),
+			new Promise<never>((_, reject) =>
+				setTimeout(
+					() =>
+						reject(
+							new Error(
+								`Tool "${payload.tool_key}" timed out after ${payload.timeout_ms}ms`,
+							),
+						),
+					payload.timeout_ms,
+				),
+			),
+		]);
+		return {
+			type: "tool_invocation_result",
+			invocation_id: payload.invocation_id,
+			result,
+		};
+	} catch (error) {
+		return {
+			type: "tool_invocation_result",
+			invocation_id: payload.invocation_id,
+			error: validationMessage(error),
+		};
+	}
+}
+
+function buildToolMap(toolKits: ToolKit[]): Map<string, HostTool> {
+	const toolMap = new Map<string, HostTool>();
+	for (const toolKit of toolKits) {
+		for (const [toolName, tool] of Object.entries(toolKit.tools)) {
+			toolMap.set(`${toolKit.name}:${toolName}`, tool);
+		}
+	}
+	return toolMap;
+}
+
+async function registerToolkitsOnSidecar(
+	client: NativeSidecarProcessClient,
+	session: AuthenticatedSession,
+	vm: CreatedVm,
+	toolKits: ToolKit[],
+): Promise<string> {
+	if (toolKits.length === 0) {
+		return "";
+	}
+
+	let promptMarkdown = "";
+	for (const toolKit of toolKits) {
+		const registered = await client.registerToolkit(session, vm, {
+			name: toolKit.name,
+			description: toolKit.description,
+			tools: Object.fromEntries(
+				Object.entries(toolKit.tools).map(([toolName, tool]) => [
+					toolName,
+					toolToSidecarDefinition(tool),
+				]),
+			),
+		});
+		promptMarkdown = registered.promptMarkdown;
+	}
+
+	return promptMarkdown;
+}
+
 export class AgentOs {
 	#kernel: Kernel;
 	readonly sidecar: AgentOsSidecar;
-	private _sessions = new Map<string, Session>();
+	private _sessions = new Map<string, AgentSessionEntry>();
+	private _closedSessionIds = new Set<string>();
+	private _sessionClosePromises = new Map<string, Promise<void>>();
+	private _pendingSessionRequestResolvers = new Map<
+		string,
+		Set<{
+			method: string;
+			resolve: (response: JsonRpcResponse) => void;
+		}>
+	>();
 	private _processes = new Map<
 		number,
 		{
@@ -1163,15 +1520,16 @@ export class AgentOs {
 	private _softwareRoots: SoftwareRoot[];
 	private _softwareAgentConfigs: Map<string, AgentConfig>;
 	private _cronManager!: CronManager;
-	private _toolsServer: HostToolsServer | null = null;
 	private _toolKits: ToolKit[] = [];
-	private _shimFs: ReturnType<typeof createInMemoryFileSystem> | null = null;
+	private _toolReference = "";
 	private _hostMounts: HostMountInfo[];
-	private _acpTerminals = new Map<string, AcpTerminalState>();
-	private _acpTerminalCounter = 0;
 	private _env: Record<string, string>;
 	private _rootFilesystem: VirtualFileSystem;
 	private _sidecarLease: AgentOsSidecarVmLease<AgentOsVmAdmin> | null = null;
+	private readonly _sidecarClient: NativeSidecarProcessClient;
+	private readonly _sidecarSession: AuthenticatedSession;
+	private readonly _sidecarVm: CreatedVm;
+	private readonly _disposeSidecarEventListener: () => void;
 
 	private constructor(
 		kernel: Kernel,
@@ -1182,6 +1540,9 @@ export class AgentOs {
 		hostMounts: HostMountInfo[],
 		env: Record<string, string>,
 		rootFilesystem: VirtualFileSystem,
+		sidecarClient: NativeSidecarProcessClient,
+		sidecarSession: AuthenticatedSession,
+		sidecarVm: CreatedVm,
 	) {
 		this.#kernel = kernel;
 		this.sidecar = sidecar;
@@ -1191,6 +1552,12 @@ export class AgentOs {
 		this._hostMounts = hostMounts;
 		this._env = env;
 		this._rootFilesystem = rootFilesystem;
+		this._sidecarClient = sidecarClient;
+		this._sidecarSession = sidecarSession;
+		this._sidecarVm = sidecarVm;
+		this._disposeSidecarEventListener = this._sidecarClient.onEvent((event) => {
+			this._handleSidecarEvent(event);
+		});
 		agentOsRuntimeAdmins.set(this, {
 			kernel,
 			rootView: rootFilesystem,
@@ -1202,13 +1569,13 @@ export class AgentOs {
 	static async createSidecar(
 		options: AgentOsCreateSidecarOptions = {},
 	): Promise<AgentOsSidecar> {
-		return createAgentOsSidecar(options);
+		return createAgentOsSidecarInternal(options);
 	}
 
 	static async getSharedSidecar(
 		options: AgentOsSharedSidecarOptions = {},
 	): Promise<AgentOsSidecar> {
-		return getSharedAgentOsSidecar(options);
+		return getSharedAgentOsSidecarInternal(options);
 	}
 
 	static async create(options?: AgentOsOptions): Promise<AgentOs> {
@@ -1222,18 +1589,23 @@ export class AgentOs {
 
 		const createVmAdmin = async (): Promise<AgentOsVmAdmin> => {
 			const preparedCommandDirs = prepareCommandDirs(processed.commandPackages);
+			const toolBootstrapCommands = collectToolkitBootstrapCommands(
+				toolKits ?? [],
+			);
 			const bootstrapLower = createKernelBootstrapLower(
 				options?.rootFilesystem,
 				[
 					...collectBootstrapWasmCommands(preparedCommandDirs.commandDirs),
 					...NODE_RUNTIME_BOOTSTRAP_COMMANDS,
+					...toolBootstrapCommands,
 				],
+				buildOsInstructionsBootstrapEntries(options?.additionalInstructions),
 			);
-			let toolsServer: HostToolsServer | null = null;
-			let shimFs: ReturnType<typeof createInMemoryFileSystem> | null = null;
+			let toolReference = "";
 			let rootBridge: NativeSidecarKernelProxy | null = null;
 			let kernel: Kernel | null = null;
 			let client: NativeSidecarProcessClient | null = null;
+			let osInstructionsDir: string | null = null;
 			let toolShimDir: string | null = null;
 			let cleanedUp = false;
 
@@ -1242,31 +1614,25 @@ export class AgentOs {
 					return;
 				}
 				cleanedUp = true;
-				if (toolsServer) {
-					await toolsServer.close().catch(() => {});
-					toolsServer = null;
-				}
 				if (toolShimDir) {
 					rmSync(toolShimDir, { recursive: true, force: true });
 					toolShimDir = null;
+				}
+				if (osInstructionsDir) {
+					rmSync(osInstructionsDir, { recursive: true, force: true });
+					osInstructionsDir = null;
 				}
 				preparedCommandDirs.dispose();
 			};
 
 			try {
-				if (toolKits && toolKits.length > 0) {
-					toolsServer = await startHostToolsServer(toolKits);
-				}
-
 				const env: Record<string, string> = getBaseEnvironment();
-				if (toolsServer) {
-					env.AGENTOS_TOOLS_PORT = String(toolsServer.port);
-				}
 				if (toolKits && toolKits.length > 0) {
-					shimFs = await createShimFilesystem(toolKits);
 					toolShimDir = materializeToolShimDir(toolKits);
 				}
-
+				osInstructionsDir = materializeOsInstructionsDir(
+					options?.additionalInstructions,
+				);
 				const commandGuestPaths = collectGuestCommandPaths(
 					preparedCommandDirs.commandDirs,
 				);
@@ -1278,6 +1644,16 @@ export class AgentOs {
 						commandDirs: preparedCommandDirs.commandDirs,
 						shimDir: toolShimDir,
 					});
+				sidecarMounts.push(
+					serializeMountConfigForSidecar({
+						path: "/etc/agentos",
+						plugin: createHostDirBackend({
+							hostPath: osInstructionsDir,
+							readOnly: true,
+						}),
+						readOnly: true,
+					}),
+				);
 
 				client = NativeSidecarProcessClient.spawn({
 					cwd: REPO_ROOT,
@@ -1292,7 +1668,6 @@ export class AgentOs {
 				const nativeVm = await client.createVm(session, {
 					runtime: "java_script",
 					metadata: {
-						cwd: "/home/user",
 						...Object.fromEntries(
 							Object.entries(env).map(([key, value]) => [`env.${key}`, value]),
 						),
@@ -1312,8 +1687,26 @@ export class AgentOs {
 				await client.configureVm(session, nativeVm, {
 					mounts: sidecarMounts,
 					permissions: sidecarPermissions,
+					moduleAccessCwd,
 					commandPermissions: processed.commandPermissions,
+					allowedNodeBuiltins: options?.allowedNodeBuiltins,
+					loopbackExemptPorts: options?.loopbackExemptPorts,
 				});
+				if (toolKits && toolKits.length > 0) {
+					toolReference = await registerToolkitsOnSidecar(
+						client,
+						session,
+						nativeVm,
+						toolKits,
+					);
+					commandGuestPaths.set("agentos", "/bin/agentos");
+					for (const toolKit of toolKits) {
+						commandGuestPaths.set(
+							`agentos-${toolKit.name}`,
+							`/bin/agentos-${toolKit.name}`,
+						);
+					}
+				}
 
 				rootBridge = new NativeSidecarKernelProxy({
 					client,
@@ -1323,29 +1716,10 @@ export class AgentOs {
 					cwd: "/home/user",
 					localMounts,
 					commandGuestPaths,
-					wasmCommandPermissions: processed.commandPermissions,
-					hostPathMappings: hostPathMappings.map((mapping) => ({
-						guestPath: mapping.vmPath,
-						hostPath: mapping.hostPath,
-					})),
-					allowedNodeBuiltins: options?.allowedNodeBuiltins,
-					loopbackExemptPorts: options?.loopbackExemptPorts,
-					nodeExecutionCwd: "/home/user",
 					onDispose: cleanup,
 				});
 
 				kernel = rootBridge as unknown as Kernel;
-
-				const etcAgentosFs = createInMemoryFileSystem();
-				await etcAgentosFs.writeFile(
-					"instructions.md",
-					getOsInstructions(options?.additionalInstructions),
-				);
-				kernel.mountFs("/etc/agentos", etcAgentosFs, { readOnly: true });
-
-				if (shimFs) {
-					kernel.mountFs("/usr/local/bin", shimFs, { readOnly: true });
-				}
 				const snapshotClient = client;
 
 				return {
@@ -1353,15 +1727,17 @@ export class AgentOs {
 					hostMounts,
 					kernel,
 					rootView: rootBridge.createRootView(),
+					sidecarClient: client,
+					sidecarSession: session,
+					sidecarVm: nativeVm,
 					snapshotRootFilesystem: async () =>
 						createSnapshotExport(
 							convertSidecarRootSnapshotEntries(
 								await snapshotClient.snapshotRootFilesystem(session, nativeVm),
 							),
 						),
-					shimFs,
 					toolKits: toolKits ?? [],
-					toolsServer,
+					toolReference,
 					async dispose() {
 						if (kernel) {
 							const currentKernel = kernel;
@@ -1409,11 +1785,14 @@ export class AgentOs {
 				vmAdmin.hostMounts,
 				vmAdmin.env,
 				vmAdmin.rootView,
+				vmAdmin.sidecarClient,
+				vmAdmin.sidecarSession,
+				vmAdmin.sidecarVm,
 			);
 			vm._sidecarLease = sidecarLease;
-			vm._toolsServer = vmAdmin.toolsServer;
 			vm._toolKits = vmAdmin.toolKits;
-			vm._shimFs = vmAdmin.shimFs;
+			vm._toolReference = vmAdmin.toolReference;
+			vm._installSidecarRequestHandler();
 			vm._cronManager = new CronManager(
 				vm,
 				options?.scheduleDriver ?? new TimerScheduleDriver(),
@@ -1451,7 +1830,7 @@ export class AgentOs {
 		};
 		this._processes.set(proc.pid, entry);
 
-		proc.wait().then((code) => {
+		void proc.wait().then((code) => {
 			for (const h of exitHandlers) h(code);
 		});
 
@@ -1880,228 +2259,6 @@ export class AgentOs {
 		return null;
 	}
 
-	private _resolveHostPathToVmPath(hostPath: string): string | null {
-		const normalizedHostPath = resolveHostPath(hostPath);
-		for (const mount of this._hostMounts) {
-			if (
-				normalizedHostPath === mount.hostPath ||
-				normalizedHostPath.startsWith(`${mount.hostPath}${hostPathSeparator}`)
-			) {
-				const relativePath = relativeHostPath(
-					mount.hostPath,
-					normalizedHostPath,
-				);
-				if (!relativePath) {
-					return mount.vmPath;
-				}
-				return posixPath.join(
-					mount.vmPath,
-					...relativePath.split(hostPathSeparator).filter(Boolean),
-				);
-			}
-		}
-		return null;
-	}
-
-	private _normalizeClientPathToVmPath(clientPath: string): string {
-		if (!clientPath.startsWith("/")) {
-			throw new Error(`ACP path must be absolute: ${clientPath}`);
-		}
-		return (
-			this._resolveHostPathToVmPath(clientPath) ??
-			posixPath.normalize(clientPath)
-		);
-	}
-
-	private _appendTerminalOutput(
-		terminal: AcpTerminalState,
-		data: Uint8Array,
-	): void {
-		terminal.output += new TextDecoder().decode(data);
-		if (terminal.outputByteLimit <= 0) {
-			terminal.output = "";
-			terminal.truncated = true;
-			return;
-		}
-
-		while (
-			Buffer.byteLength(terminal.output, "utf8") > terminal.outputByteLimit
-		) {
-			terminal.output = terminal.output.slice(1);
-			terminal.truncated = true;
-		}
-	}
-
-	private async _handleInboundAcpRequest(
-		request: JsonRpcRequest,
-	): Promise<{ result?: unknown } | null> {
-		const params =
-			request.params && typeof request.params === "object"
-				? (request.params as Record<string, unknown>)
-				: {};
-
-		switch (request.method) {
-			case "fs/read_text_file": {
-				const path = params.path;
-				if (typeof path !== "string") {
-					throw new Error("fs/read_text_file requires a string path");
-				}
-				const vmPath = this._normalizeClientPathToVmPath(path);
-				const content = new TextDecoder().decode(await this.readFile(vmPath));
-				const startLine = Math.max(
-					1,
-					typeof params.line === "number" ? params.line : 1,
-				);
-				const limit =
-					typeof params.limit === "number" ? params.limit : undefined;
-				const lines = content.split("\n");
-				const sliced = lines.slice(
-					startLine - 1,
-					limit === undefined ? undefined : startLine - 1 + limit,
-				);
-				return { result: { content: sliced.join("\n") } };
-			}
-			case "fs/write_text_file": {
-				const path = params.path;
-				const content = params.content;
-				if (typeof path !== "string" || typeof content !== "string") {
-					throw new Error(
-						"fs/write_text_file requires string path and content",
-					);
-				}
-				await this.writeFile(this._normalizeClientPathToVmPath(path), content);
-				return { result: null };
-			}
-			case "terminal/create": {
-				const command = params.command;
-				if (typeof command !== "string") {
-					throw new Error("terminal/create requires a command");
-				}
-				const args = Array.isArray(params.args)
-					? params.args.filter((arg): arg is string => typeof arg === "string")
-					: [];
-				const env = Array.isArray(params.env)
-					? Object.fromEntries(
-							params.env
-								.map((entry) => {
-									if (
-										!entry ||
-										typeof entry !== "object" ||
-										typeof (entry as { name?: unknown }).name !== "string" ||
-										typeof (entry as { value?: unknown }).value !== "string"
-									) {
-										return null;
-									}
-									return [
-										(entry as { name: string }).name,
-										(entry as { value: string }).value,
-									];
-								})
-								.filter((entry): entry is [string, string] =>
-									Array.isArray(entry),
-								),
-						)
-					: undefined;
-				const cwd =
-					typeof params.cwd === "string"
-						? this._normalizeClientPathToVmPath(params.cwd)
-						: undefined;
-				const outputByteLimit =
-					typeof params.outputByteLimit === "number"
-						? params.outputByteLimit
-						: 1_048_576;
-				const terminalId = `acp-term-${++this._acpTerminalCounter}`;
-				const { pid } = this.spawn(command, args, {
-					cwd,
-					env,
-					onStdout: (data) => {
-						const terminal = this._acpTerminals.get(terminalId);
-						if (terminal) {
-							this._appendTerminalOutput(terminal, data);
-						}
-					},
-					onStderr: (data) => {
-						const terminal = this._acpTerminals.get(terminalId);
-						if (terminal) {
-							this._appendTerminalOutput(terminal, data);
-						}
-					},
-				});
-				this._acpTerminals.set(terminalId, {
-					sessionId:
-						typeof params.sessionId === "string" ? params.sessionId : "",
-					pid,
-					output: "",
-					truncated: false,
-					outputByteLimit,
-				});
-				return { result: { terminalId } };
-			}
-			case "terminal/output": {
-				const terminalId = params.terminalId;
-				if (typeof terminalId !== "string") {
-					throw new Error("terminal/output requires a terminalId");
-				}
-				const terminal = this._acpTerminals.get(terminalId);
-				if (!terminal) {
-					throw new Error(`ACP terminal not found: ${terminalId}`);
-				}
-				const proc = this.getProcess(terminal.pid);
-				return {
-					result: {
-						output: terminal.output,
-						truncated: terminal.truncated,
-						exitStatus:
-							proc.exitCode === null
-								? undefined
-								: { exitCode: proc.exitCode, signal: null },
-					},
-				};
-			}
-			case "terminal/wait_for_exit": {
-				const terminalId = params.terminalId;
-				if (typeof terminalId !== "string") {
-					throw new Error("terminal/wait_for_exit requires a terminalId");
-				}
-				const terminal = this._acpTerminals.get(terminalId);
-				if (!terminal) {
-					throw new Error(`ACP terminal not found: ${terminalId}`);
-				}
-				const exitCode = await this.waitProcess(terminal.pid);
-				return { result: { exitCode, signal: null } };
-			}
-			case "terminal/kill": {
-				const terminalId = params.terminalId;
-				if (typeof terminalId !== "string") {
-					throw new Error("terminal/kill requires a terminalId");
-				}
-				const terminal = this._acpTerminals.get(terminalId);
-				if (!terminal) {
-					throw new Error(`ACP terminal not found: ${terminalId}`);
-				}
-				this.killProcess(terminal.pid);
-				return { result: null };
-			}
-			case "terminal/release": {
-				const terminalId = params.terminalId;
-				if (typeof terminalId !== "string") {
-					throw new Error("terminal/release requires a terminalId");
-				}
-				const terminal = this._acpTerminals.get(terminalId);
-				if (!terminal) {
-					throw new Error(`ACP terminal not found: ${terminalId}`);
-				}
-				if (this.getProcess(terminal.pid).exitCode === null) {
-					this.killProcess(terminal.pid);
-				}
-				this._acpTerminals.delete(terminalId);
-				return { result: null };
-			}
-			default:
-				return null;
-		}
-	}
-
 	/** Returns info about all processes spawned via spawn(). */
 	listProcesses(): SpawnedProcessInfo[] {
 		return [...this._processes.values()].map(({ proc, command, args }) => ({
@@ -2189,7 +2346,7 @@ export class AgentOs {
 	}
 
 	/** Internal helper: retrieve a session or throw. */
-	private _requireSession(sessionId: string): Session {
+	private _requireSession(sessionId: string): AgentSessionEntry {
 		const session = this._sessions.get(sessionId);
 		if (!session) {
 			throw new Error(`Session not found: ${sessionId}`);
@@ -2223,9 +2380,7 @@ export class AgentOs {
 					}
 					if (!hostPkgJsonPath) {
 						hostPkgJsonPath = join(
-							this._moduleAccessCwd,
-							"node_modules",
-							config.acpAdapter,
+							resolvePackageDir(this._moduleAccessCwd, config.acpAdapter),
 							"package.json",
 						);
 					}
@@ -2235,7 +2390,7 @@ export class AgentOs {
 					// Package not installed
 				}
 				return {
-					id: id as AgentType,
+					id,
 					acpAdapter: config.acpAdapter,
 					agentPackage: config.agentPackage,
 					installed,
@@ -2244,71 +2399,495 @@ export class AgentOs {
 			.filter((entry): entry is AgentRegistryEntry => entry !== null);
 	}
 
-	private _deriveSessionConfigOptions(
-		agentType: string,
-		sessionResult: Record<string, unknown> | undefined,
-	): SessionConfigOption[] {
-		const models =
-			sessionResult?.models && typeof sessionResult.models === "object"
-				? (sessionResult.models as Record<string, unknown>)
-				: null;
-		if (!models) {
-			return [];
-		}
-
-		const currentModelId =
-			typeof models.currentModelId === "string"
-				? models.currentModelId
-				: undefined;
-		const allowedValues = Array.isArray(models.availableModels)
-			? models.availableModels.reduce<Array<{ id: string; label?: string }>>(
-					(acc, model) => {
-						if (!model || typeof model !== "object") {
-							return acc;
-						}
-						const modelId = (model as { modelId?: unknown }).modelId;
-						const name = (model as { name?: unknown }).name;
-						if (typeof modelId !== "string") {
-							return acc;
-						}
-						acc.push({
-							id: modelId,
-							label: typeof name === "string" ? name : undefined,
-						});
-						return acc;
-					},
-					[],
-				)
-			: [];
-
-		if (!currentModelId && allowedValues.length === 0) {
-			return [];
-		}
-
-		return [
-			{
-				id: "model",
-				category: "model",
-				label: "Model",
-				description:
-					agentType === "opencode"
-						? "Available models reported by OpenCode. Model switching must be configured before createSession() because ACP session/set_config_option is not implemented."
-						: undefined,
-				currentValue: currentModelId,
-				allowedValues,
-				readOnly: agentType === "opencode",
-			},
-		];
+	private _syncSessionState(
+		session: AgentSessionEntry,
+		state: Pick<
+			SidecarSessionState,
+			| "processId"
+			| "pid"
+			| "closed"
+			| "modes"
+			| "configOptions"
+			| "agentCapabilities"
+			| "agentInfo"
+			| "events"
+		>,
+	): void {
+		session.processId = state.processId;
+		session.pid = state.pid ?? null;
+		session.closed = state.closed;
+		session.modes = toSessionModes(state.modes);
+		session.configOptions = toSessionConfigOptions(state.configOptions);
+		this._applySyntheticConfigOverrides(session);
+		session.capabilities = toAgentCapabilities(state.agentCapabilities);
+		session.agentInfo = toAgentInfo(state.agentInfo);
+		session.events = mergeSequencedEvents(
+			session.events,
+			state.events.map((event) => ({
+				sequenceNumber: event.sequenceNumber,
+				notification: toJsonRpcNotification(event.notification),
+			})),
+		);
 	}
 
-	/**
-	 * Spawn an ACP-compatible coding agent inside the VM and return a Session.
-	 *
-	 * 1. Resolves the adapter binary from mounted node_modules
-	 * 2. Spawns it with streaming stdin and stdout capture
-	 * 3. Sends initialize + session/new
-	 * 4. Returns a Session for prompt/cancel/close
-	 */
+	private _applySessionUpdate(
+		session: AgentSessionEntry,
+		notification: JsonRpcNotification,
+	): void {
+		if (notification.method !== "session/update") {
+			return;
+		}
+
+		const params = toRecord(notification.params);
+		const update = toRecord(params.update ?? params);
+		const sessionUpdate = update.sessionUpdate;
+
+		if (
+			sessionUpdate === "current_mode_update" &&
+			typeof update.currentModeId === "string" &&
+			session.modes
+		) {
+			session.modes = {
+				...session.modes,
+				currentModeId: update.currentModeId,
+			};
+		}
+
+		if (
+			(sessionUpdate === "config_option_update" ||
+				sessionUpdate === "config_options_update") &&
+			Array.isArray(update.configOptions)
+		) {
+			session.configOptions = update.configOptions as SessionConfigOption[];
+		}
+	}
+
+	private _recordSessionNotification(
+		session: AgentSessionEntry,
+		sequenceNumber: number,
+		notification: JsonRpcNotification,
+	): void {
+		session.events = mergeSequencedEvents(session.events, [
+			{ sequenceNumber, notification },
+		]);
+		this._applySessionUpdate(session, notification);
+
+		if (notification.method === "session/update") {
+			for (const handler of session.eventHandlers) {
+				handler(notification);
+			}
+		}
+
+		if (
+			notification.method === LEGACY_PERMISSION_METHOD ||
+			notification.method === ACP_PERMISSION_METHOD
+		) {
+			const params = toRecord(notification.params);
+			const permissionId = params.permissionId;
+			if (
+				typeof permissionId === "string" ||
+				typeof permissionId === "number"
+			) {
+				const request: PermissionRequest = {
+					permissionId: String(permissionId),
+					description:
+						typeof params.description === "string"
+							? params.description
+							: undefined,
+					params,
+				};
+				for (const handler of session.permissionHandlers) {
+					handler(request);
+				}
+			}
+		}
+	}
+
+	private _nextSyntheticSequenceNumber(session: AgentSessionEntry): number {
+		return (
+			Math.min(0, ...session.events.map((event) => event.sequenceNumber)) - 1
+		);
+	}
+
+	private _applySyntheticConfigOverrides(session: AgentSessionEntry): void {
+		if (session.configOverrides.size === 0) {
+			return;
+		}
+
+		session.configOptions = session.configOptions.map((option) => {
+			const override =
+				session.configOverrides.get(option.id) ??
+				(typeof option.category === "string"
+					? session.configOverrides.get(option.category)
+					: undefined);
+			return override === undefined
+				? option
+				: { ...option, currentValue: override };
+		});
+	}
+
+	private _recordSyntheticConfigUpdate(session: AgentSessionEntry): void {
+		this._recordSessionNotification(
+			session,
+			this._nextSyntheticSequenceNumber(session),
+			{
+				jsonrpc: "2.0",
+				method: "session/update",
+				params: {
+					update: {
+						sessionUpdate: "config_option_update",
+						configOptions: session.configOptions,
+					},
+				},
+			},
+		);
+	}
+
+	private _applyCodexConfigFallback(
+		session: AgentSessionEntry,
+		category: string,
+		value: string,
+	): JsonRpcResponse {
+		const option = session.configOptions.find(
+			(entry) => entry.category === category,
+		);
+		if (option) {
+			session.configOverrides.set(option.id, value);
+		}
+		session.configOverrides.set(category, value);
+		this._applySyntheticConfigOverrides(session);
+		this._recordSyntheticConfigUpdate(session);
+		return {
+			jsonrpc: "2.0",
+			id: null,
+			result: {
+				configOptions: session.configOptions,
+				via: "codex-config-fallback",
+			},
+		};
+	}
+
+	private _augmentPromptParams(
+		session: AgentSessionEntry,
+		params?: Record<string, unknown>,
+	): Record<string, unknown> | undefined {
+		if (session.agentType !== "codex") {
+			return params;
+		}
+
+		const model = session.configOptions.find(
+			(option) => option.category === "model",
+		)?.currentValue;
+		const thoughtLevel = session.configOptions.find(
+			(option) => option.category === "thought_level",
+		)?.currentValue;
+		if (!model && !thoughtLevel) {
+			return params;
+		}
+
+		const meta =
+			params?._meta &&
+			typeof params._meta === "object" &&
+			!Array.isArray(params._meta)
+				? { ...(params._meta as Record<string, unknown>) }
+				: {};
+		meta.agentOsCodexConfig = {
+			...(typeof model === "string" ? { model } : {}),
+			...(typeof thoughtLevel === "string"
+				? { thought_level: thoughtLevel }
+				: {}),
+		};
+		return {
+			...(params ?? {}),
+			_meta: meta,
+		};
+	}
+
+	private _handleSidecarEvent(
+		event: Parameters<NativeSidecarProcessClient["onEvent"]>[0] extends (
+			event: infer T,
+		) => void
+			? T
+			: never,
+	): void {
+		if (event.payload.type !== "structured") {
+			return;
+		}
+		if (event.payload.name !== "acp.session_event") {
+			return;
+		}
+
+		const sessionId = event.payload.detail.session_id;
+		const session = sessionId ? this._sessions.get(sessionId) : undefined;
+		if (!session) {
+			return;
+		}
+
+		const sequenceNumber = Number(event.payload.detail.sequence_number);
+		if (!Number.isInteger(sequenceNumber)) {
+			return;
+		}
+
+		const notificationText = event.payload.detail.notification;
+		if (typeof notificationText !== "string") {
+			return;
+		}
+
+		try {
+			this._recordSessionNotification(
+				session,
+				sequenceNumber,
+				toJsonRpcNotification(JSON.parse(notificationText)),
+			);
+		} catch {
+			// Ignore malformed event payloads from the sidecar.
+		}
+	}
+
+	private _unsupportedConfigResponse(
+		agentType: string,
+		category: string,
+	): JsonRpcResponse {
+		const message =
+			agentType === "opencode" && category === "model"
+				? "OpenCode reports available models, but model switching must be configured before createSession() because ACP session/set_config_option is not implemented."
+				: `The ${category} config option is read-only for ${agentType} sessions.`;
+		return {
+			jsonrpc: "2.0",
+			id: null,
+			error: {
+				code: -32601,
+				message,
+			},
+		};
+	}
+
+	private async _sendSessionRequest(
+		sessionId: string,
+		method: string,
+		params?: Record<string, unknown>,
+	): Promise<JsonRpcResponse> {
+		const session = this._requireSession(sessionId);
+		const requestParams =
+			method === "session/prompt"
+				? this._augmentPromptParams(session, params)
+				: params;
+		const response = await new Promise<JsonRpcResponse>((resolve, reject) => {
+			const resolvers =
+				this._pendingSessionRequestResolvers.get(sessionId) ?? new Set();
+			const resolver = {
+				method,
+				resolve: (response: JsonRpcResponse) => {
+					resolve(response);
+				},
+			};
+			resolvers.add(resolver);
+			this._pendingSessionRequestResolvers.set(sessionId, resolvers);
+
+			void this._sidecarClient
+				.sessionRequest(this._sidecarSession, this._sidecarVm, {
+					sessionId,
+					method,
+					params: requestParams,
+				})
+				.then(resolve, reject)
+				.finally(() => {
+					const nextResolvers =
+						this._pendingSessionRequestResolvers.get(sessionId);
+					if (!nextResolvers) {
+						return;
+					}
+					nextResolvers.delete(resolver);
+					if (nextResolvers.size === 0) {
+						this._pendingSessionRequestResolvers.delete(sessionId);
+					}
+				});
+		});
+		await this._hydrateSessionState(session).catch(() => {});
+		if (!response.error) {
+			if (
+				method === "session/set_mode" &&
+				typeof requestParams?.modeId === "string" &&
+				session.modes
+			) {
+				session.modes = {
+					...session.modes,
+					currentModeId: requestParams.modeId,
+				};
+			}
+			if (
+				method === "session/set_config_option" &&
+				typeof requestParams?.configId === "string" &&
+				typeof requestParams?.value === "string"
+			) {
+				const nextValue = requestParams.value;
+				session.configOptions = session.configOptions.map((option) =>
+					option.id === requestParams.configId
+						? { ...option, currentValue: nextValue }
+						: option,
+				);
+			}
+		}
+		return response;
+	}
+
+	private async _setSessionConfigByCategory(
+		sessionId: string,
+		category: string,
+		value: string,
+	): Promise<JsonRpcResponse> {
+		const session = this._requireSession(sessionId);
+		const option = session.configOptions.find(
+			(entry) => entry.category === category,
+		);
+		if (option?.readOnly) {
+			return this._unsupportedConfigResponse(session.agentType, category);
+		}
+		const response = await this._sendSessionRequest(
+			sessionId,
+			"session/set_config_option",
+			{
+				configId: option?.id ?? category,
+				value,
+			},
+		);
+		if (
+			session.agentType === "codex" &&
+			response.error?.code === -32601 &&
+			toRecord(response.error.data).method === "session/set_config_option"
+		) {
+			return this._applyCodexConfigFallback(session, category, value);
+		}
+		return response;
+	}
+
+	private _removeSession(sessionId: string): void {
+		this._sessions.delete(sessionId);
+	}
+
+	private _abortPendingSessionRequests(sessionId: string): void {
+		const resolvers = this._pendingSessionRequestResolvers.get(sessionId);
+		if (!resolvers) {
+			return;
+		}
+		this._pendingSessionRequestResolvers.delete(sessionId);
+		const response: JsonRpcResponse = {
+			jsonrpc: "2.0",
+			id: null,
+			error: {
+				code: -32_000,
+				message: `Session closed: ${sessionId}`,
+			},
+		};
+		for (const resolver of resolvers) {
+			resolver.resolve(response);
+		}
+	}
+
+	private _cancelPendingPromptRequests(sessionId: string): void {
+		const resolvers = this._pendingSessionRequestResolvers.get(sessionId);
+		if (!resolvers) {
+			return;
+		}
+
+		const response: JsonRpcResponse = {
+			jsonrpc: "2.0",
+			id: null,
+			result: {
+				stopReason: "cancelled",
+			},
+		};
+
+		for (const resolver of [...resolvers]) {
+			if (resolver.method !== "session/prompt") {
+				continue;
+			}
+			resolvers.delete(resolver);
+			resolver.resolve(response);
+		}
+
+		if (resolvers.size === 0) {
+			this._pendingSessionRequestResolvers.delete(sessionId);
+		}
+	}
+
+	private _rejectPendingPermissionReplies(sessionId: string): void {
+		const session = this._sessions.get(sessionId);
+		if (!session) {
+			return;
+		}
+		for (const [
+			permissionId,
+			pendingReply,
+		] of session.pendingPermissionReplies) {
+			clearTimeout(pendingReply.timer);
+			pendingReply.reject(
+				new Error(`Session closed before permission reply: ${permissionId}`),
+			);
+		}
+		session.pendingPermissionReplies.clear();
+	}
+
+	private _tryForceCloseSessionProcess(sessionId: string): void {
+		const session = this._sessions.get(sessionId);
+		if (!session?.pid) {
+			return;
+		}
+		const sharedPidUsers = [...this._sessions.values()].filter(
+			(candidate) =>
+				candidate.sessionId !== sessionId && candidate.pid === session.pid,
+		);
+		if (sharedPidUsers.length > 0) {
+			return;
+		}
+		try {
+			process.kill(session.pid, "SIGKILL");
+		} catch {
+			// Ignore ESRCH and permission errors; close_agent_session remains the source of truth.
+		}
+	}
+
+	private async _closeSessionInternal(sessionId: string): Promise<void> {
+		const closing = this._sessionClosePromises.get(sessionId);
+		if (closing) {
+			return closing;
+		}
+		if (this._closedSessionIds.has(sessionId)) {
+			return;
+		}
+
+		const hasPendingRequests =
+			(this._pendingSessionRequestResolvers.get(sessionId)?.size ?? 0) > 0;
+		this._abortPendingSessionRequests(sessionId);
+		this._rejectPendingPermissionReplies(sessionId);
+		if (hasPendingRequests) {
+			this._tryForceCloseSessionProcess(sessionId);
+		}
+
+		this._requireSession(sessionId);
+		this._removeSession(sessionId);
+		this._closedSessionIds.add(sessionId);
+
+		const closePromise = this._sidecarClient
+			.closeAgentSession(this._sidecarSession, this._sidecarVm, sessionId)
+			.finally(() => {
+				this._sessionClosePromises.delete(sessionId);
+			});
+		this._sessionClosePromises.set(sessionId, closePromise);
+		await closePromise;
+	}
+
+	private async _hydrateSessionState(
+		session: AgentSessionEntry,
+	): Promise<void> {
+		const state = await this._sidecarClient.getSessionState(
+			this._sidecarSession,
+			this._sidecarVm,
+			session.sessionId,
+		);
+		this._syncSessionState(session, state);
+	}
+
 	async createSession(
 		agentType: AgentType | string,
 		options?: CreateSessionOptions,
@@ -2318,15 +2897,7 @@ export class AgentOs {
 			throw new Error(`Unknown agent type: ${agentType}`);
 		}
 
-		// Generate tool reference from VM-level toolkits. This is always
-		// injected into the agent prompt, even when skipOsInstructions is true.
-		const toolReference =
-			this._toolKits.length > 0
-				? generateToolReference(this._toolKits)
-				: undefined;
-
-		// Prepare OS instructions injection. When skipOsInstructions is true,
-		// the base OS instructions are skipped but tool docs are still injected.
+		const toolReference = this._toolReference || undefined;
 		let extraArgs: string[] = [];
 		let extraEnv: Record<string, string> = {};
 		if (config.prepareInstructions) {
@@ -2346,12 +2917,10 @@ export class AgentOs {
 			}
 		}
 
-		// Create stdout line iterable wired via onStdout callback
-		const { iterable, onStdout } = createStdoutLineIterable();
 		const launchArgs = [...(config.launchArgs ?? []), ...extraArgs];
 		let launchEnv = { ...config.defaultEnv, ...extraEnv, ...options?.env };
 		const sessionCwd = options?.cwd ?? "/home/user";
-		const binPath = this._resolveAdapterBin(config.acpAdapter);
+		const adapterEntrypoint = this._resolveAdapterBin(config.acpAdapter);
 		if (
 			(agentType === "pi" || agentType === "pi-cli") &&
 			!launchEnv.PI_ACP_PI_COMMAND
@@ -2361,113 +2930,43 @@ export class AgentOs {
 				PI_ACP_PI_COMMAND: this._resolvePackageBin(config.agentPackage, "pi"),
 			};
 		}
-		const pid = this.spawn("node", [binPath, ...launchArgs], {
-			streamStdin: true,
-			onStdout,
-			env: launchEnv,
-			cwd: options?.cwd,
-		}).pid;
 
-		const proc = this._processes.get(pid)!.proc;
-		const client = new AcpClient(proc, iterable, {
-			requestHandler: (request) => this._handleInboundAcpRequest(request),
-		});
-
-		let initResponse: JsonRpcResponse;
-		let sessionResponse: JsonRpcResponse;
-		try {
-			initResponse = await client.request("initialize", {
-				protocolVersion: 1,
-				clientCapabilities: {
-					fs: {
-						readTextFile: true,
-						writeTextFile: true,
-					},
-					terminal: true,
-				},
-			});
-			if (initResponse.error) {
-				throw new Error(`ACP initialize failed: ${initResponse.error.message}`);
-			}
-
-			sessionResponse = await client.request("session/new", {
+		const created = await this._sidecarClient.createSession(
+			this._sidecarSession,
+			this._sidecarVm,
+			{
+				agentType: String(agentType),
+				runtime: "java_script",
+				adapterEntrypoint,
+				args: launchArgs,
+				env: launchEnv,
 				cwd: sessionCwd,
 				mcpServers: options?.mcpServers ?? [],
-			});
-			if (sessionResponse.error) {
-				throw new Error(
-					`ACP session/new failed: ${sessionResponse.error.message}`,
-				);
-			}
+			},
+		);
+
+		const initData: SessionInitData = {
+			modes: toSessionModes(created.modes) ?? undefined,
+			configOptions: toSessionConfigOptions(created.configOptions),
+			capabilities: toAgentCapabilities(created.agentCapabilities),
+			agentInfo: toAgentInfo(created.agentInfo) ?? undefined,
+		};
+		const session = sessionEntryFromInit(
+			created.sessionId,
+			String(agentType),
+			initData,
+		);
+		this._closedSessionIds.delete(created.sessionId);
+		this._sessions.set(created.sessionId, session);
+
+		try {
+			await this._hydrateSessionState(session);
 		} catch (error) {
-			client.close();
+			this._removeSession(created.sessionId);
 			throw error;
 		}
 
-		const sessionId = (sessionResponse.result as { sessionId: string })
-			.sessionId;
-
-		// Extract initialize-scoped metadata, then allow session/new to
-		// override with session-scoped modes/config options when present.
-		const initResult = initResponse.result as
-			| Record<string, unknown>
-			| undefined;
-		const sessionResult = sessionResponse.result as
-			| Record<string, unknown>
-			| undefined;
-		const initData: SessionInitData = {};
-		if (initResult) {
-			if (initResult.modes) {
-				initData.modes = initResult.modes as SessionInitData["modes"];
-			}
-			if (initResult.configOptions) {
-				initData.configOptions =
-					initResult.configOptions as SessionInitData["configOptions"];
-			}
-			if (initResult.agentCapabilities) {
-				initData.capabilities =
-					initResult.agentCapabilities as SessionInitData["capabilities"];
-			}
-			if (initResult.agentInfo) {
-				initData.agentInfo =
-					initResult.agentInfo as SessionInitData["agentInfo"];
-			}
-		}
-		if (sessionResult) {
-			if (sessionResult.modes) {
-				initData.modes = sessionResult.modes as SessionInitData["modes"];
-			}
-			if (sessionResult.configOptions) {
-				initData.configOptions =
-					sessionResult.configOptions as SessionInitData["configOptions"];
-			}
-		}
-		const derivedConfigOptions = this._deriveSessionConfigOptions(
-			agentType,
-			sessionResult,
-		);
-		if (derivedConfigOptions.length > 0) {
-			initData.configOptions = [
-				...(initData.configOptions ?? []),
-				...derivedConfigOptions,
-			];
-		}
-
-		const session = new Session(client, sessionId, agentType, initData, () => {
-			for (const [terminalId, terminal] of this._acpTerminals) {
-				if (terminal.sessionId !== sessionId) {
-					continue;
-				}
-				if (this.getProcess(terminal.pid).exitCode === null) {
-					this.killProcess(terminal.pid);
-				}
-				this._acpTerminals.delete(terminalId);
-			}
-			this._sessions.delete(sessionId);
-		});
-		this._sessions.set(sessionId, session);
-
-		return { sessionId };
+		return { sessionId: created.sessionId };
 	}
 
 	/**
@@ -2491,9 +2990,7 @@ export class AgentOs {
 		// Fall back to CWD-based node_modules.
 		if (!hostPkgJsonPath) {
 			hostPkgJsonPath = join(
-				this._moduleAccessCwd,
-				"node_modules",
-				packageName,
+				resolvePackageDir(this._moduleAccessCwd, packageName),
 				"package.json",
 			);
 		}
@@ -2514,6 +3011,97 @@ export class AgentOs {
 		}
 
 		return `${vmPrefix}/${binEntry}`;
+	}
+
+	private _installSidecarRequestHandler(): void {
+		const toolMap = buildToolMap(this._toolKits);
+		this._sidecarClient.setSidecarRequestHandler((request) => {
+			switch (request.payload.type) {
+				case "tool_invocation":
+					return handleToolInvocation(request, toolMap);
+				case "permission_request":
+					return this._handlePermissionSidecarRequest(request);
+				case "js_bridge_call":
+					return Promise.resolve({
+						type: "js_bridge_result",
+						call_id: request.payload.call_id,
+						error: `unsupported sidecar request type: ${request.payload.type}`,
+					});
+			}
+		});
+	}
+
+	private async _handlePermissionSidecarRequest(
+		request: SidecarRequestFrame,
+	): Promise<SidecarResponsePayload> {
+		const payload = request.payload;
+		if (payload.type !== "permission_request") {
+			return {
+				type: "permission_request_result",
+				permission_id: "unknown",
+				error: `unsupported sidecar request type: ${payload.type}`,
+			};
+		}
+
+		const session = this._sessions.get(payload.session_id);
+		if (!session) {
+			return {
+				type: "permission_request_result",
+				permission_id: payload.permission_id,
+				error: `Session not found: ${payload.session_id}`,
+			};
+		}
+
+		if (session.permissionHandlers.size === 0) {
+			return {
+				type: "permission_request_result",
+				permission_id: payload.permission_id,
+				reply: "reject",
+			};
+		}
+
+		const params = toRecord(payload.params);
+		try {
+			const reply = await new Promise<PermissionReply>((resolve, reject) => {
+				const timer = setTimeout(() => {
+					session.pendingPermissionReplies.delete(payload.permission_id);
+					reject(
+						new Error(
+							`Timed out waiting for permission reply: ${payload.permission_id}`,
+						),
+					);
+				}, 120_000);
+				session.pendingPermissionReplies.set(payload.permission_id, {
+					resolve,
+					reject,
+					timer,
+				});
+
+				const permissionRequest: PermissionRequest = {
+					permissionId: payload.permission_id,
+					description:
+						typeof params.description === "string"
+							? params.description
+							: undefined,
+					params,
+				};
+				for (const handler of session.permissionHandlers) {
+					handler(permissionRequest);
+				}
+			});
+
+			return {
+				type: "permission_request_result",
+				permission_id: payload.permission_id,
+				reply,
+			};
+		} catch (error) {
+			return {
+				type: "permission_request_result",
+				permission_id: payload.permission_id,
+				error: validationMessage(error),
+			};
+		}
 	}
 
 	/**
@@ -2542,150 +3130,183 @@ export class AgentOs {
 	 * a graceful shutdown sequence.
 	 */
 	async destroySession(sessionId: string): Promise<void> {
-		const session = this._sessions.get(sessionId);
-		if (!session) {
-			throw new Error(`Session not found: ${sessionId}`);
-		}
-
-		// Attempt graceful cancel before closing (ignore errors)
+		this._requireSession(sessionId);
 		try {
-			await session.cancel();
+			await this.cancelSession(sessionId);
 		} catch {
-			// No pending work or already closed — ignore
+			// Ignore cancellation failures during teardown.
 		}
-
-		session.close();
+		await this._closeSessionInternal(sessionId);
 	}
 
 	// ── Flat session API (ID-based) ───────────────────────────────
 
-	/** Send a prompt to the agent and wait for the final response.
-	 *  Returns the raw JSON-RPC response and the accumulated agent text. */
 	async prompt(sessionId: string, text: string): Promise<PromptResult> {
-		const session = this._requireSession(sessionId);
-
-		// Collect streamed text while the prompt is running
+		this._requireSession(sessionId);
 		let agentText = "";
 		const handler: SessionEventHandler = (event) => {
-			const params = event.params as Record<string, unknown> | undefined;
-			const update = params?.update as Record<string, unknown> | undefined;
+			const params = toRecord(event.params);
+			const update = toRecord(params.update);
 			if (update?.sessionUpdate === "agent_message_chunk") {
-				const content = update.content as { text?: string } | undefined;
-				if (content?.text) agentText += content.text;
+				const content = toRecord(update.content);
+				if (typeof content.text === "string") {
+					agentText += content.text;
+				}
 			}
 		};
-		session.onSessionEvent(handler);
+		const unsubscribe = this.onSessionEvent(sessionId, handler);
 
 		try {
-			const response = await session.prompt(text);
+			const response = await this._sendSessionRequest(
+				sessionId,
+				"session/prompt",
+				{
+					prompt: [{ type: "text", text }],
+				},
+			);
 			return { response, text: agentText };
 		} finally {
-			session.removeSessionEventHandler(handler);
+			unsubscribe();
 		}
 	}
 
 	/** Cancel ongoing agent work for a session. */
 	async cancelSession(sessionId: string): Promise<JsonRpcResponse> {
-		return this._requireSession(sessionId).cancel();
+		this._cancelPendingPromptRequests(sessionId);
+		return this._sendSessionRequest(sessionId, "session/cancel");
 	}
 
-	/** Kill the agent process and clear event history for a session. */
 	closeSession(sessionId: string): void {
-		this._requireSession(sessionId).close();
+		if (
+			!this._sessions.has(sessionId) &&
+			!this._closedSessionIds.has(sessionId) &&
+			!this._sessionClosePromises.has(sessionId)
+		) {
+			throw new Error(`Session not found: ${sessionId}`);
+		}
+		const closePromise = this._closeSessionInternal(sessionId);
+		// `closeSession()` is intentionally fire-and-forget; suppress unhandled
+		// rejections here and let tracked close promises surface errors to any
+		// internal/test callers awaiting `_sessionClosePromises`.
+		void closePromise.catch(() => {});
 	}
 
-	/** Returns the sequenced event history for a session. */
 	getSessionEvents(
 		sessionId: string,
 		options?: GetEventsOptions,
 	): SequencedEvent[] {
-		return this._requireSession(sessionId).getSequencedEvents(options);
+		let events = cloneSequencedEvents(this._requireSession(sessionId).events);
+		if (options?.since !== undefined) {
+			events = events.filter((event) => event.sequenceNumber > options.since!);
+		}
+		if (options?.method !== undefined) {
+			events = events.filter(
+				(event) => event.notification.method === options.method,
+			);
+		}
+		return events;
 	}
 
-	/** Respond to a permission request from an agent. */
 	async respondPermission(
 		sessionId: string,
 		permissionId: string,
 		reply: PermissionReply,
 	): Promise<JsonRpcResponse> {
-		return this._requireSession(sessionId).respondPermission(
+		const session = this._requireSession(sessionId);
+		const pendingReply = session.pendingPermissionReplies.get(permissionId);
+		if (pendingReply) {
+			session.pendingPermissionReplies.delete(permissionId);
+			clearTimeout(pendingReply.timer);
+			pendingReply.resolve(reply);
+			return {
+				jsonrpc: "2.0",
+				id: null,
+				result: {
+					permissionId,
+					reply,
+					via: "sidecar-request",
+				},
+			};
+		}
+
+		return this._sendSessionRequest(sessionId, LEGACY_PERMISSION_METHOD, {
 			permissionId,
 			reply,
-		);
+		});
 	}
 
-	/** Set the session mode (e.g., "plan", "normal"). */
 	async setSessionMode(
 		sessionId: string,
 		modeId: string,
 	): Promise<JsonRpcResponse> {
-		return this._requireSession(sessionId).setMode(modeId);
+		return this._sendSessionRequest(sessionId, "session/set_mode", {
+			modeId,
+		});
 	}
 
-	/** Returns available modes from the agent's reported capabilities. */
 	getSessionModes(sessionId: string): SessionModeState | null {
-		return this._requireSession(sessionId).getModes();
+		return this._requireSession(sessionId).modes;
 	}
 
-	/** Set the model for a session. */
 	async setSessionModel(
 		sessionId: string,
 		model: string,
 	): Promise<JsonRpcResponse> {
-		return this._requireSession(sessionId).setModel(model);
+		return this._setSessionConfigByCategory(sessionId, "model", model);
 	}
 
-	/** Set the thought/reasoning level for a session. */
 	async setSessionThoughtLevel(
 		sessionId: string,
 		level: string,
 	): Promise<JsonRpcResponse> {
-		return this._requireSession(sessionId).setThoughtLevel(level);
+		return this._setSessionConfigByCategory(sessionId, "thought_level", level);
 	}
 
-	/** Returns available config options for a session. */
 	getSessionConfigOptions(sessionId: string): SessionConfigOption[] {
-		return this._requireSession(sessionId).getConfigOptions();
+		return [...this._requireSession(sessionId).configOptions];
 	}
 
-	/** Returns the agent's capability flags for a session. */
 	getSessionCapabilities(sessionId: string): AgentCapabilities | null {
 		const caps = this._requireSession(sessionId).capabilities;
 		return Object.keys(caps).length > 0 ? caps : null;
 	}
 
-	/** Returns agent identity information for a session. */
 	getSessionAgentInfo(sessionId: string): AgentInfo | null {
 		return this._requireSession(sessionId).agentInfo;
 	}
 
-	/** Send an arbitrary JSON-RPC request to a session's agent. */
 	async rawSessionSend(
 		sessionId: string,
 		method: string,
 		params?: Record<string, unknown>,
 	): Promise<JsonRpcResponse> {
-		return this._requireSession(sessionId).rawSend(method, params);
+		return this._sendSessionRequest(sessionId, method, params);
 	}
 
-	/** Subscribe to session/update notifications for a session. Returns an unsubscribe function. */
+	async rawSend(
+		sessionId: string,
+		method: string,
+		params?: Record<string, unknown>,
+	): Promise<JsonRpcResponse> {
+		return this.rawSessionSend(sessionId, method, params);
+	}
+
 	onSessionEvent(sessionId: string, handler: SessionEventHandler): () => void {
 		const session = this._requireSession(sessionId);
-		session.onSessionEvent(handler);
+		session.eventHandlers.add(handler);
 		return () => {
-			session.removeSessionEventHandler(handler);
+			session.eventHandlers.delete(handler);
 		};
 	}
 
-	/** Subscribe to permission requests for a session. Returns an unsubscribe function. */
 	onPermissionRequest(
 		sessionId: string,
 		handler: PermissionRequestHandler,
 	): () => void {
 		const session = this._requireSession(sessionId);
-		session.onPermissionRequest(handler);
+		session.permissionHandlers.add(handler);
 		return () => {
-			session.removePermissionRequestHandler(handler);
+			session.permissionHandlers.delete(handler);
 		};
 	}
 
@@ -2712,31 +3333,21 @@ export class AgentOs {
 	}
 
 	async dispose(): Promise<void> {
-		// Cancel all cron jobs first
 		this._cronManager.dispose();
 
-		// Close all active sessions before disposing the kernel
-		for (const session of [...this._sessions.values()]) {
-			session.close();
+		for (const sessionId of [...this._sessions.keys()]) {
+			await this._closeSessionInternal(sessionId).catch(() => {});
 		}
-		this._sessions.clear();
 
-		// Kill all tracked shells
 		for (const [id, entry] of this._shells) {
 			entry.handle.kill();
 		}
 		this._shells.clear();
 
-		for (const terminal of this._acpTerminals.values()) {
-			if (this.getProcess(terminal.pid).exitCode === null) {
-				this.killProcess(terminal.pid);
-			}
-		}
-		this._acpTerminals.clear();
+		this._disposeSidecarEventListener();
 
 		const sidecarLease = this._sidecarLease;
 		this._sidecarLease = null;
-		this._toolsServer = null;
 		if (sidecarLease) {
 			return sidecarLease.dispose();
 		}
@@ -2762,10 +3373,274 @@ function resolveAgentOsSidecar(
 	config: AgentOsSidecarConfig | undefined,
 ): AgentOsSidecar {
 	if (!config || config.kind === "shared") {
-		return getSharedAgentOsSidecar(
+		return getSharedAgentOsSidecarInternal(
 			config?.kind === "shared" ? { pool: config.pool } : undefined,
 		);
 	}
 
 	return config.handle;
+}
+
+interface CreateInProcessSidecarTransportOptions<
+	TVmAdmin extends InProcessSidecarVmAdmin,
+> {
+	createVm(
+		sessionBootstrap: AgentOsSidecarSessionBootstrap,
+		vmBootstrap: AgentOsSidecarVmBootstrap,
+	): Promise<TVmAdmin>;
+}
+
+interface InProcessSidecarTransport<TVmAdmin extends InProcessSidecarVmAdmin>
+	extends AgentOsSidecarTransport {
+	getVmAdmin(vmId: string): TVmAdmin | undefined;
+}
+
+interface AgentOsSidecarLeaseRecord {
+	dispose(): Promise<void>;
+}
+
+interface AgentOsSidecarState {
+	description: AgentOsSidecarDescription;
+	activeLeases: Set<AgentOsSidecarLeaseRecord>;
+	sharedPool?: string;
+}
+
+const sidecarStates = new WeakMap<AgentOsSidecar, AgentOsSidecarState>();
+const sharedSidecars = new Map<string, AgentOsSidecar>();
+
+export class AgentOsSidecar {
+	constructor(
+		sidecarId: string,
+		placement: AgentOsSidecarPlacement,
+		sharedPool?: string,
+	) {
+		sidecarStates.set(this, {
+			description: {
+				sidecarId,
+				placement: cloneSidecarPlacement(placement),
+				state: "ready",
+				activeVmCount: 0,
+			},
+			activeLeases: new Set(),
+			sharedPool,
+		});
+	}
+
+	describe(): AgentOsSidecarDescription {
+		const state = getSidecarState(this);
+		return cloneSidecarDescription(state.description);
+	}
+
+	async dispose(): Promise<void> {
+		const state = getSidecarState(this);
+		if (state.description.state === "disposed") {
+			return;
+		}
+
+		state.description.state = "disposing";
+		const errors: Error[] = [];
+		for (const lease of [...state.activeLeases]) {
+			try {
+				await lease.dispose();
+			} catch (error) {
+				errors.push(error instanceof Error ? error : new Error(String(error)));
+			}
+		}
+		state.activeLeases.clear();
+		state.description.activeVmCount = 0;
+		state.description.state = "disposed";
+		if (state.sharedPool && sharedSidecars.get(state.sharedPool) === this) {
+			sharedSidecars.delete(state.sharedPool);
+		}
+		if (errors.length > 0) {
+			throw new Error(errors.map((error) => error.message).join("; "));
+		}
+	}
+}
+
+function createAgentOsSidecarInternal(
+	options: AgentOsCreateSidecarOptions = {},
+): AgentOsSidecar {
+	const sidecarId = options.sidecarId ?? `agent-os-sidecar-${randomUUID()}`;
+	return new AgentOsSidecar(sidecarId, {
+		kind: "explicit",
+		sidecarId,
+	});
+}
+
+function getSharedAgentOsSidecarInternal(
+	options: AgentOsSharedSidecarOptions = {},
+): AgentOsSidecar {
+	const pool = options.pool ?? "default";
+	const existing = sharedSidecars.get(pool);
+	if (existing && existing.describe().state !== "disposed") {
+		return existing;
+	}
+
+	const sidecar = new AgentOsSidecar(
+		`agent-os-shared-sidecar:${pool}`,
+		{ kind: "shared", ...(pool ? { pool } : {}) },
+		pool,
+	);
+	sharedSidecars.set(pool, sidecar);
+	return sidecar;
+}
+
+async function leaseAgentOsSidecarVm<TVmAdmin extends InProcessSidecarVmAdmin>(
+	sidecar: AgentOsSidecar,
+	options: CreateInProcessSidecarTransportOptions<TVmAdmin>,
+): Promise<AgentOsSidecarVmLease<TVmAdmin>> {
+	const state = getSidecarState(sidecar);
+	if (state.description.state !== "ready") {
+		throw new Error(
+			`Cannot lease VM from sidecar ${state.description.sidecarId} while it is ${state.description.state}`,
+		);
+	}
+
+	let transport: InProcessSidecarTransport<TVmAdmin> | undefined;
+	const client: AgentOsSidecarClient = createAgentOsSidecarClient({
+		async createSessionTransport(sessionBootstrap) {
+			transport = await createInProcessSidecarTransport(
+				sessionBootstrap,
+				options,
+			);
+			return transport;
+		},
+	});
+
+	let disposed = false;
+	let leaseRecord: AgentOsSidecarLeaseRecord | undefined;
+
+	try {
+		const session = await client.createSession({
+			placement: cloneSidecarPlacement(state.description.placement),
+		});
+		const vm = await session.createVm();
+		const admin = transport?.getVmAdmin(vm.vmId);
+		if (!admin) {
+			throw new Error(`Sidecar VM admin was not registered for ${vm.vmId}`);
+		}
+
+		const lease: AgentOsSidecarVmLease<TVmAdmin> = {
+			sidecar,
+			session,
+			vm,
+			admin,
+			async dispose() {
+				if (disposed) {
+					return;
+				}
+				disposed = true;
+				state.activeLeases.delete(leaseRecord!);
+				state.description.activeVmCount = state.activeLeases.size;
+				await client.dispose();
+			},
+		};
+
+		leaseRecord = {
+			dispose: () => lease.dispose(),
+		};
+		state.activeLeases.add(leaseRecord);
+		state.description.activeVmCount = state.activeLeases.size;
+		return lease;
+	} catch (error) {
+		await client.dispose().catch(() => {});
+		throw error;
+	}
+}
+
+async function createInProcessSidecarTransport<
+	TVmAdmin extends InProcessSidecarVmAdmin,
+>(
+	sessionBootstrap: AgentOsSidecarSessionBootstrap,
+	options: CreateInProcessSidecarTransportOptions<TVmAdmin>,
+): Promise<InProcessSidecarTransport<TVmAdmin>> {
+	const vmAdmins = new Map<string, TVmAdmin>();
+	let disposed = false;
+
+	async function disposeVmAdmin(vmId: string): Promise<void> {
+		const admin = vmAdmins.get(vmId);
+		if (!admin) {
+			return;
+		}
+
+		vmAdmins.delete(vmId);
+		await admin.dispose();
+	}
+
+	return {
+		async createVm(vmBootstrap) {
+			if (disposed) {
+				throw new Error(
+					`Cannot create VM ${vmBootstrap.vmId} for disposed sidecar session ${sessionBootstrap.sessionId}`,
+				);
+			}
+
+			const admin = await options.createVm(sessionBootstrap, vmBootstrap);
+			vmAdmins.set(vmBootstrap.vmId, admin);
+		},
+
+		async disposeVm(vmId) {
+			await disposeVmAdmin(vmId);
+		},
+
+		async dispose() {
+			if (disposed) {
+				return;
+			}
+			disposed = true;
+
+			const errors: Error[] = [];
+			for (const vmId of [...vmAdmins.keys()]) {
+				try {
+					await disposeVmAdmin(vmId);
+				} catch (error) {
+					errors.push(
+						error instanceof Error ? error : new Error(String(error)),
+					);
+				}
+			}
+
+			if (errors.length > 0) {
+				throw new Error(errors.map((error) => error.message).join("; "));
+			}
+		},
+
+		getVmAdmin(vmId) {
+			return vmAdmins.get(vmId);
+		},
+	};
+}
+
+function getSidecarState(sidecar: AgentOsSidecar): AgentOsSidecarState {
+	const state = sidecarStates.get(sidecar);
+	if (!state) {
+		throw new Error("Unknown Agent OS sidecar handle");
+	}
+	return state;
+}
+
+function cloneSidecarDescription(
+	description: AgentOsSidecarDescription,
+): AgentOsSidecarDescription {
+	return {
+		...description,
+		placement: cloneSidecarPlacement(description.placement),
+	};
+}
+
+function cloneSidecarPlacement(
+	placement: AgentOsSidecarPlacement,
+): AgentOsSidecarPlacement {
+	if (placement.kind === "shared") {
+		return {
+			kind: "shared",
+			...(placement.pool ? { pool: placement.pool } : {}),
+		};
+	}
+
+	return {
+		kind: "explicit",
+		sidecarId: placement.sidecarId,
+	};
 }

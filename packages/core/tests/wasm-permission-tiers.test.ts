@@ -2,12 +2,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { NativeSidecarKernelProxy } from "../src/sidecar/native-kernel-proxy.js";
 import type {
 	AuthenticatedSession,
 	CreatedVm,
 	NativeSidecarProcessClient,
-} from "../src/sidecar/native-process-client.js";
+} from "../src/sidecar/rpc-client.js";
+import { NativeSidecarKernelProxy } from "../src/sidecar/rpc-client.js";
 
 describe("WASM command permission tiers", () => {
 	let proxy: NativeSidecarKernelProxy | null = null;
@@ -46,7 +46,7 @@ describe("WASM command permission tiers", () => {
 		return { client, execute };
 	}
 
-	test("propagates per-command WASM tiers into sidecar execute requests", async () => {
+	test("sends unresolved WASM commands to the sidecar", async () => {
 		fixtureRoot = mkdtempSync(join(tmpdir(), "agent-os-wasm-tiers-"));
 		const { client, execute } = createMockClient();
 
@@ -61,14 +61,6 @@ describe("WASM command permission tiers", () => {
 			cwd: "/workspace",
 			localMounts: [],
 			commandGuestPaths: new Map([["grep", "/__agentos/commands/000/grep"]]),
-			wasmCommandPermissions: { grep: "read-only" },
-			hostPathMappings: [
-				{
-					guestPath: "/workspace",
-					hostPath: fixtureRoot,
-				},
-			],
-			nodeExecutionCwd: "/workspace",
 		});
 
 		const proc = proxy.spawn("grep", ["needle", "haystack.txt"], {
@@ -79,9 +71,9 @@ describe("WASM command permission tiers", () => {
 		expect(exitCode).toBe(1);
 		expect(execute).toHaveBeenCalledTimes(1);
 		expect(execute.mock.calls[0]?.[2]).toMatchObject({
-			runtime: "web_assembly",
-			entrypoint: "/__agentos/commands/000/grep",
-			wasmPermissionTier: "read-only",
+			command: "grep",
+			args: ["needle", "haystack.txt"],
+			cwd: "/workspace",
 		});
 	});
 });

@@ -6,11 +6,13 @@ describe("processTree()", () => {
 
 	beforeEach(async () => {
 		vm = await AgentOs.create();
-	});
+	}, 30_000);
 
 	afterEach(async () => {
-		await vm.dispose();
-	});
+		if (vm) {
+			await vm.dispose();
+		}
+	}, 30_000);
 
 	test("returns empty array on fresh VM", () => {
 		expect(vm.processTree()).toEqual([]);
@@ -31,13 +33,15 @@ describe("processTree()", () => {
 		vm.killProcess(pid);
 	}, 30_000);
 
-	test("parent-child tree structure: node script spawning a child", async () => {
-		// Parent spawns a child process via child_process.spawn
+	test("guest child_process.spawn children appear under the tracked parent", async () => {
+		let childPid: string | null = null;
+
 		await vm.writeFile(
 			"/tmp/parent.mjs",
 			`
 import { spawn } from "node:child_process";
 const child = spawn("node", ["/tmp/child.mjs"]);
+console.log("CHILD_PID:" + child.pid);
 // Keep parent alive
 setTimeout(() => {}, 30000);
 `,
@@ -46,19 +50,35 @@ setTimeout(() => {}, 30000);
 
 		const { pid } = vm.spawn("node", ["/tmp/parent.mjs"], {
 			env: { HOME: "/home/user" },
+			onStdout: (data) => {
+				const text = new TextDecoder().decode(data);
+				const match = text.match(/CHILD_PID:(\d+)/);
+				if (match) {
+					childPid = match[1];
+				}
+			},
 		});
 
-		// Give it a moment for the child to spawn
-		await new Promise((r) => setTimeout(r, 1000));
+		for (let attempt = 0; attempt < 20 && childPid === null; attempt++) {
+			await new Promise((r) => setTimeout(r, 100));
+		}
 
-		const tree = vm.processTree();
-		const parentNode = tree.find((n) => n.pid === pid);
+		let parentNode = vm.processTree().find((node) => node.pid === pid);
+		for (let attempt = 0; attempt < 20; attempt++) {
+			parentNode = vm.processTree().find((node) => node.pid === pid);
+			if (
+				parentNode?.children.some((child) => child.pid === Number(childPid))
+			) {
+				break;
+			}
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+
 		expect(parentNode).toBeDefined();
-		expect(parentNode?.children.length).toBeGreaterThanOrEqual(1);
-
-		// Child's ppid should point to parent
-		const childNode = parentNode?.children[0];
-		expect(childNode.ppid).toBe(pid);
+		expect(childPid).not.toBeNull();
+		expect(parentNode?.children.map((child) => child.pid)).toContain(
+			Number(childPid),
+		);
 
 		vm.killProcess(pid);
 	}, 30_000);

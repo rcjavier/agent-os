@@ -2,10 +2,10 @@ mod support;
 
 use agent_os_bridge::StructuredEventRecord;
 use agent_os_sidecar::protocol::{
-    BootstrapRootFilesystemRequest, ConfigureVmRequest, ExecuteRequest, GuestFilesystemCallRequest,
-    GuestFilesystemOperation, GuestRuntimeKind, KillProcessRequest, MountDescriptor,
-    MountPluginDescriptor, OwnershipScope, PermissionDescriptor, PermissionMode, RequestPayload,
-    ResponsePayload, RootFilesystemEntry, RootFilesystemEntryKind,
+    BootstrapRootFilesystemRequest, ConfigureVmRequest, ExecuteRequest, FsPermissionRuleSet,
+    GuestFilesystemCallRequest, GuestFilesystemOperation, GuestRuntimeKind, KillProcessRequest,
+    MountDescriptor, MountPluginDescriptor, OwnershipScope, PermissionMode, PermissionsPolicy,
+    RequestPayload, ResponsePayload, RootFilesystemEntry, RootFilesystemEntryKind,
 };
 use support::{
     assert_node_available, authenticate, authenticate_with_token, collect_process_output,
@@ -74,31 +74,39 @@ fn filesystem_permission_denials_emit_security_audit_events() {
     let denied_vm_id = vm_id.clone();
     let sidecar = &mut sidecar;
     let _ = sidecar
-        .dispatch(request(
+        .dispatch_blocking(request(
             4,
             OwnershipScope::vm(&connection_id, &session_id, &vm_id),
             RequestPayload::ConfigureVm(ConfigureVmRequest {
                 mounts: Vec::new(),
                 software: Vec::new(),
-                permissions: vec![
-                    PermissionDescriptor {
-                        capability: String::from("fs"),
-                        mode: PermissionMode::Allow,
-                    },
-                    PermissionDescriptor {
-                        capability: String::from("fs.read"),
-                        mode: PermissionMode::Deny,
-                    },
-                ],
+                permissions: Some(PermissionsPolicy {
+                    fs: Some(agent_os_sidecar::protocol::FsPermissionScope::Rules(
+                        FsPermissionRuleSet {
+                            default: Some(PermissionMode::Allow),
+                            rules: vec![agent_os_sidecar::protocol::FsPermissionRule {
+                                mode: PermissionMode::Deny,
+                                operations: vec![String::from("read")],
+                                paths: Vec::new(),
+                            }],
+                        },
+                    )),
+                    network: None,
+                    child_process: None,
+                    env: None,
+                }),
+                module_access_cwd: None,
                 instructions: Vec::new(),
                 projected_modules: Vec::new(),
                 command_permissions: Default::default(),
+                allowed_node_builtins: Vec::new(),
+                loopback_exempt_ports: Vec::new(),
             }),
         ))
         .expect("configure vm permissions");
 
     let write = sidecar
-        .dispatch(request(
+        .dispatch_blocking(request(
             5,
             OwnershipScope::vm(&connection_id, &session_id, &denied_vm_id),
             RequestPayload::GuestFilesystemCall(GuestFilesystemCallRequest {
@@ -124,7 +132,7 @@ fn filesystem_permission_denials_emit_security_audit_events() {
     }
 
     let read = sidecar
-        .dispatch(request(
+        .dispatch_blocking(request(
             6,
             OwnershipScope::vm(&connection_id, &session_id, &denied_vm_id),
             RequestPayload::GuestFilesystemCall(GuestFilesystemCallRequest {
@@ -179,7 +187,7 @@ fn mount_operations_emit_security_audit_events() {
     );
 
     sidecar
-        .dispatch(request(
+        .dispatch_blocking(request(
             4,
             OwnershipScope::vm(&connection_id, &session_id, &vm_id),
             RequestPayload::BootstrapRootFilesystem(BootstrapRootFilesystemRequest {
@@ -193,7 +201,7 @@ fn mount_operations_emit_security_audit_events() {
         .expect("bootstrap workspace");
 
     sidecar
-        .dispatch(request(
+        .dispatch_blocking(request(
             5,
             OwnershipScope::vm(&connection_id, &session_id, &vm_id),
             RequestPayload::ConfigureVm(ConfigureVmRequest {
@@ -206,25 +214,31 @@ fn mount_operations_emit_security_audit_events() {
                     },
                 }],
                 software: Vec::new(),
-                permissions: Vec::new(),
+                permissions: None,
+                module_access_cwd: None,
                 instructions: Vec::new(),
                 projected_modules: Vec::new(),
                 command_permissions: Default::default(),
+                allowed_node_builtins: Vec::new(),
+                loopback_exempt_ports: Vec::new(),
             }),
         ))
         .expect("mount workspace");
 
     sidecar
-        .dispatch(request(
+        .dispatch_blocking(request(
             6,
             OwnershipScope::vm(&connection_id, &session_id, &vm_id),
             RequestPayload::ConfigureVm(ConfigureVmRequest {
                 mounts: Vec::new(),
                 software: Vec::new(),
-                permissions: Vec::new(),
+                permissions: None,
+                module_access_cwd: None,
                 instructions: Vec::new(),
                 projected_modules: Vec::new(),
                 command_permissions: Default::default(),
+                allowed_node_builtins: Vec::new(),
+                loopback_exempt_ports: Vec::new(),
             }),
         ))
         .expect("unmount workspace");
@@ -272,13 +286,14 @@ fn kill_requests_emit_security_audit_events() {
     );
 
     let result = sidecar
-        .dispatch(request(
+        .dispatch_blocking(request(
             4,
             OwnershipScope::vm(&connection_id, &session_id, &vm_id),
             RequestPayload::Execute(ExecuteRequest {
                 process_id: String::from("proc-kill"),
-                runtime: GuestRuntimeKind::JavaScript,
-                entrypoint: entry.to_string_lossy().into_owned(),
+                command: None,
+                runtime: Some(GuestRuntimeKind::JavaScript),
+                entrypoint: Some(entry.to_string_lossy().into_owned()),
                 args: Vec::new(),
                 env: Default::default(),
                 cwd: None,
@@ -292,7 +307,7 @@ fn kill_requests_emit_security_audit_events() {
     }
 
     let result = sidecar
-        .dispatch(request(
+        .dispatch_blocking(request(
             5,
             OwnershipScope::vm(&connection_id, &session_id, &vm_id),
             RequestPayload::KillProcess(KillProcessRequest {
