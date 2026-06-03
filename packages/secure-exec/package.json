@@ -1,6 +1,7 @@
 {
 	"name": "secure-exec",
 	"version": "0.2.1",
+	"private": true,
 	"description": "Secure-Exec public compatibility wrapper backed by Agent OS primitives.",
 	"type": "module",
 	"license": "Apache-2.0",
