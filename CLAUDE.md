@@ -90,22 +90,78 @@ The Rust sidecar kernel was migrated from a working JavaScript kernel (`@secure-
 
 ## Agent Working Directory
 
-All agent working files live in `.agent/` at the repo root.
+All agent working files live user-scoped in `~/.agents/`, never inside the repo. Override the location with the `AGENTS_DIR` env var. These files are not committed; `.agent/` is gitignored as a safety net.
 
-- **Specs**: `.agent/specs/` -- design specs and interface definitions for planned work.
-- **Research**: `.agent/research/` -- research documents on external systems, prior art, and design analysis.
-- **Todo**: `.agent/todo/*.md` -- deferred work items with context on what needs to be done and why.
-- **Notes**: `.agent/notes/` -- general notes and tracking.
+- **Specs**: `~/.agents/specs/` -- design specs and interface definitions for planned work.
+- **Research**: `~/.agents/research/` -- research documents on external systems, prior art, and design analysis.
+- **Todo**: `~/.agents/todo/*.md` -- deferred work items with context on what needs to be done and why.
+- **Notes**: `~/.agents/notes/` -- general notes and tracking.
 
-When the user asks to track something in a note, store it in `.agent/notes/` by default. When something is identified as "do later", add it to `.agent/todo/`. Design documents and interface specs go in `.agent/specs/`.
+When the user asks to track something in a note, store it in `~/.agents/notes/` by default. When something is identified as "do later", add it to `~/.agents/todo/`. Design documents and interface specs go in `~/.agents/specs/`.
 
 ## CLAUDE.md Convention
 
 - Every directory that has a `CLAUDE.md` must also have an `AGENTS.md` symlink pointing to it (`ln -s CLAUDE.md AGENTS.md`). This ensures other AI agents that look for `AGENTS.md` find the same instructions.
+- When adding entries to any `CLAUDE.md`, keep them concise -- ideally a single bullet point. Do not write paragraphs.
+- Only add design constraints, invariants, and non-obvious rules that shape how new code should be written. Do not add general trivia, current implementation wiring, module organization, API signatures, or ephemeral migration state. Anything a reader can learn from the code belongs in module doc-comments or reference docs.
+
+## Code Style
+
+- Follow existing patterns in neighboring files.
+- Always check existing imports and dependencies before adding new ones.
+- **Always add imports at the top of the file instead of inline within a function.**
+- Never use a `_ =>` fall-through arm when matching on a Rust enum or a TypeScript discriminated union. Enumerate every variant so adding a new one later is a compile error, not a silent behavior change. `_` is fine for `Result`, `Option`, integers, strings, and other open value spaces. `_ => unreachable!()` / `_ => panic!()` are explicit asserts and acceptable.
+
+### Comments
+
+- Write comments as normal, complete sentences. Avoid fragmented structures with parentheticals and dashes (hyphens are OK).
+- Do not use em dashes. Use periods to separate sentences instead.
+- Documenting deltas is not useful. A developer who never saw the previous code gains nothing from a comment saying something was removed or changed. The only reason to note something missing is if its absence is unintuitive.
+
+## Logging
+
+- Use tracing in Rust. Never use `eprintln!` or `println!` for logging. Always use `tracing::info!`, `tracing::warn!`, `tracing::error!`, etc.
+- Do not format parameters into the main message. Use structured fields: `tracing::info!(?x, "foo")` instead of `tracing::info!("foo {x}")`.
+- Log messages should be lowercase unless mentioning specific code symbols.
+
+## Error Handling
+
+- Always return anyhow errors from failable Rust functions. Do not glob-import from anyhow. Prefer `.context()` over the `anyhow!` macro.
+
+## Fail-By-Default Runtime
+
+- Avoid silent no-ops for required runtime behavior. If a capability is required, validate it and throw an explicit error with actionable context instead of returning early.
+- Do not use optional chaining for required lifecycle and bridge operations. Optional chaining is acceptable only for best-effort diagnostics and cleanup paths (logging hooks, dispose/release cleanup).
+
+## Async Rust Locks
+
+- Async Rust code defaults to `tokio::sync::Mutex` / `tokio::sync::RwLock`. Do not use `std::sync::Mutex` / `std::sync::RwLock`.
+- Use `parking_lot::Mutex` / `parking_lot::RwLock` only when sync is mandated by the call context: `Drop`, sync traits, FFI callbacks, or sync `&self` accessors.
+- Prefer async locks because sync guards can be silently held across `.await`, and poisoning creates `.expect("lock poisoned")` boilerplate.
+
+## Performance
+
+- Never use `Mutex<HashMap<...>>` or `RwLock<HashMap<...>>`. Use `scc::HashMap` (preferred), `moka::Cache` (for TTL/bounded), or `DashMap` for concurrent maps. Use `scc::HashSet` instead of `Mutex<HashSet<...>>`.
+- Hold lock guards as briefly as possible. Clone/copy needed data and `drop(...)` before async work.
+- Never poll a shared-state counter with `loop { if ready; sleep(Nms).await; }`. Pair the counter with a `tokio::sync::Notify` (or `watch::channel`) that every decrement-to-zero site pings, and wait on that instead.
+- Reserve `tokio::time::sleep` for per-call timeouts, retry/reconnect backoff, deliberate debounce windows, or `sleep_until(deadline)` arms in an event-select loop. A `loop { check; sleep }` body is polling and should be event-driven instead.
+
+## Memory Leaks
+
+- Do not introduce intentional leaks (`Box::leak`, `std::mem::forget`, `*_into_raw` without matching cleanup) unless an upstream API makes ownership impossible to express safely.
+- Never call `Box::leak` inside a per-request, per-error, or per-call code path. If a `'static` reference is required, use a compile-time `static`/`const` or intern it through a process-global map keyed by identity.
+- Interned leaks must be bounded by unique schema/config identity and must not include unbounded user input such as raw error messages, request paths, or headers.
+
+## Testing
+
+- **Never use `vi.mock`, `jest.mock`, or module-level mocking.** Write tests against real infrastructure (real kernel, real filesystems, real processes). `vi.fn()` for simple callback tracking is acceptable.
+- **Never paper over flakes with retry loops or bumped waits.** When a test flakes, root-cause the race, write a deterministic repro, fix the underlying ordering, and delete any flake-workaround note.
+- **Rust tests live under `tests/`, not inline `#[cfg(test)] mod tests` in `src/`.** Exceptions must be justified (e.g., testing a private internal that can't be reached from an integration test).
 
 ## Git
 
 - **Commit messages**: Single-line conventional commits (e.g., `feat: add host tools RPC server`). No body, no co-author trailers.
+- **Never push to `main` unless explicitly specified by the user.**
 
 ## Build & Dev
 
