@@ -34,7 +34,7 @@ The kernel provides a POSIX-like userspace environment. The goal is that a progr
 - **Standard filesystem paths.** `/tmp` must be writable. `/etc/hostname`, `/etc/resolv.conf`, `/etc/passwd`, `/etc/group` should contain valid content. `/usr/bin/env` should exist for shebangs. Shell (`/bin/sh`, `/bin/bash`) must be available.
 - **Direct script exec should resolve registered stubs before reparsing files.** When the kernel executes a path under `/bin/` or `/usr/bin/` that corresponds to a registered command driver, dispatch that driver directly before falling back to shebang parsing.
 - **Environment variable conventions.** `HOME`, `USER`, `PATH`, `SHELL`, `TERM`, `HOSTNAME`, `PWD`, `LANG` must be set to reasonable values. `PATH` must include standard directories where commands are found.
-- **Document deviations in the friction log** at `.agent/notes/vm-friction.md`.
+- **Document deviations in the friction log** at `~/.agents/notes/vm-friction.md`.
 
 ## Virtual Filesystem Design Reference
 

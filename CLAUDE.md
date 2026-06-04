@@ -42,7 +42,7 @@ Agent OS is a **fully virtualized operating system**. The kernel, written as a R
 
 ## Secure-Exec Reference Implementation
 
-The Rust sidecar kernel was migrated from a working JavaScript kernel (`@secure-exec/core` + `@secure-exec/nodejs` + `@secure-exec/v8`). The original source is at `/home/nathan/secure-exec-1/` (tagged `v0.2.1`), and recovered polyfill/bridge code lives at `.agent/recovery/secure-exec/`. **When something doesn't work in the Rust V8 isolate runtime, check how secure-exec handled it first** — the answer is almost always already there. Key reference files:
+The Rust sidecar kernel was migrated from a working JavaScript kernel (`@secure-exec/core` + `@secure-exec/nodejs` + `@secure-exec/v8`). The original source is at `/home/nathan/secure-exec-1/` (tagged `v0.2.1`), and recovered polyfill/bridge code lives at `~/.agents/recovery/secure-exec/`. **When something doesn't work in the Rust V8 isolate runtime, check how secure-exec handled it first** — the answer is almost always already there. Key reference files:
 - `nodejs/src/bridge-handlers.ts` (6,405 lines) -- host-side handlers for all kernel syscalls
 - `nodejs/src/bridge/fs.ts` (3,974 lines) -- full kernel-backed `fs` polyfill
 - `nodejs/src/bridge/network.ts` (11,149 lines) -- full `net`/`dgram`/`dns` polyfill
