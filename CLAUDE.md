@@ -87,6 +87,7 @@ The Rust sidecar kernel was migrated from a working JavaScript kernel (`@secure-
 - **If a user asks for a `secure-exec` change without naming the package, prompt them to choose the target public package when it is ambiguous.**
 - **Keep `website/src/data/registry.ts` up to date.** When adding, removing, or renaming a package, update this file so the website reflects the current set of available apps.
 - **No implementation details in user-facing docs.** Never mention WebAssembly, WASM, V8 isolates, Pyodide, or SQLite VFS in documentation outside of `architecture.mdx`. Use user-facing language instead.
+- If you need to look at the documentation for a package, visit `https://docs.rs/{package-name}`. For example, serde docs live at `https://docs.rs/serde/`.
 
 ## Agent Working Directory
 
@@ -104,6 +105,16 @@ When the user asks to track something in a note, store it in `~/.agents/notes/` 
 - Every directory that has a `CLAUDE.md` must also have an `AGENTS.md` symlink pointing to it (`ln -s CLAUDE.md AGENTS.md`). This ensures other AI agents that look for `AGENTS.md` find the same instructions.
 - When adding entries to any `CLAUDE.md`, keep them concise -- ideally a single bullet point. Do not write paragraphs.
 - Only add design constraints, invariants, and non-obvious rules that shape how new code should be written. Do not add general trivia, current implementation wiring, module organization, API signatures, or ephemeral migration state. Anything a reader can learn from the code belongs in module doc-comments or reference docs.
+
+## Naming + Data Conventions
+
+- Data structures often include:
+  - `id` (uuid)
+  - `name` (machine-readable name, must be valid DNS subdomain, convention is using kebab case)
+  - `description` (human-readable, if applicable)
+- Use UUID (v4) for generating unique identifiers.
+- Store dates as i64 epoch timestamps in milliseconds for precise time tracking.
+- Timestamps use `*_at` naming with past-tense verbs. For example, `created_at`, `destroyed_at`.
 
 ## Code Style
 
@@ -137,6 +148,7 @@ When the user asks to track something in a note, store it in `~/.agents/notes/` 
 
 - Async Rust code defaults to `tokio::sync::Mutex` / `tokio::sync::RwLock`. Do not use `std::sync::Mutex` / `std::sync::RwLock`.
 - Use `parking_lot::Mutex` / `parking_lot::RwLock` only when sync is mandated by the call context: `Drop`, sync traits, FFI callbacks, or sync `&self` accessors.
+- If an external dependency's struct requires `std::sync::Mutex`, keep it at the construction boundary with an explicit forced-std-sync comment.
 - Prefer async locks because sync guards can be silently held across `.await`, and poisoning creates `.expect("lock poisoned")` boilerplate.
 
 ## Performance
@@ -145,23 +157,33 @@ When the user asks to track something in a note, store it in `~/.agents/notes/` 
 - Hold lock guards as briefly as possible. Clone/copy needed data and `drop(...)` before async work.
 - Never poll a shared-state counter with `loop { if ready; sleep(Nms).await; }`. Pair the counter with a `tokio::sync::Notify` (or `watch::channel`) that every decrement-to-zero site pings, and wait on that instead.
 - Reserve `tokio::time::sleep` for per-call timeouts, retry/reconnect backoff, deliberate debounce windows, or `sleep_until(deadline)` arms in an event-select loop. A `loop { check; sleep }` body is polling and should be event-driven instead.
+- `scc` async methods do not hold locks across `.await` points. Use `entry_async` for atomic read-then-write.
+- Never add unexplained wall-clock defers like `sleep(1ms)` to decouple a spawn from its caller. Use `tokio::task::yield_now().await` or rely on the spawn itself.
 
 ## Memory Leaks
 
 - Do not introduce intentional leaks (`Box::leak`, `std::mem::forget`, `*_into_raw` without matching cleanup) unless an upstream API makes ownership impossible to express safely.
 - Never call `Box::leak` inside a per-request, per-error, or per-call code path. If a `'static` reference is required, use a compile-time `static`/`const` or intern it through a process-global map keyed by identity.
 - Interned leaks must be bounded by unique schema/config identity and must not include unbounded user input such as raw error messages, request paths, or headers.
+- `std::mem::forget` is only acceptable when an FFI handle cannot be dropped in the current context; document the constraint inline, prove the leak is bounded, and prefer routing cleanup through an Env-bearing owner.
+- Spawned futures that capture JS callbacks or other heavy resources must have a guaranteed completion path (e.g. a `CancellationToken` whose clones are guaranteed to drop). A `spawn_local(async move { token.cancelled().await; ... })` only drains if every clone of the token is dropped or cancelled.
 
 ## Testing
 
-- **Never use `vi.mock`, `jest.mock`, or module-level mocking.** Write tests against real infrastructure (real kernel, real filesystems, real processes). `vi.fn()` for simple callback tracking is acceptable.
+- **Never use `vi.mock`, `jest.mock`, or module-level mocking.** Write tests against real infrastructure (real kernel, real filesystems, real processes). For LLM calls, use `@copilotkit/llmock` to run a mock LLM server. For protocol-level test doubles (e.g., ACP adapters), write hand-written scripts that run as real processes. `vi.fn()` for simple callback tracking is acceptable.
 - **Never paper over flakes with retry loops or bumped waits.** When a test flakes, root-cause the race, write a deterministic repro, fix the underlying ordering, and delete any flake-workaround note.
 - **Rust tests live under `tests/`, not inline `#[cfg(test)] mod tests` in `src/`.** Exceptions must be justified (e.g., testing a private internal that can't be reached from an integration test).
 
-## Git
+## Version control (jj)
 
-- **Commit messages**: Single-line conventional commits (e.g., `feat: add host tools RPC server`). No body, no co-author trailers.
+- This repo uses jj (Jujutsu) on top of git. **jj's workflow is inverted from git:** the working copy is itself a revision that auto-tracks edits, so you create a new revision *before* making changes (with `jj new`) rather than committing *after* (`git commit`). The description is set separately via `jj describe`. There is no staging step.
+- Before making changes, check whether jj is initialized by running `jj status`. If it fails (e.g. "There is no jj repo in '.'"), run `jj git init --colocate` from the repo root so jj lives alongside the existing `.git` directory. Do NOT run `jj git init` without `--colocate` — that creates a standalone jj repo and breaks the git workflow.
+- **MUST run `jj new` before making any file edits for a new task.** This is the first step of any task that touches files. Run it before reading, before planning, before editing. The only exception is when you are directly fixing or finishing the change at `@` that you just made in this same session. In that case use `jj squash --into <rev>` or `jj edit <rev>`. If you already started editing without running `jj new`, stop and split the changes with `JJ_EDITOR=true jj split <paths>` before continuing. Each revision must be one self-contained change reviewable on its own. Never mix unrelated work into one revision.
+- Set the revision description with `jj describe -m "[SLOP({full-model-id}-{reasoning})] {conventional commit message}"`. Use conventional commits (`feat`, `fix`, `chore`, `docs`, `refactor`, etc.) with a single-line message. `{full-model-id}` is the canonical model ID (e.g. `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5`). `{reasoning}` is the reasoning effort (`high`, `medium`, `low`, `off`) — include it only if the runtime exposes it; otherwise omit the `-{reasoning}` suffix entirely.
+- Examples: `[SLOP(claude-opus-4-7-high)] feat(metrics): record depot sqlite phase timings` or, when reasoning is not known, `[SLOP(claude-opus-4-7)] fix(pegboard): handle empty ack batch`.
+- **Never add a co-author trailer** (no `Co-Authored-By: ...` line). Descriptions are single-line only.
 - **Never push to `main` unless explicitly specified by the user.**
+- **Safety:** Never run destructive jj or git commands (`jj git push`, `jj abandon`, `jj squash` into a non-current revision, `jj op restore`, `jj op undo` past your own work, `jj rebase -d main`, `git push --force`, `git reset --hard`) unless the user explicitly requests it.
 
 ## Build & Dev
 
