@@ -1143,7 +1143,9 @@ pub struct ExecuteRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteStdinRequest {
     pub process_id: String,
-    pub chunk: String,
+    // BARE `data`: serde_bare encodes Vec<u8> as a length-prefixed byte run (wire-identical to the
+    // hand-written TypeScript codec). Carries arbitrary binary stdin without UTF-8 corruption.
+    pub chunk: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1622,7 +1624,8 @@ pub struct VmLifecycleEvent {
 pub struct ProcessOutputEvent {
     pub process_id: String,
     pub channel: StreamChannel,
-    pub chunk: String,
+    // BARE `data`: raw stdout/stderr bytes, carried without UTF-8 corruption.
+    pub chunk: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

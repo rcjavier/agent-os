@@ -16,19 +16,31 @@ use agent_os_sidecar::protocol::ProtocolCodecError;
 #[derive(thiserror::Error, Debug)]
 pub enum ClientError {
     /// A filesystem path was not absolute (did not start with `/`).
-    #[error("path must be absolute: {0}")]
+    ///
+    /// The message text matches the TypeScript `AgentOs` exactly (capital "P"). These strings are
+    /// observable data (they surface in `BatchWriteResult.error` / `BatchReadResult.error`), not
+    /// logs, so the casing follows TS rather than the lowercase log convention.
+    #[error("Path must be absolute: {0}")]
     PathNotAbsolute(String),
 
     /// A filesystem path was not in posix-normalized form.
-    #[error("path must be normalized: {0}")]
+    ///
+    /// The message text matches the TypeScript `AgentOs` exactly (capital "P").
+    #[error("Path must be normalized: {0}")]
     PathNotNormalized(String),
 
     /// A write was attempted against a read-only path (for example `/proc`).
-    #[error("path is read-only: {0}")]
+    ///
+    /// The message text matches the TypeScript `AgentOs` exactly (capital "P").
+    #[error("Path is read-only: {0}")]
     PathReadOnly(String),
 
     /// An SDK-spawned process with the given pid was not found.
-    #[error("process not found: {0}")]
+    ///
+    /// The message text matches the TypeScript `AgentOs` exactly (capital "P"). These strings are
+    /// observable data (surfaced to callers), not logs, so the casing follows TS rather than the
+    /// lowercase log convention.
+    #[error("Process not found: {0}")]
     ProcessNotFound(u32),
 
     /// A shell with the given synthetic `shell-N` id was not found.
@@ -60,6 +72,38 @@ pub enum ClientError {
     /// A generic sidecar rejection or I/O failure with context.
     #[error("sidecar error: {0}")]
     Sidecar(String),
+}
+
+impl ClientError {
+    /// Render this error the way the TypeScript `AgentOs` surfaces `err.message` into batch results
+    /// (`BatchWriteResult.error` / `BatchReadResult.error`).
+    ///
+    /// The general [`Display`](std::fmt::Display) impl carries a human/log-oriented prefix
+    /// (`kernel error [<code>]: ...`), but the batch surface is observable data that must match TS
+    /// byte-for-byte. For kernel failures TS reports `KernelError.message`, which is
+    /// `<code>: <message>` (and avoids doubling the code when the message already starts with it).
+    /// Path-guard variants already carry the exact TS strings via their `Display` impl.
+    pub fn batch_message(&self) -> String {
+        match self {
+            ClientError::Kernel { code, message } => {
+                if message.starts_with(&format!("{code}:")) {
+                    message.clone()
+                } else {
+                    format!("{code}: {message}")
+                }
+            }
+            ClientError::PathNotAbsolute(_)
+            | ClientError::PathNotNormalized(_)
+            | ClientError::PathReadOnly(_)
+            | ClientError::ProcessNotFound(_)
+            | ClientError::ShellNotFound(_)
+            | ClientError::SessionNotFound(_)
+            | ClientError::InvalidSchedule(_)
+            | ClientError::PastSchedule(_)
+            | ClientError::Transport(_)
+            | ClientError::Sidecar(_) => self.to_string(),
+        }
+    }
 }
 
 /// Convenience alias for results carrying a typed [`ClientError`].

@@ -395,7 +395,7 @@ type ExecuteRequest struct {
 
 type WriteStdinRequest struct {
   processId: str
-  chunk: str
+  chunk: data
 }
 
 type CloseStdinRequest struct {
@@ -826,7 +826,7 @@ type VmLifecycleEvent struct {
 type ProcessOutputEvent struct {
   processId: str
   channel: StreamChannel
-  chunk: str
+  chunk: data
 }
 
 type ProcessExitedEvent struct {

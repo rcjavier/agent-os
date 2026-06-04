@@ -308,7 +308,7 @@ type RequestPayload =
 	| {
 			type: "write_stdin";
 			process_id: string;
-			chunk: string;
+			chunk: Uint8Array;
 	  }
 	| {
 			type: "close_stdin";
@@ -422,7 +422,7 @@ interface EventFrame {
 				type: "process_output";
 				process_id: string;
 				channel: "stdout" | "stderr";
-				chunk: string;
+				chunk: Uint8Array;
 		  }
 		| {
 				type: "process_exited";
@@ -2101,9 +2101,7 @@ export class NativeSidecarProcessClient {
 				type: "write_stdin",
 				process_id: processId,
 				chunk:
-					typeof chunk === "string"
-						? chunk
-						: Buffer.from(chunk).toString("utf8"),
+					typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk,
 			},
 		});
 		if (response.payload.type !== "stdin_written") {
@@ -2822,7 +2820,14 @@ function encodeProtocolFramePayload(
 	codec: NativeTransportPayloadCodec,
 ): Buffer {
 	if (codec === "json") {
-		return Buffer.from(JSON.stringify(frame), "utf8");
+		// BARE `data` fields are Uint8Array; JSON.stringify renders those as objects, so encode them
+		// as number arrays to match serde_json's Vec<u8> representation on the Rust side.
+		return Buffer.from(
+			JSON.stringify(frame, (_key, value) =>
+				value instanceof Uint8Array ? Array.from(value) : value,
+			),
+			"utf8",
+		);
 	}
 	return encodeBareProtocolFrame(frame);
 }
@@ -2832,10 +2837,20 @@ function decodeProtocolFramePayload(
 	codec: NativeTransportPayloadCodec,
 ): ResponseFrame | EventFrame | SidecarRequestFrame {
 	if (codec === "json") {
-		return JSON.parse(Buffer.from(payload).toString("utf8")) as
+		const frame = JSON.parse(Buffer.from(payload).toString("utf8")) as
 			| ResponseFrame
 			| EventFrame
 			| SidecarRequestFrame;
+		// JSON renders BARE `data` fields as number arrays; restore the Uint8Array shape the typed
+		// payloads expect (matching the BARE decoder's readData output).
+		const decodedPayload = frame.payload as { type?: string; chunk?: unknown };
+		if (
+			decodedPayload?.type === "process_output" &&
+			Array.isArray(decodedPayload.chunk)
+		) {
+			decodedPayload.chunk = Uint8Array.from(decodedPayload.chunk as number[]);
+		}
+		return frame;
 	}
 	return decodeBareProtocolFrame(payload);
 }
@@ -3022,6 +3037,11 @@ class BareWriter {
 		this.push(encoded);
 	}
 
+	writeData(value: Uint8Array): void {
+		this.writeVarUint(value.length);
+		this.push(Buffer.from(value));
+	}
+
 	writeOptional<T>(value: T | undefined, encoder: (value: T) => void): void {
 		if (value === undefined) {
 			this.writeBool(false);
@@ -3151,6 +3171,14 @@ class BareReader {
 			this.bytes.byteOffset + this.offset,
 			length,
 		).toString("utf8");
+		this.offset += length;
+		return value;
+	}
+
+	readData(context: string): Uint8Array {
+		const length = this.readVarUint(`${context} length`);
+		this.ensureAvailable(length, context);
+		const value = this.bytes.slice(this.offset, this.offset + length);
 		this.offset += length;
 		return value;
 	}
@@ -3615,7 +3643,7 @@ function encodeRequestPayload(
 		case "write_stdin":
 			writer.writeVarUint(20);
 			writer.writeString(payload.process_id);
-			writer.writeString(payload.chunk);
+			writer.writeData(payload.chunk);
 			return;
 		case "close_stdin":
 			writer.writeVarUint(21);
@@ -4046,7 +4074,7 @@ function decodeEventPayload(reader: BareReader): EventFrame["payload"] {
 					reader.readVarUint("process_output.channel"),
 					"stream channel",
 				),
-				chunk: reader.readString("process_output.chunk"),
+				chunk: reader.readData("process_output.chunk"),
 			};
 		case 3:
 			return {

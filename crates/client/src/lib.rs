@@ -63,8 +63,8 @@ pub use config::{
     AgentOsConfig, AgentOsConfigBuilder, AgentOsSidecarConfig, FsPermissionRule, FsPermissions,
     MountConfig, MountPlugin, OverlayMountConfig, PatternPermissionRule, PatternPermissions,
     PermissionMode, Permissions, RootFilesystemConfig, RootFilesystemKind, RootFilesystemMode,
-    RootLowerInput, RulePermissions, ScheduleDriver, ScheduleHandle, SoftwareInput, TimerScheduleDriver,
-    ToolKit,
+    RootLowerInput, RulePermissions, ScheduleCallback, ScheduleDriver, ScheduleEntry,
+    ScheduleHandle, SoftwareInput, TimerScheduleDriver, ToolKit,
 };
 
 pub use process::{
@@ -83,9 +83,9 @@ pub use shell::{ConnectTerminalOptions, OpenShellOptions, ShellHandle};
 
 pub use session::{
     AgentCapabilities, AgentInfo, AgentRegistryEntry, ConfigAllowedValue, CreateSessionOptions,
-    GetEventsOptions, McpServerConfig, PermissionReply, PermissionRequest, PromptCapabilities,
-    PromptResult, SessionConfigOption, SessionId, SessionInfo, SessionInitData, SessionMode,
-    SessionModeState,
+    GetEventsOptions, McpServerConfig, PermissionDelivery, PermissionReply, PermissionRequest,
+    PromptCapabilities, PromptResult, SessionConfigOption, SessionId, SessionInfo, SessionInitData,
+    SessionMode, SessionModeState,
 };
 
 pub use json_rpc::{

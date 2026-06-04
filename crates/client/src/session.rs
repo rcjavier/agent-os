@@ -137,11 +137,15 @@ pub struct SessionMode {
 }
 
 /// Session mode state (`{ currentModeId; availableModes }`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `currentModeId` and `availableModes` default so a loosely-shaped modes object (one missing either
+/// field) still deserializes and is stored. Mirrors TS `toSessionModes`, which returns ANY non-array
+/// object as `SessionModeState` with no field check.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionModeState {
-    #[serde(rename = "currentModeId")]
+    #[serde(default, rename = "currentModeId")]
     pub current_mode_id: String,
-    #[serde(rename = "availableModes")]
+    #[serde(default, rename = "availableModes")]
     pub available_modes: Vec<SessionMode>,
 }
 
@@ -154,8 +158,13 @@ pub struct ConfigAllowedValue {
 }
 
 /// A session config option.
+///
+/// `id` defaults so a partial entry missing `id` still deserializes and is kept (rather than dropped),
+/// narrowing the gap with TS `toSessionConfigOptions`, which casts the whole array verbatim. Truly
+/// non-object entries still cannot be stored in this typed Vec; see the parity audit minor note.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionConfigOption {
+    #[serde(default)]
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
@@ -307,9 +316,89 @@ pub enum PermissionReply {
     Reject,
 }
 
+/// Resolve the ACP `optionId` for a permission `reply`, scanning the agent-provided `options`
+/// (`params.options[]`) for a matching `optionId`/`kind`, then falling back to the canonical id.
+/// Mirrors `_normalizeAcpPermissionOptionId`. Always returns a `Some` (the TS `null` branch is never
+/// reachable since each reply has a non-empty fallback).
+fn normalize_acp_permission_option_id(
+    options: Option<&Vec<Value>>,
+    reply: PermissionReply,
+) -> String {
+    let (option_ids, kinds): (&[&str], &[&str]) = match reply {
+        PermissionReply::Always => (&["always", "allow_always"], &["allow_always"]),
+        PermissionReply::Once => (&["once", "allow_once"], &["allow_once"]),
+        PermissionReply::Reject => (&["reject", "reject_once"], &["reject_once"]),
+    };
+
+    let matched = options.and_then(|options| {
+        options.iter().find_map(|option| {
+            let option_id = option.get("optionId").and_then(Value::as_str);
+            let kind = option.get("kind").and_then(Value::as_str);
+            let hit = option_id.map(|id| option_ids.contains(&id)).unwrap_or(false)
+                || kind.map(|kind| kinds.contains(&kind)).unwrap_or(false);
+            if hit {
+                option_id.map(str::to_string)
+            } else {
+                None
+            }
+        })
+    });
+
+    matched.unwrap_or_else(|| {
+        match reply {
+            PermissionReply::Always => "allow_always",
+            PermissionReply::Once => "allow_once",
+            PermissionReply::Reject => "reject_once",
+        }
+        .to_string()
+    })
+}
+
+/// Build the ACP permission result (`{ outcome: { outcome: "selected", optionId } }`) for a `reply`,
+/// reading agent-provided options from `params.options[]`. Mirrors `_buildAcpPermissionResult`.
+/// Because `normalize_acp_permission_option_id` always yields an id, the `cancelled` outcome branch
+/// is never taken (matching the TS fallbacks).
+fn build_acp_permission_result(reply: PermissionReply, params: &Value) -> Value {
+    let options: Option<Vec<Value>> = params.get("options").and_then(Value::as_array).map(|array| {
+        array
+            .iter()
+            .filter(|option| option.is_object())
+            .cloned()
+            .collect()
+    });
+    let option_id = normalize_acp_permission_option_id(options.as_ref(), reply);
+    json!({
+        "outcome": {
+            "outcome": "selected",
+            "optionId": option_id,
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Local-state helpers (operate on a `SessionEntry`; mirror the TS private helpers)
 // ---------------------------------------------------------------------------
+
+/// Whether a cached [`AgentCapabilities`] is empty in the TS sense (`Object.keys(caps).length === 0`):
+/// every modeled field is `None` and there are no extra keys. `toAgentCapabilities` stores `{}` for
+/// any non-object/empty state, and `getSessionCapabilities` returns `null` for that empty object.
+fn agent_capabilities_is_empty(caps: &AgentCapabilities) -> bool {
+    caps.permissions.is_none()
+        && caps.plan_mode.is_none()
+        && caps.questions.is_none()
+        && caps.tool_calls.is_none()
+        && caps.text_messages.is_none()
+        && caps.images.is_none()
+        && caps.file_attachments.is_none()
+        && caps.session_lifecycle.is_none()
+        && caps.error_events.is_none()
+        && caps.reasoning.is_none()
+        && caps.status.is_none()
+        && caps.streaming_deltas.is_none()
+        && caps.mcp_tools.is_none()
+        && caps.prompt_capabilities.is_none()
+        && caps.extra.is_empty()
+}
 
 /// Whether a notification should be delivered to `on_session_event` subscribers (`session/update`
 /// only). Mirrors `shouldDispatchToSessionEventHandlers`.
@@ -458,26 +547,80 @@ fn record_session_notification(
         });
     }
 
-    // The permission-from-notification delivery path (legacy `request/permission` /
-    // `session/request_permission`) needs an `AgentOs` handle to register the reply slot + 120s
-    // timeout, so it is exposed as [`AgentOs::deliver_permission_request`] and invoked by the
-    // sidecar event/request handler (in `agent_os.rs`/`transport`, which this module does not own).
+    // Permission-from-notification delivery (mirrors the permission branch of
+    // `_recordSessionNotification`). When a recorded notification is a legacy `request/permission`
+    // or ACP `session/request_permission` with a string/number `permissionId`, deliver a
+    // [`PermissionRequest`] to subscribers. This is the notification path: it broadcasts the request
+    // (params verbatim, as TS does here) WITHOUT registering a `pending_permission_replies` slot or
+    // arming the 120s timeout. The request/responder reply slot + timeout wiring is the separate
+    // ACP/sidecar request path handled by [`AgentOs::deliver_permission_request`].
+    if notification.method == LEGACY_PERMISSION_METHOD
+        || notification.method == ACP_PERMISSION_METHOD
+    {
+        let params = notification.params.clone().unwrap_or(Value::Null);
+        let permission_id = match params.get("permissionId") {
+            Some(Value::String(id)) => Some(id.clone()),
+            Some(Value::Number(num)) => Some(num.to_string()),
+            _ => None,
+        };
+        if let Some(permission_id) = permission_id {
+            let description = params
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            // The notification path has no reply slot, so the responder resolves to nothing.
+            let (responder, _receiver) = PermissionResponder::new();
+            let request = PermissionRequest {
+                permission_id,
+                description,
+                params,
+                responder,
+            };
+            let _ = entry.permission_tx.send(request);
+        }
+    }
 }
 
-/// Build a [`PermissionRequest`] from a legacy/ACP permission notification and broadcast it to
-/// subscribers, registering its reply slot into `pending_permission_replies` with a 120s timeout.
-/// Mirrors the permission branch of `_recordSessionNotification` plus the request/responder wiring.
+/// Build a [`PermissionRequest`] from a legacy/ACP permission notification for the request/responder
+/// (sidecar-request / ACP-request) path. Mirrors the request construction in
+/// `_handleAcpPermissionRequest` / `_handlePermissionSidecarRequest`.
 ///
-/// `register_pending` registers the resolution slot keyed by permission id and arms the timeout; it
-/// is supplied by the caller because it needs an [`AgentOs`] handle for the timeout cleanup.
-fn build_permission_request(notification: &JsonRpcNotification) -> Option<(String, PermissionRequest, tokio::sync::oneshot::Receiver<PermissionReply>)> {
-    let params = notification.params.clone().unwrap_or(Value::Null);
-    let permission_id = match params.get("permissionId") {
+/// For the ACP path (`session/request_permission`) the delivered params are enriched with
+/// `permissionId` and `_acpMethod` (matching `permissionParams = { ...params, permissionId,
+/// _acpMethod: request.method }`). The enriched params are also returned so the caller can build the
+/// ACP outcome result via [`build_acp_permission_result`]. The legacy path delivers params verbatim.
+fn build_permission_request(
+    notification: &JsonRpcNotification,
+) -> Option<(
+    String,
+    PermissionRequest,
+    Value,
+    tokio::sync::oneshot::Receiver<PermissionReply>,
+)> {
+    let raw_params = notification.params.clone().unwrap_or(Value::Null);
+    let permission_id = match raw_params.get("permissionId") {
         Some(Value::String(id)) => id.clone(),
         Some(Value::Number(num)) => num.to_string(),
         _ => return None,
     };
-    let description = params
+
+    // ACP path enriches params with `permissionId` and `_acpMethod`; legacy path uses params as-is.
+    let delivered_params = if notification.method == ACP_PERMISSION_METHOD {
+        let mut object = match raw_params {
+            Value::Object(existing) => existing,
+            _ => serde_json::Map::new(),
+        };
+        object.insert("permissionId".to_string(), Value::String(permission_id.clone()));
+        object.insert(
+            "_acpMethod".to_string(),
+            Value::String(notification.method.clone()),
+        );
+        Value::Object(object)
+    } else {
+        raw_params
+    };
+
+    let description = delivered_params
         .get("description")
         .and_then(Value::as_str)
         .map(str::to_string);
@@ -486,10 +629,10 @@ fn build_permission_request(notification: &JsonRpcNotification) -> Option<(Strin
     let request = PermissionRequest {
         permission_id: permission_id.clone(),
         description,
-        params,
+        params: delivered_params.clone(),
         responder,
     };
-    Some((permission_id, request, receiver))
+    Some((permission_id, request, delivered_params, receiver))
 }
 
 /// Apply the local cache mutations of `_syncSessionState`: modes, config options, capabilities,
@@ -761,9 +904,12 @@ impl AgentOs {
         };
 
         // Register a pending-resolver slot so cancel/close can resolve this request locally. The
-        // resolver fires `()` to short-circuit the awaited oneshot; whichever completes first wins.
+        // resolver carries the intended [`JsonRpcResponse`] (close -> `-32000 Session closed`,
+        // cancel -> `{stopReason: cancelled}`); whichever completes first wins. Mirrors the TS
+        // resolver `{ method, resolve: (response) => void }`.
         let resolver_id = self.inner().request_counter.fetch_add(1, Ordering::SeqCst);
-        let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel::<()>();
+        let (resolve_tx, resolve_rx) =
+            tokio::sync::oneshot::channel::<JsonRpcResponse>();
         self.require_session(session_id, |entry| {
             let _ = entry.pending_prompt_resolvers.insert(resolver_id, resolve_tx);
             // Track the method so prompt-fallback can target only `session/prompt` resolvers.
@@ -787,10 +933,15 @@ impl AgentOs {
 
         let response = tokio::select! {
             biased;
-            _ = resolve_rx => {
-                // A cancel/close resolved this request locally before the sidecar replied.
+            resolved = resolve_rx => {
+                // A cancel/close resolved this request locally before the sidecar replied. The
+                // resolver carries the intended response (cancel vs close), set at the abort/cancel
+                // site, so it is returned verbatim rather than re-derived from the method.
                 self.cleanup_pending_resolver(session_id, resolver_id);
-                return Ok(session_closed_or_cancelled_placeholder(session_id, method));
+                match resolved {
+                    Ok(response) => return Ok(response),
+                    Err(_) => return Ok(session_closed_response(session_id)),
+                }
             }
             result = &mut rpc => {
                 self.cleanup_pending_resolver(session_id, resolver_id);
@@ -1049,54 +1200,74 @@ impl AgentOs {
             (entry.event_tx.subscribe(), latest)
         })?;
 
-        let agent_text = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
-        let agent_text_task = agent_text.clone();
-        let accumulator = tokio::spawn(async move {
-            let mut last_delivered = start_after;
-            loop {
-                match rx.recv().await {
-                    Ok(event) => {
-                        if event.sequence_number <= last_delivered {
-                            continue;
-                        }
-                        last_delivered = event.sequence_number;
-                        let params = event.notification.params.clone().unwrap_or(Value::Null);
-                        let update = params.get("update").cloned().unwrap_or(Value::Null);
-                        if update.get("sessionUpdate").and_then(Value::as_str)
-                            == Some("agent_message_chunk")
-                        {
-                            if let Some(chunk) = update
-                                .get("content")
-                                .and_then(|content| content.get("text"))
-                                .and_then(Value::as_str)
-                            {
-                                agent_text_task.lock().push_str(chunk);
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        let mut agent_text = String::new();
+        let mut last_delivered = start_after;
+        // Accumulate `agent_message_chunk` text from an event into the running buffer (dedup by
+        // sequence number). Mirrors the synchronous `SessionEventHandler` invoked inline by TS
+        // `_flushSessionEventHandlers`.
+        let mut accumulate = |event: &SequencedEvent, agent_text: &mut String| {
+            if event.sequence_number <= last_delivered {
+                return;
+            }
+            last_delivered = event.sequence_number;
+            let params = event.notification.params.clone().unwrap_or(Value::Null);
+            let update = params.get("update").cloned().unwrap_or(Value::Null);
+            if update.get("sessionUpdate").and_then(Value::as_str) == Some("agent_message_chunk") {
+                if let Some(chunk) = update
+                    .get("content")
+                    .and_then(|content| content.get("text"))
+                    .and_then(Value::as_str)
+                {
+                    agent_text.push_str(chunk);
                 }
             }
-        });
+        };
 
-        let response = self
-            .send_session_request(
-                session_id,
-                "session/prompt",
-                Some(json!({ "prompt": [{ "type": "text", "text": text }] })),
-            )
-            .await;
+        let request = self.send_session_request(
+            session_id,
+            "session/prompt",
+            Some(json!({ "prompt": [{ "type": "text", "text": text }] })),
+        );
+        tokio::pin!(request);
+
+        // Drive the request to completion while concurrently draining broadcast chunks, so the
+        // bounded broadcast buffer never lags during a long prompt.
+        let response = loop {
+            tokio::select! {
+                biased;
+                result = &mut request => break result,
+                event = rx.recv() => {
+                    match event {
+                        Ok(event) => accumulate(&event, &mut agent_text),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            // Channel closed; finish the request without further chunks.
+                            break (&mut request).await;
+                        }
+                    }
+                }
+            }
+        };
 
         // The prompt has resolved; `send_session_request` re-hydrates state (recording any final
-        // chunks) before returning, so all `agent_message_chunk` broadcasts have been emitted. Stop
-        // the accumulator (= the TS `finally { unsubscribe() }`) and read the buffered text.
-        accumulator.abort();
-        let _ = accumulator.await;
-        let text = std::mem::take(&mut *agent_text.lock());
+        // chunks) before returning. Drain every remaining buffered broadcast event with `try_recv`
+        // until empty before unsubscribing (= the TS `finally { unsubscribe() }`), so chunks emitted
+        // late (during the final hydrate) but not yet received are not dropped.
+        loop {
+            match rx.try_recv() {
+                Ok(event) => accumulate(&event, &mut agent_text),
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+            }
+        }
+        drop(rx);
 
         let response = response?;
-        Ok(PromptResult { response, text })
+        Ok(PromptResult {
+            response,
+            text: agent_text,
+        })
     }
 
     /// Cancel a session. If prompt requests are pending, resolves locally + background
@@ -1154,7 +1325,14 @@ impl AgentOs {
             let mut cancelled = false;
             for id in prompt_resolver_ids {
                 if let Some((_, resolver)) = entry.pending_prompt_resolvers.remove(&id) {
-                    let _ = resolver.send(());
+                    // Mirrors `_cancelPendingPromptRequests`: resolve prompt resolvers with the
+                    // synthetic `{ result: { stopReason: "cancelled" } }` response.
+                    let _ = resolver.send(JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id: Some(JsonRpcId::Null),
+                        result: Some(json!({ "stopReason": "cancelled" })),
+                        error: None,
+                    });
                     cancelled = true;
                 }
                 entry
@@ -1176,7 +1354,9 @@ impl AgentOs {
                 .scan(|id, _| ids.push(*id));
             for id in ids {
                 if let Some((_, resolver)) = entry.pending_prompt_resolvers.remove(&id) {
-                    let _ = resolver.send(());
+                    // Mirrors `_abortPendingSessionRequests`: resolve EVERY pending resolver
+                    // (prompt or otherwise) with the `-32000` `Session closed: <id>` error.
+                    let _ = resolver.send(session_closed_response(session_id));
                 }
                 entry
                     .config_overrides
@@ -1201,10 +1381,13 @@ impl AgentOs {
         });
     }
 
-    /// Close a session. SYNC fire-and-forget. Errors only if unknown across sessions / closed-ids.
-    /// Aborts pending, rejects pending permissions, records the closed id (bounded 2048).
+    /// Close a session. SYNC fire-and-forget. Errors only if unknown across sessions / closed-ids /
+    /// in-flight closes. Aborts pending, rejects pending permissions, records the closed id (bounded
+    /// 2048). Mirrors `closeSession`, whose known-check spans `_sessions`, `_closedSessionIds`, and
+    /// `_sessionClosePromises`.
     pub fn close_session(&self, session_id: &str) -> std::result::Result<(), ClientError> {
         let known = self.inner().sessions.contains(session_id)
+            || self.inner().closing_session_ids.contains(session_id)
             || self
                 .inner()
                 .closed_session_ids
@@ -1215,10 +1398,19 @@ impl AgentOs {
             return Err(ClientError::SessionNotFound(session_id.to_string()));
         }
 
+        // Synchronously mark the close in-flight (mirrors setting `_sessionClosePromises`) so a
+        // second `close_session` / close-after-destroy issued during the detached close still sees
+        // the id as known.
+        let _ = self
+            .inner()
+            .closing_session_ids
+            .insert(session_id.to_string());
+
         let this = self.clone();
         let session_id_owned = session_id.to_string();
         tokio::spawn(async move {
             let _ = this.close_session_internal(&session_id_owned).await;
+            let _ = this.inner().closing_session_ids.remove(&session_id_owned);
         });
         Ok(())
     }
@@ -1395,11 +1587,13 @@ impl AgentOs {
             .unwrap_or_default()
     }
 
-    /// Get cached capabilities (empty -> None).
+    /// Get cached capabilities. Mirrors `getSessionCapabilities`: returns `null` (`None`) when the
+    /// stored capabilities object has no keys (`Object.keys(caps).length === 0`).
     pub fn get_session_capabilities(&self, session_id: &str) -> Option<AgentCapabilities> {
         self.require_session(session_id, |entry| entry.capabilities.lock().clone())
             .ok()
             .flatten()
+            .filter(|caps| !agent_capabilities_is_empty(caps))
     }
 
     /// Get cached agent info.
@@ -1493,17 +1687,25 @@ impl AgentOs {
     /// auto-rejects on expiry. When there are no subscribers the request auto-rejects immediately.
     ///
     /// Invoked by the sidecar event/request handler for both `request/permission` (legacy) and
-    /// `session/request_permission` (ACP). The returned future resolves to the [`PermissionReply`]
-    /// the host (or timeout / no-subscriber path) settles on, mirroring `_handleAcpPermissionRequest`
-    /// / `_handlePermissionSidecarRequest`.
+    /// `session/request_permission` (ACP). The returned [`PermissionDelivery`] carries the settled
+    /// [`PermissionReply`] and the path-appropriate handler `result`:
+    /// - ACP path (`session/request_permission`) returns `_buildAcpPermissionResult(reply, params)`
+    ///   = `{ outcome: { outcome: "selected", optionId } }`, mirroring `_handleAcpPermissionRequest`.
+    /// - legacy path (`request/permission`) returns the bare `{ reply }`, mirroring
+    ///   `_handlePermissionSidecarRequest`'s `{ reply }`.
+    ///
+    /// On the no-subscriber / timeout path the reply is `Reject`, and the ACP result is built from
+    /// `reject` (mirroring `_buildAcpPermissionResult("reject", ...)`).
     pub(crate) async fn deliver_permission_request(
         &self,
         session_id: &str,
         notification: &JsonRpcNotification,
-    ) -> PermissionReply {
-        let Some((permission_id, request, responder_rx)) = build_permission_request(notification)
+    ) -> PermissionDelivery {
+        let is_acp = notification.method == ACP_PERMISSION_METHOD;
+        let Some((permission_id, request, delivered_params, responder_rx)) =
+            build_permission_request(notification)
         else {
-            return PermissionReply::Reject;
+            return PermissionDelivery::new(PermissionReply::Reject, is_acp, &Value::Null);
         };
 
         // Register the reply slot so `respond_permission` can resolve it directly.
@@ -1522,7 +1724,9 @@ impl AgentOs {
 
         match registered {
             Ok(true) => {}
-            Ok(false) | Err(_) => return PermissionReply::Reject,
+            Ok(false) | Err(_) => {
+                return PermissionDelivery::new(PermissionReply::Reject, is_acp, &delivered_params)
+            }
         }
 
         // Bridge the subscriber's `responder.respond(..)` into the same reply slot.
@@ -1542,7 +1746,7 @@ impl AgentOs {
         let timeout =
             tokio::time::sleep(std::time::Duration::from_millis(PERMISSION_TIMEOUT_MS));
         tokio::pin!(timeout);
-        tokio::select! {
+        let reply = tokio::select! {
             reply = slot_rx => reply.unwrap_or(PermissionReply::Reject),
             _ = &mut timeout => {
                 let _ = self.require_session(session_id, |entry| {
@@ -1550,21 +1754,30 @@ impl AgentOs {
                 });
                 PermissionReply::Reject
             }
-        }
+        };
+        PermissionDelivery::new(reply, is_acp, &delivered_params)
     }
 }
 
-/// Placeholder response returned when a pending request was resolved locally (cancel/close) before
-/// the sidecar replied. The exact shape depends on whether it was a prompt-cancel or a close.
-fn session_closed_or_cancelled_placeholder(session_id: &str, method: &str) -> JsonRpcResponse {
-    if method == "session/prompt" {
-        JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
-            id: Some(JsonRpcId::Null),
-            result: Some(json!({ "stopReason": "cancelled" })),
-            error: None,
-        }
-    } else {
-        session_closed_response(session_id)
+/// The settled outcome of [`AgentOs::deliver_permission_request`], carrying both the resolved
+/// [`PermissionReply`] and the path-appropriate JSON-RPC handler `result` (the ACP `outcome` object
+/// for the ACP path, or the bare `{ reply }` for the legacy sidecar path).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PermissionDelivery {
+    /// The settled reply (host answer, or `Reject` on no-subscriber / timeout).
+    pub reply: PermissionReply,
+    /// The handler result to return on the wire (ACP outcome vs bare `{ reply }`).
+    pub result: Value,
+}
+
+impl PermissionDelivery {
+    fn new(reply: PermissionReply, is_acp: bool, params: &Value) -> Self {
+        let result = if is_acp {
+            build_acp_permission_result(reply, params)
+        } else {
+            json!({ "reply": reply })
+        };
+        Self { reply, result }
     }
 }
+

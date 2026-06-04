@@ -1,20 +1,27 @@
 //! Cron scheduling + the `CronManager`.
 //!
-//! Ported from `packages/core/src/cron/`. The `schedule` is a 5-field cron expression or an ISO-8601
-//! one-shot timestamp. `CronAction::Callback` is in-process only (non-serializable). `on_cron_event`
-//! returns NO unsubscribe in TS; the Rust equivalent is a [`tokio::sync::broadcast::Receiver`] whose
-//! drop is the unsubscribe.
+//! Ported from `packages/core/src/cron/`. The `schedule` is a 5/6/7-field cron expression (croner
+//! grammar) or an ISO-8601 one-shot timestamp. `CronAction::Callback` is in-process only
+//! (non-serializable). `on_cron_event` returns NO unsubscribe in TS; the Rust equivalent is a
+//! [`tokio::sync::broadcast::Receiver`] whose drop is the unsubscribe.
+//!
+//! Timing is owned by the [`ScheduleDriver`] (mirroring TS `CronManager.schedule` delegating to
+//! `this.driver.schedule({...})`). The default [`crate::config::TimerScheduleDriver`] parses the
+//! schedule, arms the timer, reschedules cron after each fire, and tears down on dispose. The manager
+//! itself only registers job state and runs `execute_job` when the driver fires the callback.
+//!
+//! Cron fields are interpreted in the host LOCAL timezone, matching croner's default behavior.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, Timelike, Utc, Weekday};
 use scc::HashMap as SccHashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::agent_os::AgentOs;
-use crate::config::ScheduleDriver;
+use crate::config::{ScheduleDriver, ScheduleEntry, ScheduleHandle};
 use crate::error::ClientError;
 use crate::session::CreateSessionOptions;
 
@@ -75,7 +82,7 @@ impl std::fmt::Debug for CronAction {
 pub struct CronJobOptions {
     /// Default: a fresh UUID.
     pub id: Option<String>,
-    /// 5-field cron expression OR an ISO-8601 one-shot timestamp.
+    /// 5/6/7-field cron expression OR an ISO-8601 one-shot timestamp.
     pub schedule: String,
     pub action: CronAction,
     /// Default: [`CronOverlap::Allow`].
@@ -144,7 +151,9 @@ pub(crate) struct CronJobState {
     /// Set when a `Queue`-policy fire arrives while the job is already running; drained to exactly
     /// one deferred run when the active run completes. Mirrors TS `CronJobState.queued`.
     pub queued: AtomicBool,
-    pub cancel: tokio_util::sync::CancellationToken,
+    /// Driver-returned timer handle. Used by `cancel`/`dispose` to tear down the armed timer through
+    /// the driver, mirroring TS `this.driver.cancel(state.handle)`.
+    pub handle: ScheduleHandle,
 }
 
 /// Owns scheduled jobs, the schedule driver, and the cron event broadcast.
@@ -167,25 +176,25 @@ impl CronManager {
 
     /// Cancel a job by id (no-op if unknown).
     ///
-    /// Mirrors TS `CronManager.cancel`: cancel the driver-armed timer (here the per-job
-    /// [`tokio_util::sync::CancellationToken`]) and remove the job from the registry.
+    /// Mirrors TS `CronManager.cancel`: cancel the driver-armed timer (`this.driver.cancel(handle)`)
+    /// and remove the job from the registry.
     pub(crate) fn cancel_job(&self, id: &str) {
         if let Some((_, state)) = self.jobs.remove(id) {
-            state.cancel.cancel();
+            self.driver.cancel(&state.handle);
         }
     }
 
     /// Dispose all jobs (called during shutdown).
     ///
-    /// Mirrors TS `CronManager.dispose`: cancel every armed timer, then clear the registry. The
-    /// schedule driver itself is owned by the config and torn down separately.
+    /// Mirrors TS `CronManager.dispose`: cancel every armed timer through the driver, clear the
+    /// registry, then call `this.driver.dispose()` to tear down all driver-held timer state.
     pub(crate) fn dispose(&self) {
         self.jobs.scan(|_, state| {
-            state.cancel.cancel();
+            self.driver.cancel(&state.handle);
         });
         self.jobs.clear();
+        self.driver.dispose();
     }
-
 }
 
 /// Execute a single job run, honoring the overlap policy. Emits `Fire`, then `Complete` or `Error`.
@@ -236,7 +245,7 @@ async fn execute_job_inner(manager: Arc<CronManager>, vm: AgentOs, id: String) {
     // Mark running, record this run, and snapshot the action to dispatch.
     let action = match manager.jobs.read(id, |_, state| {
         state.running.store(true, Ordering::SeqCst);
-        *state.last_run.lock() = Some(manager.driver.now());
+        *state.last_run.lock() = Some(Utc::now());
         state.run_count.fetch_add(1, Ordering::SeqCst);
         state.action.clone()
     }) {
@@ -244,28 +253,28 @@ async fn execute_job_inner(manager: Arc<CronManager>, vm: AgentOs, id: String) {
         None => return,
     };
 
-    let fire_time = manager.driver.now();
     let _ = manager.event_tx.send(CronEvent::Fire {
         job_id: id.to_string(),
-        time: fire_time,
+        time: Utc::now(),
     });
 
-    let start = std::time::Instant::now();
+    // TS `durationMs = Date.now() - startTime`, an integer millisecond count.
+    let start = Utc::now();
     let result = run_action(vm, &action).await;
-    let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let duration_ms = (Utc::now() - start).num_milliseconds() as f64;
 
     match result {
         Ok(()) => {
             let _ = manager.event_tx.send(CronEvent::Complete {
                 job_id: id.to_string(),
-                time: manager.driver.now(),
+                time: Utc::now(),
                 duration_ms,
             });
         }
         Err(error) => {
             let _ = manager.event_tx.send(CronEvent::Error {
                 job_id: id.to_string(),
-                time: manager.driver.now(),
+                time: Utc::now(),
                 error: error.to_string(),
             });
         }
@@ -275,7 +284,7 @@ async fn execute_job_inner(manager: Arc<CronManager>, vm: AgentOs, id: String) {
     let mut run_queued = false;
     manager.jobs.read(id, |_, state| {
         state.running.store(false, Ordering::SeqCst);
-        *state.next_run.lock() = compute_next_time(&state.schedule, manager.driver.now());
+        *state.next_run.lock() = compute_next_time(&state.schedule, Utc::now());
         if state.queued.swap(false, Ordering::SeqCst) {
             run_queued = true;
         }
@@ -333,14 +342,40 @@ async fn run_action(vm: &AgentOs, action: &CronAction) -> Result<(), ClientError
 // Schedule validation
 // ---------------------------------------------------------------------------
 
-/// A parsed schedule: either a 5-field recurring cron expression or a one-shot ISO-8601 timestamp.
+/// A parsed schedule: either a recurring cron expression or a one-shot ISO-8601 timestamp.
 ///
 /// Mirrors TS `ParsedSchedule` (`parse-schedule.ts`).
-enum ParsedSchedule {
+pub(crate) enum ParsedSchedule {
     /// A one-shot absolute timestamp.
     Date(DateTime<Utc>),
-    /// A recurring 5-field cron expression.
+    /// A recurring cron expression (croner grammar).
     Cron(CronExpr),
+}
+
+impl ParsedSchedule {
+    /// `true` for a recurring cron expression. Mirrors TS `parsed.kind === "cron"`.
+    pub(crate) fn is_cron(&self) -> bool {
+        matches!(self, ParsedSchedule::Cron(_))
+    }
+}
+
+/// Resolve the next run for an already-parsed schedule strictly after `now`. Mirrors TS
+/// `resolveSchedule(...).nextRun`: a cron yields `cron.nextRun()`; a one-shot date yields the date if
+/// it is in the future, else `None`.
+pub(crate) fn resolve_next_run(
+    parsed: &ParsedSchedule,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    match parsed {
+        ParsedSchedule::Cron(cron) => cron.next_after(now),
+        ParsedSchedule::Date(date) => {
+            if date.timestamp_millis() > now.timestamp_millis() {
+                Some(*date)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 /// Decide whether a schedule string looks like a one-shot ISO-8601-ish timestamp rather than a cron
@@ -350,10 +385,8 @@ fn looks_like_one_shot(schedule: &str) -> bool {
     let bytes = schedule.as_bytes();
     let mut i = 0usize;
 
-    // Helper closures over the byte slice.
     let is_digit = |b: u8| b.is_ascii_digit();
 
-    // YYYY-MM-DD
     let take_digits = |bytes: &[u8], i: &mut usize, n: usize| -> bool {
         for _ in 0..n {
             match bytes.get(*i) {
@@ -449,11 +482,15 @@ fn looks_like_one_shot(schedule: &str) -> bool {
     i == bytes.len()
 }
 
-/// Parse a one-shot timestamp string into a UTC instant. Accepts a date-only form (interpreted as
-/// midnight UTC), a `T`/space-separated local-ish datetime (interpreted as UTC when no offset is
-/// present), and RFC-3339 forms with `Z`/offset. Mirrors `Date.parse(...)` semantics closely enough
-/// for the one-shot pattern accepted by [`looks_like_one_shot`].
+/// Parse a one-shot timestamp string into a UTC instant, matching ECMAScript `Date.parse` rules for
+/// the subset accepted by [`looks_like_one_shot`]:
+/// - a date-only string (`2026-06-04`) is UTC midnight;
+/// - a date-time string WITHOUT an offset (`2026-06-04T12:30`, `2026-06-04 12:30`) is parsed as LOCAL
+///   time;
+/// - forms with `Z` or an explicit numeric offset are parsed as written.
 fn parse_one_shot(schedule: &str) -> Option<DateTime<Utc>> {
+    use chrono::TimeZone;
+
     // Try a full RFC-3339 timestamp first (handles Z and numeric offsets).
     if let Ok(dt) = DateTime::parse_from_rfc3339(schedule) {
         return Some(dt.with_timezone(&Utc));
@@ -462,14 +499,18 @@ fn parse_one_shot(schedule: &str) -> Option<DateTime<Utc>> {
     // Normalize a space separator to `T` for the naive parsers below.
     let normalized = schedule.replacen(' ', "T", 1);
 
-    // Date + time without a timezone: treat as UTC.
+    // Date + time without a timezone: ECMAScript treats this as LOCAL time.
     for fmt in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"] {
         if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(&normalized, fmt) {
-            return Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc));
+            return match Local.from_local_datetime(&naive) {
+                chrono::LocalResult::Single(dt) => Some(dt.with_timezone(&Utc)),
+                chrono::LocalResult::Ambiguous(dt, _) => Some(dt.with_timezone(&Utc)),
+                chrono::LocalResult::None => None,
+            };
         }
     }
 
-    // Date only: midnight UTC.
+    // Date only: midnight UTC (ECMAScript date-only form is UTC).
     if let Ok(date) = chrono::NaiveDate::parse_from_str(schedule, "%Y-%m-%d") {
         let naive = date.and_hms_opt(0, 0, 0)?;
         return Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc));
@@ -479,7 +520,7 @@ fn parse_one_shot(schedule: &str) -> Option<DateTime<Utc>> {
 }
 
 /// Parse a schedule string into a [`ParsedSchedule`]. Mirrors TS `parseSchedule`.
-fn parse_schedule(schedule: &str) -> std::result::Result<ParsedSchedule, ClientError> {
+pub(crate) fn parse_schedule(schedule: &str) -> std::result::Result<ParsedSchedule, ClientError> {
     let normalized = schedule.trim();
     if looks_like_one_shot(normalized) {
         return match parse_one_shot(normalized) {
@@ -498,16 +539,8 @@ fn parse_schedule(schedule: &str) -> std::result::Result<ParsedSchedule, ClientE
 /// one-shot timestamp in the past or a cron expression with no upcoming match. Mirrors TS
 /// `computeNextTime` / `resolveSchedule(...).nextRun`.
 pub(crate) fn compute_next_time(schedule: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    match parse_schedule(schedule).ok()? {
-        ParsedSchedule::Cron(cron) => cron.next_after(now),
-        ParsedSchedule::Date(date) => {
-            if date.timestamp_millis() > now.timestamp_millis() {
-                Some(date)
-            } else {
-                None
-            }
-        }
-    }
+    let parsed = parse_schedule(schedule).ok()?;
+    resolve_next_run(&parsed, now)
 }
 
 /// Validate a schedule string. Returns the parsed next run for one-shot ISO-8601 schedules.
@@ -534,79 +567,156 @@ pub(crate) fn validate_schedule(
 }
 
 // ---------------------------------------------------------------------------
-// 5-field cron expression parser + next-run search
+// Cron expression parser + next-run search (croner-compatible grammar)
 // ---------------------------------------------------------------------------
 
-/// A parsed 5-field cron expression (`minute hour day-of-month month day-of-week`).
+/// A parsed cron expression interpreted in the host LOCAL timezone (matching croner's default).
 ///
-/// Implemented in-crate because the workspace has no cron-parsing dependency. Supports the standard
-/// field grammar: `*`, ranges (`a-b`), steps (`*/n`, `a-b/n`, `a/n`), and comma lists, with the
-/// usual ranges (minute 0-59, hour 0-23, day-of-month 1-31, month 1-12, day-of-week 0-6 with `7`
-/// folded onto Sunday). Day-of-month and day-of-week combine with OR semantics when both are
-/// restricted, matching Vixie cron.
-struct CronExpr {
+/// Implemented in-crate because the workspace has no cron-parsing dependency. Accepts the croner
+/// grammar: 5-field (`min hour dom month dow`), 6-field (leading `seconds`), and 7-field (leading
+/// `seconds`, trailing `year`) expressions; named months (`JAN`-`DEC`); named weekdays (`SUN`-`SAT`);
+/// `*`, ranges (`a-b`), steps (`*/n`, `a-b/n`, `a/n`), comma lists, `?` (treated as `*` for
+/// dom/dow), `L` (last day of month for dom, last weekday-of-month for dow), `#` (nth weekday), and
+/// `W` (nearest weekday to a day-of-month). Day-of-month and day-of-week combine with OR semantics
+/// when both are restricted, matching Vixie/croner.
+pub(crate) struct CronExpr {
+    seconds: Vec<u32>,
     minutes: Vec<u32>,
     hours: Vec<u32>,
     days_of_month: Vec<u32>,
     months: Vec<u32>,
     days_of_week: Vec<u32>,
+    years: Option<Vec<u32>>,
     dom_restricted: bool,
     dow_restricted: bool,
+    /// Day-of-month `L` (last day of month).
+    dom_last: bool,
+    /// Day-of-month `<n>W` (nearest weekday to day `n`).
+    dom_nearest_weekday: Option<u32>,
+    /// Day-of-week `<weekday>L` (last given weekday of the month).
+    dow_last: Option<u32>,
+    /// Day-of-week `<weekday>#<n>` (nth given weekday of the month).
+    dow_nth: Option<(u32, u32)>,
 }
+
+const MONTH_NAMES: [&str; 12] = [
+    "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+];
+const WEEKDAY_NAMES: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 
 impl CronExpr {
     fn parse(expr: &str) -> std::result::Result<Self, ()> {
         let fields: Vec<&str> = expr.split_whitespace().collect();
-        if fields.len() != 5 {
-            return Err(());
-        }
 
-        let minutes = parse_field(fields[0], 0, 59)?;
-        let hours = parse_field(fields[1], 0, 23)?;
-        let days_of_month = parse_field(fields[2], 1, 31)?;
-        let months = parse_field(fields[3], 1, 12)?;
-        let mut days_of_week = parse_field(fields[4], 0, 7)?;
-        // Fold `7` (Sunday) onto `0` and dedupe.
-        for v in days_of_week.iter_mut() {
-            if *v == 7 {
-                *v = 0;
-            }
-        }
-        days_of_week.sort_unstable();
-        days_of_week.dedup();
+        // Accept 5, 6, or 7 fields. 6-field adds a leading seconds field; 7-field adds a trailing
+        // year field on top of that. Mirrors croner's field-count handling.
+        let (sec, min, hour, dom, month, dow, year): (
+            &str,
+            &str,
+            &str,
+            &str,
+            &str,
+            &str,
+            Option<&str>,
+        ) = match fields.len() {
+            5 => ("0", fields[0], fields[1], fields[2], fields[3], fields[4], None),
+            6 => (
+                fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], None,
+            ),
+            7 => (
+                fields[0],
+                fields[1],
+                fields[2],
+                fields[3],
+                fields[4],
+                fields[5],
+                Some(fields[6]),
+            ),
+            _ => return Err(()),
+        };
+
+        let seconds = parse_field(sec, 0, 59, FieldKind::Plain)?;
+        let minutes = parse_field(min, 0, 59, FieldKind::Plain)?;
+        let hours = parse_field(hour, 0, 23, FieldKind::Plain)?;
+
+        let mut dom_last = false;
+        let mut dom_nearest_weekday = None;
+        let days_of_month = parse_dom_field(dom, &mut dom_last, &mut dom_nearest_weekday)?;
+
+        let months = parse_field(month, 1, 12, FieldKind::Month)?;
+
+        let mut dow_last = None;
+        let mut dow_nth = None;
+        let days_of_week = parse_dow_field(dow, &mut dow_last, &mut dow_nth)?;
+
+        let years = match year {
+            Some(y) => Some(parse_field(y, 1970, 2099, FieldKind::Plain)?),
+            None => None,
+        };
+
+        // `?` is equivalent to `*` for matching purposes, so the field is "unrestricted".
+        let dom_restricted = dom != "*" && dom != "?";
+        let dow_restricted = dow != "*" && dow != "?";
 
         Ok(Self {
+            seconds,
             minutes,
             hours,
             days_of_month,
             months,
             days_of_week,
-            dom_restricted: fields[2] != "*",
-            dow_restricted: fields[4] != "*",
+            years,
+            dom_restricted,
+            dow_restricted,
+            dom_last,
+            dom_nearest_weekday,
+            dow_last,
+            dow_nth,
         })
     }
 
-    /// Find the next instant strictly after `after` (truncated to whole minutes) that matches. Scans
-    /// minute-by-minute up to a bounded horizon (~4 years) so an impossible expression terminates.
+    /// Find the next instant strictly after `after` (truncated to whole seconds) that matches, in the
+    /// LOCAL timezone. Scans second-by-second only when a sub-minute (seconds) constraint is present;
+    /// otherwise scans minute-by-minute. Bounded so an impossible expression terminates.
     fn next_after(&self, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        // Start from the next whole minute after `after`.
-        let mut candidate = after
-            .with_second(0)?
-            .with_nanosecond(0)?
-            .checked_add_signed(ChronoDuration::minutes(1))?;
+        let local_after = after.with_timezone(&Local);
 
-        // Bound the search: 4 years of minutes.
-        let max_iterations = 366 * 4 * 24 * 60;
+        // Determine the step granularity. When seconds is the default `[0]` we can step by minutes.
+        let by_seconds = self.seconds != vec![0];
+
+        let step = if by_seconds {
+            ChronoDuration::seconds(1)
+        } else {
+            ChronoDuration::minutes(1)
+        };
+
+        let mut candidate = if by_seconds {
+            local_after.with_nanosecond(0)? + ChronoDuration::seconds(1)
+        } else {
+            local_after.with_second(0)?.with_nanosecond(0)? + ChronoDuration::minutes(1)
+        };
+
+        // Bound the search: a few years of ticks so an impossible expression terminates.
+        let max_iterations: u64 = if by_seconds {
+            // ~2 years of seconds.
+            2u64 * 366 * 24 * 60 * 60
+        } else {
+            // ~6 years of minutes (years field can push matches far out).
+            6u64 * 366 * 24 * 60
+        };
         for _ in 0..max_iterations {
-            if self.matches(&candidate) {
-                return Some(candidate);
+            if self.matches_local(&candidate) {
+                return Some(candidate.with_timezone(&Utc));
             }
-            candidate = candidate.checked_add_signed(ChronoDuration::minutes(1))?;
+            candidate += step;
         }
         None
     }
 
-    fn matches(&self, dt: &DateTime<Utc>) -> bool {
+    fn matches_local(&self, dt: &DateTime<Local>) -> bool {
+        if !self.seconds.contains(&dt.second()) {
+            return false;
+        }
         if !self.minutes.contains(&dt.minute()) {
             return false;
         }
@@ -616,15 +726,17 @@ impl CronExpr {
         if !self.months.contains(&dt.month()) {
             return false;
         }
+        if let Some(years) = &self.years {
+            let year = dt.year();
+            if year < 0 || !years.contains(&(year as u32)) {
+                return false;
+            }
+        }
 
-        let dom = dt.day();
-        // chrono weekday: Mon=0..Sun=6 via num_days_from_monday; cron uses Sun=0..Sat=6.
-        let dow = dt.weekday().num_days_from_sunday();
+        let dom_match = self.dom_matches(dt);
+        let dow_match = self.dow_matches(dt);
 
-        let dom_match = self.days_of_month.contains(&dom);
-        let dow_match = self.days_of_week.contains(&dow);
-
-        // Vixie-cron OR semantics: if both DOM and DOW are restricted, a match in either suffices;
+        // Vixie/croner OR semantics: if both DOM and DOW are restricted, a match in either suffices;
         // if only one is restricted, only that one is consulted; if neither, both pass.
         match (self.dom_restricted, self.dow_restricted) {
             (true, true) => dom_match || dow_match,
@@ -633,17 +745,122 @@ impl CronExpr {
             (false, false) => true,
         }
     }
+
+    fn dom_matches(&self, dt: &DateTime<Local>) -> bool {
+        let dom = dt.day();
+        if self.dom_last && dom == last_day_of_month(dt.year(), dt.month()) {
+            return true;
+        }
+        if let Some(target) = self.dom_nearest_weekday {
+            if is_nearest_weekday(dt, target) {
+                return true;
+            }
+        }
+        self.days_of_month.contains(&dom)
+    }
+
+    fn dow_matches(&self, dt: &DateTime<Local>) -> bool {
+        let dow = weekday_sun0(dt.weekday());
+
+        if let Some(target) = self.dow_last {
+            // Last occurrence of `target` weekday in this month.
+            if dow == target {
+                let next_week = *dt + ChronoDuration::days(7);
+                if next_week.month() != dt.month() {
+                    return true;
+                }
+            }
+        }
+        if let Some((target, n)) = self.dow_nth {
+            if dow == target {
+                // 1-based occurrence index of this weekday within the month.
+                let occurrence = (dt.day() - 1) / 7 + 1;
+                if occurrence == n {
+                    return true;
+                }
+            }
+        }
+        self.days_of_week.contains(&dow)
+    }
 }
 
-/// Parse a single cron field (`*`, lists, ranges, steps) into the sorted set of matching values
-/// within `[min, max]`.
-fn parse_field(field: &str, min: u32, max: u32) -> std::result::Result<Vec<u32>, ()> {
+/// Convert chrono `Weekday` to cron's `Sun=0..Sat=6` numbering.
+fn weekday_sun0(weekday: Weekday) -> u32 {
+    weekday.num_days_from_sunday()
+}
+
+/// Last calendar day of a given month.
+fn last_day_of_month(year: i32, month: u32) -> u32 {
+    let (ny, nm) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let first_next = chrono::NaiveDate::from_ymd_opt(ny, nm, 1).expect("valid first-of-month");
+    (first_next - ChronoDuration::days(1)).day()
+}
+
+/// Whether `dt` is the nearest weekday (Mon-Fri) to day-of-month `target` within the same month,
+/// per cron `W` semantics. If `target` falls on a weekend, the nearest weekday in the same month is
+/// used (Saturday shifts to Friday, Sunday shifts to Monday); a shift never crosses the month
+/// boundary.
+fn is_nearest_weekday(dt: &DateTime<Local>, target: u32) -> bool {
+    let last = last_day_of_month(dt.year(), dt.month());
+    let target = target.min(last);
+    let target_date = chrono::NaiveDate::from_ymd_opt(dt.year(), dt.month(), target);
+    let target_date = match target_date {
+        Some(d) => d,
+        None => return false,
+    };
+    let target_weekday = target_date.weekday();
+    let resolved_day = match target_weekday {
+        Weekday::Sat => {
+            if target > 1 {
+                target - 1
+            } else {
+                // Saturday on the 1st shifts forward to Monday (the 3rd).
+                target + 2
+            }
+        }
+        Weekday::Sun => {
+            if target < last {
+                target + 1
+            } else {
+                // Sunday on the last day shifts back to Friday.
+                target - 2
+            }
+        }
+        Weekday::Mon | Weekday::Tue | Weekday::Wed | Weekday::Thu | Weekday::Fri => target,
+    };
+    dt.day() == resolved_day
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FieldKind {
+    Plain,
+    Month,
+    Weekday,
+}
+
+/// Parse a numeric/named cron field (`*`, `?`, lists, ranges, steps) into the sorted set of matching
+/// values within `[min, max]`. `?` is treated as `*`. For [`FieldKind::Month`] names `JAN`-`DEC` are
+/// accepted.
+fn parse_field(
+    field: &str,
+    min: u32,
+    max: u32,
+    kind: FieldKind,
+) -> std::result::Result<Vec<u32>, ()> {
+    if field == "?" {
+        // `?` = no specific value; treat as the full range.
+        return Ok((min..=max).collect());
+    }
     let mut values: Vec<u32> = Vec::new();
     for part in field.split(',') {
         if part.is_empty() {
             return Err(());
         }
-        parse_field_part(part, min, max, &mut values)?;
+        parse_field_part(part, min, max, kind, &mut values)?;
     }
     if values.is_empty() {
         return Err(());
@@ -653,10 +870,119 @@ fn parse_field(field: &str, min: u32, max: u32) -> std::result::Result<Vec<u32>,
     Ok(values)
 }
 
+/// Parse the day-of-month field, recognizing `L` (last day) and `<n>W` (nearest weekday) in addition
+/// to the standard grammar.
+fn parse_dom_field(
+    field: &str,
+    dom_last: &mut bool,
+    dom_nearest_weekday: &mut Option<u32>,
+) -> std::result::Result<Vec<u32>, ()> {
+    let upper = field.to_ascii_uppercase();
+    if upper == "L" {
+        *dom_last = true;
+        // No fixed numeric days; matching handled by `dom_last`.
+        return Ok(Vec::new());
+    }
+    if let Some(stripped) = upper.strip_suffix('W') {
+        let day: u32 = stripped.parse().map_err(|_| ())?;
+        if !(1..=31).contains(&day) {
+            return Err(());
+        }
+        *dom_nearest_weekday = Some(day);
+        return Ok(Vec::new());
+    }
+    if upper == "?" || upper == "*" {
+        return parse_field(field, 1, 31, FieldKind::Plain);
+    }
+    parse_field(field, 1, 31, FieldKind::Plain)
+}
+
+/// Parse the day-of-week field, recognizing `<weekday>L` (last weekday-of-month) and
+/// `<weekday>#<n>` (nth weekday-of-month), named weekdays, and `7` folded onto Sunday.
+fn parse_dow_field(
+    field: &str,
+    dow_last: &mut Option<u32>,
+    dow_nth: &mut Option<(u32, u32)>,
+) -> std::result::Result<Vec<u32>, ()> {
+    let upper = field.to_ascii_uppercase();
+
+    // `<weekday>#<n>` (nth weekday of the month).
+    if let Some((wd, nth)) = upper.split_once('#') {
+        let weekday = parse_weekday_token(wd)?;
+        let n: u32 = nth.parse().map_err(|_| ())?;
+        if !(1..=5).contains(&n) {
+            return Err(());
+        }
+        *dow_nth = Some((weekday, n));
+        return Ok(Vec::new());
+    }
+
+    // `<weekday>L` (last given weekday of the month).
+    if let Some(stripped) = upper.strip_suffix('L') {
+        let weekday = parse_weekday_token(stripped)?;
+        *dow_last = Some(weekday);
+        return Ok(Vec::new());
+    }
+
+    if upper == "?" || upper == "*" {
+        let mut v = parse_field(field, 0, 7, FieldKind::Plain)?;
+        fold_sunday(&mut v);
+        return Ok(v);
+    }
+
+    let mut values = parse_field(field, 0, 7, FieldKind::Weekday)?;
+    fold_sunday(&mut values);
+    Ok(values)
+}
+
+/// Fold `7` (Sunday) onto `0` and dedupe.
+fn fold_sunday(values: &mut Vec<u32>) {
+    for v in values.iter_mut() {
+        if *v == 7 {
+            *v = 0;
+        }
+    }
+    values.sort_unstable();
+    values.dedup();
+}
+
+/// Parse a single weekday token (numeric `0`-`7` or named `SUN`-`SAT`) to `Sun=0..Sat=6`.
+fn parse_weekday_token(token: &str) -> std::result::Result<u32, ()> {
+    let upper = token.to_ascii_uppercase();
+    if let Some(idx) = WEEKDAY_NAMES.iter().position(|name| *name == upper) {
+        return Ok(idx as u32);
+    }
+    let v: u32 = upper.parse().map_err(|_| ())?;
+    match v {
+        0..=6 => Ok(v),
+        7 => Ok(0),
+        _ => Err(()),
+    }
+}
+
+// Re-add FieldKind::Weekday support by extending parse_field via a wrapper for weekday names.
+impl FieldKind {
+    fn resolve_name(self, token: &str) -> Option<u32> {
+        let upper = token.to_ascii_uppercase();
+        match self {
+            FieldKind::Plain => None,
+            FieldKind::Month => MONTH_NAMES
+                .iter()
+                .position(|name| *name == upper)
+                .map(|i| (i + 1) as u32),
+            FieldKind::Weekday => WEEKDAY_NAMES
+                .iter()
+                .position(|name| *name == upper)
+                .map(|i| i as u32),
+        }
+    }
+}
+
 fn parse_field_part(
     part: &str,
     min: u32,
     max: u32,
+    kind: FieldKind,
     out: &mut Vec<u32>,
 ) -> std::result::Result<(), ()> {
     // Split off an optional step (`.../n`).
@@ -675,11 +1001,11 @@ fn parse_field_part(
     let (start, end) = if range_spec == "*" {
         (min, max)
     } else if let Some((lo, hi)) = range_spec.split_once('-') {
-        let lo: u32 = lo.parse().map_err(|_| ())?;
-        let hi: u32 = hi.parse().map_err(|_| ())?;
+        let lo = parse_value_token(lo, kind)?;
+        let hi = parse_value_token(hi, kind)?;
         (lo, hi)
     } else {
-        let v: u32 = range_spec.parse().map_err(|_| ())?;
+        let v = parse_value_token(range_spec, kind)?;
         match step {
             // A bare value with a step (`a/n`) ranges from the value to the field max.
             Some(_) => (v, max),
@@ -700,6 +1026,21 @@ fn parse_field_part(
     Ok(())
 }
 
+/// Parse a single value token: a number, or a name (month names for [`FieldKind::Month`], weekday
+/// names for [`FieldKind::Weekday`]).
+fn parse_value_token(token: &str, kind: FieldKind) -> std::result::Result<u32, ()> {
+    match kind {
+        FieldKind::Weekday => parse_weekday_token(token),
+        FieldKind::Month => {
+            if let Some(v) = kind.resolve_name(token) {
+                return Ok(v);
+            }
+            token.parse().map_err(|_| ())
+        }
+        FieldKind::Plain => token.parse().map_err(|_| ()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Methods
 // ---------------------------------------------------------------------------
@@ -709,21 +1050,43 @@ impl AgentOs {
     /// `id` defaults to a UUID; `overlap` defaults to allow.
     ///
     /// Mirrors TS `AgentOs.scheduleCron` / `CronManager.schedule`: validation happens up front, the
-    /// job is registered, and a self-driven timer loop is armed against the job's cancel token. The
-    /// returned [`CronJobHandle`] cancels the job on [`CronJobHandle::cancel`].
+    /// driver is asked to arm the timer (`this.driver.schedule({ id, schedule, callback })`), and the
+    /// job is registered. The driver owns all timing: it parses the schedule, fires the callback,
+    /// reschedules cron after each fire, and is cancelled on [`CronJobHandle::cancel`] /
+    /// [`CronManager::dispose`]. The returned [`CronJobHandle`] cancels the job.
     pub fn schedule_cron(
         &self,
         options: CronJobOptions,
     ) -> std::result::Result<CronJobHandle, ClientError> {
         let cron = self.cron();
-        let now = cron.driver.now();
+        let now = Utc::now();
 
         // Validate before any state mutation, matching TS `validateScheduleForRegistration`.
         let next_run = validate_schedule(&options.schedule, now)?;
 
         let id = options.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let overlap = options.overlap.unwrap_or_default();
-        let cancel = tokio_util::sync::CancellationToken::new();
+
+        // Build the driver callback that runs one job execution, mirroring TS
+        // `callback: () => this.executeJob(id)`.
+        let manager = Arc::clone(cron);
+        let vm = self.clone();
+        let callback_id = id.clone();
+        let callback: crate::config::ScheduleCallback = Arc::new(move || {
+            let manager = Arc::clone(&manager);
+            let vm = vm.clone();
+            let id = callback_id.clone();
+            Box::pin(async move {
+                execute_job(manager, vm, id).await;
+            })
+        });
+
+        // Ask the driver to arm the timer.
+        let handle = cron.driver.schedule(ScheduleEntry {
+            id: id.clone(),
+            schedule: options.schedule.clone(),
+            callback,
+        });
 
         let state = CronJobState {
             schedule: options.schedule.clone(),
@@ -734,27 +1097,15 @@ impl AgentOs {
             run_count: std::sync::atomic::AtomicU64::new(0),
             running: AtomicBool::new(false),
             queued: AtomicBool::new(false),
-            cancel: cancel.clone(),
+            handle,
         };
 
-        // Insert; if the id already exists, replace it (cancelling the old timer first), mirroring
-        // the TS `Map.set` overwrite behavior.
+        // Insert; if the id already exists, cancel its driver-armed timer first, mirroring the TS
+        // `Map.set` overwrite over a freshly-armed handle.
         if let Some((_, old)) = cron.jobs.remove(&id) {
-            old.cancel.cancel();
+            cron.driver.cancel(&old.handle);
         }
         let _ = cron.jobs.insert(id.clone(), state);
-
-        // Arm the self-driven timer loop. It recomputes the next run before each sleep and fires
-        // `execute_job` on each match, exiting when the cancel token is tripped or the schedule has
-        // no further runs (a one-shot in the past or an exhausted expression).
-        let manager = Arc::clone(cron);
-        let vm = self.clone();
-        let schedule = options.schedule;
-        let loop_id = id.clone();
-        let loop_cancel = cancel;
-        tokio::spawn(async move {
-            run_schedule_loop(manager, vm, loop_id, schedule, loop_cancel).await;
-        });
 
         Ok(CronJobHandle {
             id,
@@ -789,50 +1140,5 @@ impl AgentOs {
     /// equivalent. Each run emits `Fire` then `Complete`|`Error`. Mirrors TS `AgentOs.onCronEvent`.
     pub fn cron_events(&self) -> broadcast::Receiver<CronEvent> {
         self.cron().event_tx.subscribe()
-    }
-}
-
-/// The per-job timer loop. Recomputes the next run, sleeps until then (or until cancelled), fires
-/// the job, and repeats. Exits when the schedule has no further runs or the job is cancelled.
-///
-/// This is the Rust equivalent of arming a [`ScheduleDriver`] timer per fire: rather than storing a
-/// driver [`crate::config::ScheduleHandle`] on the job (the scaffold reserves only a cancel token),
-/// the loop owns its own cadence and observes the cancel token directly.
-async fn run_schedule_loop(
-    manager: Arc<CronManager>,
-    vm: AgentOs,
-    id: String,
-    schedule: String,
-    cancel: tokio_util::sync::CancellationToken,
-) {
-    loop {
-        // Stop if the job was removed/cancelled.
-        if cancel.is_cancelled() || !manager.jobs.contains(&id) {
-            return;
-        }
-
-        let now = manager.driver.now();
-        let next = match compute_next_time(&schedule, now) {
-            Some(next) => next,
-            None => return,
-        };
-
-        // Keep the snapshot fresh for `list_cron_jobs`.
-        manager.jobs.read(&id, |_, state| {
-            *state.next_run.lock() = Some(next);
-        });
-
-        let delay = (next - now).to_std().unwrap_or(std::time::Duration::ZERO);
-
-        tokio::select! {
-            _ = cancel.cancelled() => return,
-            _ = tokio::time::sleep(delay) => {}
-        }
-
-        if cancel.is_cancelled() || !manager.jobs.contains(&id) {
-            return;
-        }
-
-        execute_job(manager.clone(), vm.clone(), id.clone()).await;
     }
 }

@@ -319,65 +319,144 @@ pub enum AgentOsSidecarConfig {
 // Schedule driver
 // ---------------------------------------------------------------------------
 
-/// Abstraction over wall-clock scheduling, allowing tests to inject a deterministic clock.
+/// The callback fired by a [`ScheduleDriver`] when a schedule entry triggers.
 ///
-/// Ported from the TS `ScheduleDriver` interface used by the cron manager.
+/// Mirrors the TS `ScheduleEntry.callback: () => void | Promise<void>`. The cron manager passes a
+/// closure that runs one job execution; the driver awaits it (and, for the default driver, reschedules
+/// the next cron fire afterwards).
+pub type ScheduleCallback =
+    Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
+/// A schedule entry handed to a [`ScheduleDriver`]. Mirrors TS `ScheduleEntry`
+/// (`cron/schedule-driver.ts`).
+#[derive(Clone)]
+pub struct ScheduleEntry {
+    /// Unique ID for this job.
+    pub id: String,
+    /// 5/6/7-field cron expression OR an ISO-8601 one-shot timestamp.
+    pub schedule: String,
+    /// Called when the schedule fires.
+    pub callback: ScheduleCallback,
+}
+
+/// Driver-owned scheduling abstraction. Mirrors the TS `ScheduleDriver` interface
+/// (`cron/schedule-driver.ts`) exactly: the driver parses the schedule, arms the timer, reschedules
+/// cron entries after each fire, and tears everything down on [`ScheduleDriver::dispose`]. This is the
+/// documented extension point: a custom driver (deterministic virtual-time test driver, fire-immediately
+/// driver, etc.) fully controls timing.
 pub trait ScheduleDriver: Send + Sync {
-    /// The current wall-clock time.
-    fn now(&self) -> chrono::DateTime<chrono::Utc>;
+    /// Schedule a callback to fire on a cron expression or at a specific time. Returns a cancellation
+    /// handle.
+    fn schedule(&self, entry: ScheduleEntry) -> ScheduleHandle;
 
-    /// Schedule `callback` to run after `delay`. Returns a cancellation handle.
-    ///
-    /// TODO(parity: define the returned timer handle type once cron dispatch lands).
-    fn schedule(
-        &self,
-        delay: std::time::Duration,
-        callback: Box<dyn FnOnce() + Send + Sync>,
-    ) -> ScheduleHandle;
+    /// Cancel a previously scheduled entry.
+    fn cancel(&self, handle: &ScheduleHandle);
+
+    /// Tear down all scheduled work.
+    fn dispose(&self);
 }
 
-/// Opaque handle to a scheduled timer; dropping it cancels the pending callback.
+/// Handle to a scheduled entry. Mirrors TS `ScheduleHandle { id }`. Identifies the entry to cancel via
+/// [`ScheduleDriver::cancel`].
+#[derive(Clone)]
 pub struct ScheduleHandle {
-    pub(crate) abort: Option<Box<dyn FnOnce() + Send + Sync>>,
-}
-
-impl ScheduleHandle {
-    pub fn cancel(mut self) {
-        if let Some(abort) = self.abort.take() {
-            abort();
-        }
-    }
-}
-
-impl Drop for ScheduleHandle {
-    fn drop(&mut self) {
-        if let Some(abort) = self.abort.take() {
-            abort();
-        }
-    }
+    pub id: String,
 }
 
 /// Default schedule driver backed by `tokio` timers and the system clock.
+///
+/// Mirrors the TS `TimerScheduleDriver`: for cron expressions it computes the next fire time and arms
+/// a single timer, rescheduling after each fire; for one-shot timestamps it fires once and removes the
+/// entry. Driver-held timer tasks are tracked so [`ScheduleDriver::cancel`] / [`ScheduleDriver::dispose`]
+/// can abort them.
 #[derive(Default)]
-pub struct TimerScheduleDriver;
+pub struct TimerScheduleDriver {
+    timers: Arc<scc::HashMap<String, tokio_util::sync::CancellationToken>>,
+}
 
 impl TimerScheduleDriver {
     pub fn new() -> Self {
-        Self
+        Self {
+            timers: Arc::new(scc::HashMap::new()),
+        }
+    }
+
+    /// Arm the next fire for `entry`. For a one-shot or an exhausted cron the entry is dropped. For a
+    /// recurring cron the timer reschedules itself after firing the callback. `cancel` is the per-entry
+    /// cancellation token shared with the registry slot.
+    fn schedule_next(
+        timers: Arc<scc::HashMap<String, tokio_util::sync::CancellationToken>>,
+        entry: ScheduleEntry,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
+        let now = chrono::Utc::now();
+        let parsed = match crate::cron::parse_schedule(&entry.schedule) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                let _ = timers.remove(&entry.id);
+                return;
+            }
+        };
+        let is_cron = parsed.is_cron();
+        let next = match crate::cron::resolve_next_run(&parsed, now) {
+            Some(next) => next,
+            None => {
+                // No upcoming run (one-shot in the past, or exhausted cron).
+                let _ = timers.remove(&entry.id);
+                return;
+            }
+        };
+
+        let delay = (next - now)
+            .to_std()
+            .unwrap_or(std::time::Duration::ZERO);
+
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    return;
+                }
+                _ = tokio::time::sleep(delay) => {}
+            }
+            if cancel.is_cancelled() {
+                return;
+            }
+            // The driver is fire-and-forget; errors are the caller's responsibility.
+            (entry.callback)().await;
+
+            if is_cron && timers.contains(&entry.id) {
+                Self::schedule_next(Arc::clone(&timers), entry, cancel);
+            } else {
+                let _ = timers.remove(&entry.id);
+            }
+        });
     }
 }
 
 impl ScheduleDriver for TimerScheduleDriver {
-    fn now(&self) -> chrono::DateTime<chrono::Utc> {
-        chrono::Utc::now()
+    fn schedule(&self, entry: ScheduleEntry) -> ScheduleHandle {
+        let id = entry.id.clone();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        // Replace any existing timer for this id, cancelling it first.
+        if let Some((_, old)) = self.timers.remove(&id) {
+            old.cancel();
+        }
+        let _ = self.timers.insert(id.clone(), cancel.clone());
+
+        Self::schedule_next(Arc::clone(&self.timers), entry, cancel);
+
+        ScheduleHandle { id }
     }
 
-    fn schedule(
-        &self,
-        _delay: std::time::Duration,
-        _callback: Box<dyn FnOnce() + Send + Sync>,
-    ) -> ScheduleHandle {
-        todo!("parity: spawn a tokio timer task that runs callback after delay")
+    fn cancel(&self, handle: &ScheduleHandle) {
+        if let Some((_, cancel)) = self.timers.remove(&handle.id) {
+            cancel.cancel();
+        }
+    }
+
+    fn dispose(&self) {
+        self.timers.scan(|_, cancel| cancel.cancel());
+        self.timers.clear();
     }
 }
 

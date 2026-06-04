@@ -156,6 +156,16 @@ pub struct VirtualStat {
     pub gid: u32,
 }
 
+/// A registered in-process mount: the live [`VirtualFileSystem`] driver plus the `read_only` flag
+/// forwarded from [`MountFsOptions`]. TS `mountFs` passes `{ readOnly }` through to
+/// `kernel.mountFs`, which enforces read-only mount semantics; the flag is retained here so the
+/// option is not structurally dropped before the mount-dispatch path consumes it.
+#[derive(Clone)]
+pub struct MountedFs {
+    pub driver: Arc<dyn VirtualFileSystem>,
+    pub read_only: bool,
+}
+
 /// A directory entry with a known type, returned by `read_dir_with_types` on the mount contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtualDirEntry {
@@ -342,6 +352,18 @@ impl AgentOs {
 // ---------------------------------------------------------------------------
 
 impl AgentOs {
+    /// Render a batch-method error the way the TypeScript `AgentOs` surfaces `err.message` into
+    /// `BatchWriteResult.error` / `BatchReadResult.error`. The error may be a bare [`ClientError`]
+    /// (path guards) or an [`anyhow::Error`] wrapping one (kernel RPC failures via
+    /// [`Self::guest_fs_call`]), so downcast to recover the exact TS message; otherwise fall back to
+    /// the anyhow chain string.
+    fn batch_error_message(err: &anyhow::Error) -> String {
+        match err.downcast_ref::<ClientError>() {
+            Some(client_error) => client_error.batch_message(),
+            None => err.to_string(),
+        }
+    }
+
     /// Build the VM-scoped ownership for guest filesystem RPCs.
     fn fs_vm_scope(&self) -> OwnershipScope {
         OwnershipScope::vm(
@@ -439,11 +461,16 @@ impl AgentOs {
 
     // --- low-level kernel ops (each maps to one guest filesystem RPC) ---
 
+    /// Mirrors TS `decodeGuestFilesystemContent`: a missing `content` field is a hard error
+    /// (`sidecar returned no file content for <path>`, fail-by-default), `base64` is decoded, and
+    /// any other/absent encoding is treated as utf8 bytes.
     async fn kernel_read_file(&self, path: &str) -> Result<Vec<u8>> {
         let result = self
             .guest_fs_call(Self::fs_request(GuestFilesystemOperation::ReadFile, path))
             .await?;
-        let content = result.content.unwrap_or_default();
+        let content = result.content.with_context(|| {
+            format!("sidecar returned no file content for {path}")
+        })?;
         match result.encoding {
             Some(RootFilesystemEntryEncoding::Base64) => BASE64
                 .decode(content.as_bytes())
@@ -452,22 +479,30 @@ impl AgentOs {
         }
     }
 
+    /// Mirrors TS `encodeGuestFilesystemContent`: string content is sent verbatim with NO `encoding`
+    /// field (the sidecar defaults absent encoding to utf8); byte content is base64-encoded and
+    /// carries `encoding: "base64"`.
     async fn kernel_write_file(&self, path: &str, content: &FileContent) -> Result<()> {
         let (encoded, encoding) = match content {
-            FileContent::Text(text) => (text.clone(), RootFilesystemEntryEncoding::Utf8),
+            FileContent::Text(text) => (text.clone(), None),
             FileContent::Bytes(bytes) => {
-                (BASE64.encode(bytes), RootFilesystemEntryEncoding::Base64)
+                (BASE64.encode(bytes), Some(RootFilesystemEntryEncoding::Base64))
             }
         };
         let mut request = Self::fs_request(GuestFilesystemOperation::WriteFile, path);
         request.content = Some(encoded);
-        request.encoding = Some(encoding);
+        request.encoding = encoding;
         self.guest_fs_call(request).await?;
         Ok(())
     }
 
+    /// Single-level directory creation. Mirrors TS `kernel.mkdir(path)` (no options), which the
+    /// native client maps to the `create_dir` guest filesystem operation. This backs BOTH
+    /// `AgentOs::mkdir` (non-recursive) and every `_mkdirp` component, so it always emits
+    /// [`GuestFilesystemOperation::CreateDir`] (never `Mkdir`, which the native client reserves for
+    /// the recursive `kernel.mkdir(path, { recursive: true })` shape that this code path never uses).
     async fn kernel_mkdir(&self, path: &str) -> Result<()> {
-        self.guest_fs_call(Self::fs_request(GuestFilesystemOperation::Mkdir, path))
+        self.guest_fs_call(Self::fs_request(GuestFilesystemOperation::CreateDir, path))
             .await?;
         Ok(())
     }
@@ -625,6 +660,9 @@ impl AgentOs {
                             continue;
                         }
                         let child = format!("{path}/{entry}");
+                        // Mirror TS `delete` recursion, which re-runs the safe-path guard on each
+                        // child via the public `this.delete(...)` call before recursing.
+                        Self::assert_safe_absolute_path(&child)?;
                         self.delete_inner(&child, true).await?;
                     }
                 }
@@ -680,7 +718,7 @@ impl AgentOs {
                 Err(err) => results.push(BatchWriteResult {
                     path: entry.path,
                     success: false,
-                    error: Some(err.to_string()),
+                    error: Some(Self::batch_error_message(&err)),
                 }),
             }
         }
@@ -705,7 +743,7 @@ impl AgentOs {
                 Err(err) => results.push(BatchReadResult {
                     path,
                     content: None,
-                    error: Some(err.to_string()),
+                    error: Some(Self::batch_error_message(&err)),
                 }),
             }
         }
@@ -823,7 +861,7 @@ impl AgentOs {
             .entries
             .into_iter()
             .map(Self::snapshot_entry_from)
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(RootSnapshotExport {
             kind: SnapshotExportKind::SnapshotExport,
@@ -835,19 +873,23 @@ impl AgentOs {
     }
 
     /// Mount an in-process [`VirtualFileSystem`] driver. SYNC. Safe-path guard. The driver is a live
-    /// trait object and cannot cross an RPC boundary, so it is registered in the in-process mount
-    /// table keyed by its normalized guest path.
+    /// trait object and cannot cross an RPC boundary, so it is registered (together with the
+    /// `read_only` flag, mirroring TS `kernel.mountFs({ readOnly })`) in the in-process mount table
+    /// keyed by its normalized guest path.
     pub fn mount_fs(
         &self,
         path: &str,
         driver: Arc<dyn VirtualFileSystem>,
-        _options: MountFsOptions,
+        options: MountFsOptions,
     ) -> std::result::Result<(), ClientError> {
         Self::assert_safe_absolute_path(path)?;
-        let _ = self
-            .inner()
-            .in_process_mounts
-            .insert(path.to_string(), driver);
+        let _ = self.inner().in_process_mounts.insert(
+            path.to_string(),
+            MountedFs {
+                driver,
+                read_only: options.read_only,
+            },
+        );
         Ok(())
     }
 
@@ -880,27 +922,75 @@ impl AgentOs {
 
     /// Convert a wire [`RootFilesystemEntry`] into the public snapshot [`FilesystemEntry`],
     /// preserving the octal-string `mode` and verbatim utf8/base64 `content`/`target`.
-    fn snapshot_entry_from(entry: RootFilesystemEntry) -> FilesystemEntry {
+    ///
+    /// Mirrors TS `convertSidecarRootSnapshotEntries` + `toSnapshotModeString` exactly:
+    /// - `mode` falls back kind-dependently when absent (directory 0o755, symlink 0o777, file 0o644).
+    /// - file entries ALWAYS carry `content` (defaulting to `""`) and `encoding` (defaulting to
+    ///   `utf8`); directory/symlink entries carry neither.
+    /// - symlink entries REQUIRE a `target`; a missing target is a hard error (fail-by-default),
+    ///   matching the TS `throw`.
+    fn snapshot_entry_from(entry: RootFilesystemEntry) -> Result<FilesystemEntry> {
         let entry_type = match entry.kind {
             RootFilesystemEntryKind::File => DirEntryType::File,
             RootFilesystemEntryKind::Directory => DirEntryType::Directory,
             RootFilesystemEntryKind::Symlink => DirEntryType::Symlink,
         };
-        // Octal string with leading `0`, masked to the permission bits, matching TS `toModeString`.
-        let mode = format!("0{:o}", entry.mode.unwrap_or(0) & 0o7777);
-        let encoding = entry.encoding.map(|encoding| match encoding {
-            RootFilesystemEntryEncoding::Utf8 => FilesystemEntryEncoding::Utf8,
-            RootFilesystemEntryEncoding::Base64 => FilesystemEntryEncoding::Base64,
-        });
-        FilesystemEntry {
-            path: entry.path,
-            entry_type,
-            mode,
-            uid: entry.uid.unwrap_or(0),
-            gid: entry.gid.unwrap_or(0),
-            content: entry.content,
-            encoding,
-            target: entry.target,
+        // Kind-dependent permission-bit fallback, then octal string with leading `0` masked to the
+        // permission bits, matching TS `toSnapshotModeString`.
+        let fallback_mode = match entry.kind {
+            RootFilesystemEntryKind::Directory => 0o755,
+            RootFilesystemEntryKind::Symlink => 0o777,
+            RootFilesystemEntryKind::File => 0o644,
+        };
+        let mode = format!("0{:o}", entry.mode.unwrap_or(fallback_mode) & 0o7777);
+        let uid = entry.uid.unwrap_or(0);
+        let gid = entry.gid.unwrap_or(0);
+
+        match entry.kind {
+            RootFilesystemEntryKind::File => {
+                let encoding = match entry.encoding {
+                    Some(RootFilesystemEntryEncoding::Utf8) | None => FilesystemEntryEncoding::Utf8,
+                    Some(RootFilesystemEntryEncoding::Base64) => FilesystemEntryEncoding::Base64,
+                };
+                Ok(FilesystemEntry {
+                    path: entry.path,
+                    entry_type,
+                    mode,
+                    uid,
+                    gid,
+                    content: Some(entry.content.unwrap_or_default()),
+                    encoding: Some(encoding),
+                    target: None,
+                })
+            }
+            RootFilesystemEntryKind::Symlink => {
+                let target = entry.target.with_context(|| {
+                    format!(
+                        "sidecar root snapshot for {} is missing a symlink target",
+                        entry.path
+                    )
+                })?;
+                Ok(FilesystemEntry {
+                    path: entry.path,
+                    entry_type,
+                    mode,
+                    uid,
+                    gid,
+                    content: None,
+                    encoding: None,
+                    target: Some(target),
+                })
+            }
+            RootFilesystemEntryKind::Directory => Ok(FilesystemEntry {
+                path: entry.path,
+                entry_type,
+                mode,
+                uid,
+                gid,
+                content: None,
+                encoding: None,
+                target: None,
+            }),
         }
     }
 }

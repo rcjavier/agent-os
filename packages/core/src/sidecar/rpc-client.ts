@@ -1614,7 +1614,7 @@ export class NativeSidecarKernelProxy {
 						this.signalRefreshes.set(entry.pid, this.refreshSignalState(entry));
 						await this.signalRefreshes.get(entry.pid);
 					}
-					const chunk = new TextEncoder().encode(event.payload.chunk);
+					const chunk = event.payload.chunk;
 					const listeners =
 						event.payload.channel === "stdout"
 							? entry.onStdout

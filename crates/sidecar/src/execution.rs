@@ -2994,8 +2994,8 @@ where
                     payload.process_id
                 ))
             })?;
-        process.execution.write_stdin(payload.chunk.as_bytes())?;
-        write_kernel_process_stdin(&mut vm.kernel, process, payload.chunk.as_bytes())?;
+        process.execution.write_stdin(&payload.chunk)?;
+        write_kernel_process_stdin(&mut vm.kernel, process, &payload.chunk)?;
 
         Ok(DispatchResult {
             response: self.respond(
@@ -4033,7 +4033,7 @@ where
                 EventPayload::ProcessOutput(ProcessOutputEvent {
                     process_id: process_id.to_owned(),
                     channel: StreamChannel::Stdout,
-                    chunk: String::from_utf8_lossy(&chunk).into_owned(),
+                    chunk,
                 }),
             ))),
             ActiveExecutionEvent::Stderr(chunk) => Ok(Some(EventFrame::new(
@@ -4041,7 +4041,7 @@ where
                 EventPayload::ProcessOutput(ProcessOutputEvent {
                     process_id: process_id.to_owned(),
                     channel: StreamChannel::Stderr,
-                    chunk: String::from_utf8_lossy(&chunk).into_owned(),
+                    chunk,
                 }),
             ))),
             ActiveExecutionEvent::JavascriptSyncRpcRequest(request) => {

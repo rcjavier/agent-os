@@ -3131,57 +3131,6 @@ export class AgentOs {
 		session.pendingPermissionReplies.clear();
 	}
 
-	private _collectHostProcessTree(rootPid: number): number[] {
-		let output = "";
-		try {
-			output = execFileSync("ps", ["-eo", "pid=,ppid="], {
-				encoding: "utf8",
-			});
-		} catch {
-			return [];
-		}
-
-		const rows = output
-			.split("\n")
-			.map((line) => line.trim())
-			.filter(Boolean)
-			.map((line) => {
-				const [pid, ppid] = line.split(/\s+/);
-				return {
-					pid: Number(pid),
-					ppid: Number(ppid),
-				};
-			})
-			.filter((row) => Number.isFinite(row.pid) && Number.isFinite(row.ppid));
-		if (!rows.some((row) => row.pid === rootPid)) {
-			return [];
-		}
-
-		const byParent = new Map<number, number[]>();
-		for (const row of rows) {
-			const children = byParent.get(row.ppid);
-			if (children) {
-				children.push(row.pid);
-			} else {
-				byParent.set(row.ppid, [row.pid]);
-			}
-		}
-
-		const discovered: number[] = [];
-		const queue = [rootPid];
-		while (queue.length > 0) {
-			const pid = queue.shift();
-			if (pid === undefined || discovered.includes(pid)) {
-				continue;
-			}
-			discovered.push(pid);
-			for (const childPid of byParent.get(pid) ?? []) {
-				queue.push(childPid);
-			}
-		}
-		return discovered;
-	}
-
 	private _tryForceCloseSessionProcess(sessionId: string): void {
 		const session = this._sessions.get(sessionId);
 		if (!session?.pid) {
@@ -3194,6 +3143,17 @@ export class AgentOs {
 		if (sharedPidUsers.length > 0) {
 			return;
 		}
+		// Session processes live entirely inside the VM, so the only safe
+		// force-close is the sidecar `kill_process` RPC, which targets the guest
+		// process by its in-VM handle (`session.processId`).
+		//
+		// NEVER fall back to host `process.kill()` here. `session.pid` is a
+		// guest/kernel display PID, not a host PID. Passing it to the host signal
+		// API SIGKILLs whatever unrelated host process happens to share that
+		// number -- and a negative PID kills the entire host process *group* with
+		// that id. In practice that has killed the host tmux session, the test
+		// launcher, and even the user systemd manager. `close_agent_session`
+		// remains the authoritative teardown path if this RPC cannot run.
 		if (this.#kernel instanceof NativeSidecarKernelProxy && session.processId) {
 			void this._sidecarClient
 				.killProcess(
@@ -3203,29 +3163,6 @@ export class AgentOs {
 					"SIGKILL",
 				)
 				.catch(() => {});
-		}
-		// Native-sidecar control requests share the same framed transport as the
-		// in-flight ACP prompt request. If that prompt is wedged in adapter I/O,
-		// the sidecar may not service queued `kill_process` / `close_agent_session`
-		// frames until the prompt itself unwinds. Kill the host process tree
-		// directly as an out-of-band escape hatch so the blocked prompt tears down
-		// immediately and the sidecar close path can finish deterministically.
-		try {
-			process.kill(-session.pid, "SIGKILL");
-		} catch {
-			// Ignore ESRCH/EPERM when the session pid is not a process-group leader.
-		}
-		for (const pid of this._collectHostProcessTree(session.pid).reverse()) {
-			try {
-				process.kill(pid, "SIGKILL");
-			} catch {
-				// Ignore ESRCH and permission errors; close_agent_session remains the source of truth.
-			}
-		}
-		try {
-			process.kill(session.pid, "SIGKILL");
-		} catch {
-			// Ignore ESRCH and permission errors; close_agent_session remains the source of truth.
 		}
 	}
 
