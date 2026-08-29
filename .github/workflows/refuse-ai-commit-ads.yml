@@ -1,0 +1,48 @@
+# Refuse vendor AI advertising trailers on pushed commits.
+# Keep regex in sync with ~/.git-hooks/strip_cursor_attribution.py
+# as_of=2026-08-29T23:22:11+0800
+name: refuse-ai-commit-ads
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  refuse-ads:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan pushed commits for vendor AI ads
+        env:
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+        run: |
+          python3 - << 'PY'
+          import os, re, subprocess, sys
+          VENDORS = r"Cursor|Copilot|Claude|ChatGPT|Codex|Gemini|Devin|Aider|Windsurf|Cody|OpenAI|Anthropic"
+          STILL = re.compile(
+              rf"(?im)(^Made[- ]with:\s*(?:{VENDORS})|^Made\s+with\s+(?:{VENDORS})|^Co-authored-by:.*(?:{VENDORS})|^Signed-off-by:.*(?:{VENDORS})|^Generated[- ]by:\s*(?:{VENDORS})|^Generated\s+with\s+(?:{VENDORS})|^Assisted[- ]by:\s*(?:{VENDORS})|cursoragent@cursor\.com|copilot@github\.com|[\w.+-]*copilot[\w.+-]*@users\.noreply\.github\.com)"
+          )
+          IDENT = re.compile(
+              r"(?i)(cursoragent@|[\w.+-]+@cursor\.com|copilot@github\.com|noreply@anthropic\.com|[\w.+-]*copilot[\w.+-]*@users\.noreply\.github\.com|\bcursor agent\b|\bgithub copilot\b)"
+          )
+          before = os.environ.get("GITHUB_EVENT_BEFORE") or ""
+          after = os.environ.get("GITHUB_SHA") or "HEAD"
+          if after and before and set(before) > {"0"}:
+              spec = [f"{before}..{after}"]
+          else:
+              spec = ["--max-count=32", after]
+          r = subprocess.run(["git", "rev-list", *spec], capture_output=True, text=True)
+          shas = r.stdout.split()
+          for sha in shas:
+              meta = subprocess.check_output(
+                  ["git", "log", "-1", "--format=%B%x00%an <%ae>%n%cn <%ce>", sha],
+                  text=True,
+              )
+              body, _, ident = meta.partition("\0")
+              if STILL.search(body) or IDENT.search(ident):
+                  print(f"blocked: vendor AI advertising in {sha[:12]}", file=sys.stderr)
+                  sys.exit(1)
+          sys.exit(0)
+          PY
